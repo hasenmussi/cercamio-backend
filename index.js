@@ -3422,7 +3422,7 @@ app.post('/api/socios/solicitar', uploadDNI, async (req, res) => {
 // ===========================================
 
 // ==========================================
-// RUTA 48: DASHBOARD DEL SOCIO (CON GAMIFICACIÓN 🎮)
+// RUTA 48: DASHBOARD DEL SOCIO (CON GAMIFICACIÓN Y RETIROS 💸)
 // ==========================================
 app.get('/api/socios/dashboard', async (req, res) => {
   const authHeader = req.headers['authorization'];
@@ -3456,7 +3456,6 @@ app.get('/api/socios/dashboard', async (req, res) => {
     const localesActivos = flotaRes.rows.filter(l => parseInt(l.total_ventas_historicas) > 0).length;
 
     // 3. LÓGICA DE GAMIFICACIÓN (Niveles) 🏆
-    // Definimos la escalera
     const niveles = [
       { nombre: "BRONCE", meta: 0, ganancia: 5.0 },
       { nombre: "PLATA", meta: 10, ganancia: 7.5 },
@@ -3465,18 +3464,16 @@ app.get('/api/socios/dashboard', async (req, res) => {
       { nombre: "DIAMANTE", meta: 100, ganancia: 15.0 }
     ];
 
-    // Calculamos dónde está el socio
     let nivelActual = niveles[0];
     let nivelSiguiente = niveles[1];
     
     for (let i = 0; i < niveles.length; i++) {
       if (totalLocales >= niveles[i].meta) {
         nivelActual = niveles[i];
-        nivelSiguiente = (i + 1 < niveles.length) ? niveles[i + 1] : null; // Si es Diamante, no hay siguiente
+        nivelSiguiente = (i + 1 < niveles.length) ? niveles[i + 1] : null; 
       }
     }
 
-    // Calculamos progreso (0.0 a 1.0)
     let progreso = 0.0;
     let faltan = 0;
     let mensajeMotivacional = "¡Eres una leyenda! Has alcanzado el máximo nivel. 👑";
@@ -3489,7 +3486,17 @@ app.get('/api/socios/dashboard', async (req, res) => {
       mensajeMotivacional = `¡Vamos! Solo te faltan ${faltan} locales para ser ${nivelSiguiente.nombre} y ganar ${nivelSiguiente.ganancia}%`;
     }
 
-    // 4. RESPUESTA FINAL
+    // 4. OBTENER ÚLTIMOS RETIROS (NUEVO BLOQUE) 💸
+    // Esto es lo que faltaba para completar el circuito de Cash Out
+    const retirosRes = await pool.query(
+      `SELECT monto, estado, TO_CHAR(fecha_solicitud, 'DD/MM/YY') as fecha 
+       FROM solicitudes_retiro 
+       WHERE socio_id = $1 
+       ORDER BY fecha_solicitud DESC LIMIT 5`,
+      [socio.socio_id]
+    );
+
+    // 5. RESPUESTA FINAL
     res.json({
       perfil: {
         codigo: socio.codigo_referido,
@@ -3499,10 +3506,10 @@ app.get('/api/socios/dashboard', async (req, res) => {
       },
       gamification: {
         nivel_actual: nivelActual.nombre,
-        porcentaje_actual: socio.porcentaje_ganancia, // Usamos el real de la DB
+        porcentaje_actual: socio.porcentaje_ganancia, 
         nivel_siguiente: nivelSiguiente ? nivelSiguiente.nombre : "MAX",
         meta_siguiente: nivelSiguiente ? nivelSiguiente.meta : totalLocales,
-        progreso_decimal: progreso, // Ej: 0.5 para 50%
+        progreso_decimal: progreso, 
         mensaje: mensajeMotivacional,
         faltan_locales: faltan
       },
@@ -3510,7 +3517,8 @@ app.get('/api/socios/dashboard', async (req, res) => {
         total_locales: totalLocales,
         locales_activos: localesActivos
       },
-      flota: flotaRes.rows
+      flota: flotaRes.rows,
+      retiros: retirosRes.rows // <--- Enviamos el historial al Frontend
     });
 
   } catch (error) {
@@ -3565,6 +3573,71 @@ const actualizarNivelSocio = async (socioId) => {
     console.error("Error actualizando nivel socio:", error);
   }
 };
+
+// ==========================================
+// RUTA 49: SOLICITAR RETIRO DE FONDOS 💸
+// ==========================================
+app.post('/api/socios/retirar', async (req, res) => {
+  const authHeader = req.headers['authorization'];
+  if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
+  const token = authHeader.split(' ')[1];
+
+  const MONTO_MINIMO = 1000; // Configurable
+
+  const client = await pool.connect();
+
+  try {
+    const usuario = jwt.verify(token, JWT_SECRET);
+    
+    await client.query('BEGIN');
+
+    // 1. Obtener datos del socio bloqueando la fila (FOR UPDATE) para evitar doble click
+    const socioRes = await client.query(
+      'SELECT socio_id, saldo_acumulado, cbu_alias FROM socios WHERE usuario_id = $1 FOR UPDATE',
+      [usuario.id]
+    );
+
+    if (socioRes.rows.length === 0) throw new Error('No eres socio');
+    const socio = socioRes.rows[0];
+    const saldoActual = parseFloat(socio.saldo_acumulado);
+
+    // 2. Validaciones
+    if (saldoActual < MONTO_MINIMO) {
+      throw new Error(`El monto mínimo para retirar es $${MONTO_MINIMO}`);
+    }
+
+    if (!socio.cbu_alias) {
+      throw new Error('No tienes un CBU/Alias configurado');
+    }
+
+    // 3. MOVIMIENTO DE FONDOS (Atomicidad)
+    // A. Restamos el saldo
+    await client.query(
+      'UPDATE socios SET saldo_acumulado = saldo_acumulado - $1 WHERE socio_id = $2',
+      [saldoActual, socio.socio_id]
+    );
+
+    // B. Creamos el ticket de retiro
+    await client.query(
+      'INSERT INTO solicitudes_retiro (socio_id, monto, cbu_destino) VALUES ($1, $2, $3)',
+      [socio.socio_id, saldoActual, socio.cbu_alias]
+    );
+
+    await client.query('COMMIT');
+
+    // 4. Notificar (Opcional: Mandar email al admin avisando que hay que pagar)
+    console.log(`💸 Solicitud de retiro: Socio #${socio.socio_id} pide $${saldoActual}`);
+
+    res.json({ mensaje: 'Solicitud enviada. Tu dinero está en proceso.' });
+
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error(error);
+    res.status(400).json({ error: error.message || 'Error al procesar retiro' });
+  } finally {
+    client.release();
+  }
+});
 
 
 // ENCENDEMOS EL SERVIDOR
