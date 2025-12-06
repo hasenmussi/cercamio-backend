@@ -3302,6 +3302,71 @@ app.post('/api/socios/solicitar', uploadDNI, async (req, res) => {
 
 // ===========================================
 
+// ==========================================
+// RUTA 48: DASHBOARD DEL SOCIO (ESTADÍSTICAS)
+// ==========================================
+app.get('/api/socios/dashboard', async (req, res) => {
+  const authHeader = req.headers['authorization'];
+  if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
+  const token = authHeader.split(' ')[1];
+
+  try {
+    const usuario = jwt.verify(token, JWT_SECRET);
+
+    // 1. OBTENER DATOS DEL SOCIO
+    const socioQuery = `
+      SELECT socio_id, codigo_referido, estado, saldo_acumulado, cbu_alias 
+      FROM socios WHERE usuario_id = $1
+    `;
+    const socioRes = await pool.query(socioQuery, [usuario.id]);
+
+    if (socioRes.rows.length === 0) {
+      return res.status(404).json({ error: 'No eres socio aún' });
+    }
+    const socio = socioRes.rows[0];
+
+    // 2. OBTENER SU "FLOTA" (LOCALES RECLUTADOS)
+    // Hacemos un LEFT JOIN con transacciones para ver cuándo fue la última venta
+    // Esto nos permite ponerle "Semáforo" (Verde/Amarillo/Rojo)
+    const flotaQuery = `
+      SELECT 
+        L.local_id, 
+        L.nombre, 
+        L.rubro, 
+        L.foto_url,
+        L.fecha_registro,
+        COUNT(T.transaccion_id) as total_ventas_historicas,
+        MAX(T.fecha_operacion) as ultima_venta
+      FROM locales L
+      LEFT JOIN transacciones_p2p T ON L.usuario_id = T.vendedor_id
+      WHERE L.referido_por_socio_id = $1
+      GROUP BY L.local_id
+      ORDER BY L.fecha_registro DESC
+    `;
+    
+    const flotaRes = await pool.query(flotaQuery, [socio.socio_id]);
+
+    // 3. RESPUESTA ARMADA
+    res.json({
+      perfil: {
+        codigo: socio.codigo_referido,
+        saldo: socio.saldo_acumulado,
+        estado: socio.estado, // 'APROBADO', 'PENDIENTE'
+        alias: socio.cbu_alias
+      },
+      metricas: {
+        total_locales: flotaRes.rows.length,
+        locales_activos: flotaRes.rows.filter(l => l.total_ventas_historicas > 0).length
+      },
+      flota: flotaRes.rows // La lista para el ListView
+    });
+
+  } catch (error) {
+    console.error("Error Dashboard Socio:", error);
+    res.status(500).json({ error: 'Error al cargar tu tablero' });
+  }
+});
+
 
 // ENCENDEMOS EL SERVIDOR
 app.listen(port, () => {
