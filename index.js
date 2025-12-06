@@ -525,12 +525,10 @@ app.put('/api/mi-negocio/actualizar', async (req, res) => {
 // MÓDULO DE AUTENTICACIÓN (SEGURIDAD)
 // ==========================================
 
-// RUTA 3: REGISTRO AVANZADO (CON CÓDIGO DE SOCIO)
+// RUTA 3: REGISTRO AVANZADO (CON CÓDIGO DE SOCIO Y LEVEL UP AUTOMÁTICO)
 app.post('/api/auth/registro', async (req, res) => {
-  // AHORA RECIBIMOS 'codigo_socio'
   const { nombre, email, password, tipo, nombre_tienda, categoria, whatsapp, direccion, tipo_actividad, rubro, lat, long, codigo_socio } = req.body;
 
-  // 1. Validaciones básicas
   if (!email || !password || !nombre || !tipo) {
     return res.status(400).json({ error: 'Faltan datos obligatorios' });
   }
@@ -544,11 +542,9 @@ app.post('/api/auth/registro', async (req, res) => {
   try {
     await client.query('BEGIN'); 
 
-    // 2. Encriptar contraseña
     const salt = await bcrypt.genSalt(10);
     const passwordEncriptada = await bcrypt.hash(password, salt);
 
-    // 3. Crear el USUARIO
     const userQuery = `
       INSERT INTO usuarios (nombre_completo, email, password_hash, tipo, nivel_confianza)
       VALUES ($1, $2, $3, $4, 0)
@@ -557,34 +553,26 @@ app.post('/api/auth/registro', async (req, res) => {
     const userRes = await client.query(userQuery, [nombre, email, passwordEncriptada, tipo]);
     const nuevoUsuario = userRes.rows[0];
 
-    // 4. Si es VENDEDOR, procesamos Local y SOCIO
+    // Variable para guardar el ID del socio si se usó código
+    let socioIdEncontrado = null; 
+
     if (tipo === 'Minorista' || tipo === 'Mayorista') {
       
-      let socioId = null; // Por defecto nadie lo refirió
-
-      // --- LÓGICA DE SOCIOS (NUEVO) ---
       if (codigo_socio) {
-        // A. Buscamos al dueño del código
         const socioRes = await client.query('SELECT socio_id, usuario_id FROM socios WHERE codigo_referido = $1', [codigo_socio]);
         
         if (socioRes.rows.length > 0) {
           const datosSocio = socioRes.rows[0];
           
-          // B. Anti-Fraude: No puedes referirte a ti mismo
-          // (Aunque es un usuario nuevo, verificamos por si acaso hay lógica cruzada futura)
           if (datosSocio.usuario_id === nuevoUsuario.usuario_id) {
-             // Si pasa esto, ignoramos el código silenciosamente o lanzamos error. 
-             // En registro nuevo es raro que pase, pero mejor prevenir.
              console.warn("Intento de auto-referencia en registro.");
           } else {
-             socioId = datosSocio.socio_id; // ¡Código Válido!
+             socioIdEncontrado = datosSocio.socio_id; 
           }
         } else {
-          // Si el código no existe, lanzamos error para que el usuario corrija
           throw new Error(`El código de socio "${codigo_socio}" no existe. Verifica si lo escribiste bien.`);
         }
       }
-      // -------------------------------
 
       const latitudFinal = lat || -45.86;
       const longitudFinal = long || -67.48;
@@ -594,7 +582,6 @@ app.post('/api/auth/registro', async (req, res) => {
           fotoDefecto = 'https://cdn-icons-png.flaticon.com/512/1063/1063376.png'; 
       }
 
-      // INSERTAMOS EL LOCAL CON EL SOCIO VINCULADO
       const localQuery = `
         INSERT INTO locales 
         (usuario_id, nombre, categoria, ubicacion, whatsapp, permite_retiro, permite_delivery, direccion_fisica, tipo_actividad, rubro, foto_url, referido_por_socio_id)
@@ -616,18 +603,24 @@ app.post('/api/auth/registro', async (req, res) => {
         tipo_actividad || 'PRODUCTO',
         rubro || 'General',
         fotoDefecto,
-        socioId // <--- EL DATO DEL SOCIO ($13)
+        socioIdEncontrado 
       ]);
     }
 
     await client.query('COMMIT'); 
+
+    // --- NUEVO: SI HUBO SOCIO, RECALCULAMOS SU NIVEL AUTOMÁTICAMENTE ---
+    if (socioIdEncontrado) {
+       // Ejecutamos en segundo plano (sin await para no demorar la respuesta)
+       actualizarNivelSocio(socioIdEncontrado);
+    }
+    // -------------------------------------------------------------------
 
     res.json({ mensaje: 'Registro exitoso', usuario: nuevoUsuario });
 
   } catch (error) {
     await client.query('ROLLBACK');
     console.error(error);
-    // Manejo de errores amigable
     if (error.message.includes("código de socio")) {
         return res.status(400).json({ error: error.message });
     }
@@ -743,7 +736,7 @@ app.get('/api/transaccion/mis-compras', async (req, res) => {
 });
 
 // ==========================================
-// RUTA 5: COMPRA MÚLTIPLE (CARRITO) - CON SNAPSHOT Y CUPONES 🎁
+// RUTA 5: COMPRA MÚLTIPLE (CARRITO) - CON SNAPSHOT, CUPONES Y SOCIOS 🤝
 // ==========================================
 app.post('/api/transaccion/comprar', async (req, res) => {
   const authHeader = req.headers['authorization'];
@@ -764,104 +757,108 @@ app.post('/api/transaccion/comprar', async (req, res) => {
 
     await client.query('BEGIN');
 
-    // 2. Buscamos al vendedor
-    const vendedorRes = await client.query('SELECT usuario_id FROM locales WHERE local_id = $1', [local_id]);
-    if (vendedorRes.rows.length === 0) throw new Error('Local no encontrado');
-    const vendedor_id = vendedorRes.rows[0].usuario_id;
+    // 2. Buscamos al vendedor Y DATOS DEL SOCIO (PADRINO)
+    // --- ACTUALIZACIÓN: Traemos referido_por_socio_id y porcentaje_ganancia ---
+    const localRes = await client.query(`
+      SELECT 
+        L.usuario_id, 
+        L.referido_por_socio_id,
+        S.porcentaje_ganancia -- El nivel del socio (5%, 7.5%, etc)
+      FROM locales L
+      LEFT JOIN socios S ON L.referido_por_socio_id = S.socio_id
+      WHERE L.local_id = $1
+    `, [local_id]);
+
+    if (localRes.rows.length === 0) throw new Error('Local no encontrado');
+    
+    const vendedor_id = localRes.rows[0].usuario_id;
+    const socioId = localRes.rows[0].referido_por_socio_id; // ID del Socio
+    // Si tiene socio, usamos su porcentaje de la BD, si no, 0. (Default 5.00 si es null)
+    const porcentajeSocio = socioId ? parseFloat(localRes.rows[0].porcentaje_ganancia || 5.00) : 0;
 
     if (comprador_id === vendedor_id) {
       throw new Error('No puedes realizar compras en tu propio negocio.');
     }
 
     // ============================================================
-    // 3. LÓGICA DE CANJE DE CUPÓN (CON INSERCIÓN EN BD) 🎟️
+    // 3. LÓGICA DE CANJE DE CUPÓN 🎟️ (Sin cambios, se mantiene tu lógica)
     // ============================================================
     let infoPremio = ""; 
     let tituloNotif = "¡Nueva Orden Entrante! 📦";
 
     if (usar_cupon === true) {
-      // A. Verificar si tiene cupones reales disponibles
       const checkCupón = await client.query(
         'SELECT cupones_disponibles FROM progreso_fidelizacion WHERE usuario_id = $1 AND local_id = $2 FOR UPDATE',
         [comprador_id, local_id]
       );
 
       if (checkCupón.rows.length > 0 && checkCupón.rows[0].cupones_disponibles > 0) {
-        // B. Descontar 1 cupón
         await client.query(
           'UPDATE progreso_fidelizacion SET cupones_disponibles = cupones_disponibles - 1 WHERE usuario_id = $1 AND local_id = $2',
           [comprador_id, local_id]
         );
         
-        // C. Buscar nombre del premio
         const premioRes = await client.query('SELECT premio_descripcion FROM config_fidelizacion WHERE local_id = $1', [local_id]);
         const nombrePremio = premioRes.rows[0]?.premio_descripcion || "Premio Sorpresa";
         
         infoPremio = `\n🎁 DEBES ENTREGAR PREMIO: ${nombrePremio}`;
         tituloNotif = "¡Venta con PREMIO CANJEADO! 🎁";
 
-        // --- D. INSERTAR EL PREMIO COMO UN ITEM DE VENTA ($0) ---
-        // Esto es lo que faltaba: Creamos una fila física en la orden
+        // Insertamos el premio ($0 costo, $0 comisión)
         const insertPremio = `
             INSERT INTO transacciones_p2p 
-            (comprador_id, vendedor_id, producto_global_id, cantidad, monto_total, estado, tipo_entrega, compra_uuid, nombre_snapshot, foto_snapshot)
-            VALUES ($1, $2, NULL, 1, 0, 'APROBADO', $3, $4, $5, $6)
+            (comprador_id, vendedor_id, producto_global_id, cantidad, monto_total, estado, tipo_entrega, compra_uuid, nombre_snapshot, foto_snapshot, comision_plataforma)
+            VALUES ($1, $2, NULL, 1, 0, 'APROBADO', $3, $4, $5, $6, 0)
         `;
-        
-        // Usamos una foto genérica de regalo o null
         const fotoRegalo = "https://cdn-icons-png.flaticon.com/512/4213/4213958.png"; 
 
         await client.query(insertPremio, [
-            comprador_id, 
-            vendedor_id, 
-            tipo_entrega,
-            compraUuid,
-            `🎁 PREMIO: ${nombrePremio}`, // Nombre destacado
-            fotoRegalo
+            comprador_id, vendedor_id, tipo_entrega, compraUuid,
+            `🎁 PREMIO: ${nombrePremio}`, fotoRegalo
         ]);
-        // --------------------------------------------------------
         
       } else {
-        throw new Error("Error: No tienes cupones disponibles para canjear en este local.");
+        throw new Error("Error: No tienes cupones disponibles.");
       }
     }
+
     // ============================================================
-
+    // 4. ITEMS PAGADOS (Con cálculo de comisión individual) 💰
+    // ============================================================
     let montoTotalPedido = 0; 
+    let comisionTotalPlataforma = 0; // Acumulador para saber cuánto ganamos nosotros
+    let ultimoTransaccionId = null;  // Para vincular el historial
 
-    // 4. Iteramos items normales (PAGOS)
     for (const item of items) {
-        // A. Validar Stock y Obtener SNAPSHOT
-        const stockQuery = `
-            SELECT stock, global_id, tipo_item, nombre, foto_url 
-            FROM inventario_local 
-            WHERE inventario_id = $1 FOR UPDATE
-        `;
+        // A. Validar Stock
+        const stockQuery = `SELECT stock, global_id, tipo_item, nombre, foto_url FROM inventario_local WHERE inventario_id = $1 FOR UPDATE`;
         const stockRes = await client.query(stockQuery, [item.inventario_id]);
         
         if (stockRes.rows.length === 0) throw new Error(`Producto no disponible`);
         const datosReales = stockRes.rows[0];
 
         if (datosReales.tipo_item === 'PRODUCTO_STOCK') {
-            if (datosReales.stock < item.cantidad) {
-                throw new Error(`Stock insuficiente para ${datosReales.nombre}`);
-            }
-            // B. Restar Stock
-            await client.query('UPDATE inventario_local SET stock = stock - $1 WHERE inventario_id = $2', 
-                [item.cantidad, item.inventario_id]);
+            if (datosReales.stock < item.cantidad) throw new Error(`Stock insuficiente para ${datosReales.nombre}`);
+            await client.query('UPDATE inventario_local SET stock = stock - $1 WHERE inventario_id = $2', [item.cantidad, item.inventario_id]);
         }
 
-        // C. Insertar con SNAPSHOT
+        // B. Cálculos Monetarios
         const totalItem = item.precio * item.cantidad;
         montoTotalPedido += totalItem;
 
+        // Calculamos el 1% de CercaMío para este item específico
+        const comisionItem = Math.round((totalItem * 0.01) * 100) / 100;
+        comisionTotalPlataforma += comisionItem;
+
+        // C. Insertar Transacción (Agregamos comision_plataforma)
         const insertTx = `
             INSERT INTO transacciones_p2p 
-            (comprador_id, vendedor_id, producto_global_id, cantidad, monto_total, estado, tipo_entrega, compra_uuid, nombre_snapshot, foto_snapshot)
-            VALUES ($1, $2, $3, $4, $5, 'APROBADO', $6, $7, $8, $9)
+            (comprador_id, vendedor_id, producto_global_id, cantidad, monto_total, estado, tipo_entrega, compra_uuid, nombre_snapshot, foto_snapshot, comision_plataforma)
+            VALUES ($1, $2, $3, $4, $5, 'APROBADO', $6, $7, $8, $9, $10)
+            RETURNING transaccion_id
         `;
         
-        await client.query(insertTx, [
+        const txRes = await client.query(insertTx, [
             comprador_id, 
             vendedor_id, 
             datosReales.global_id, 
@@ -870,16 +867,50 @@ app.post('/api/transaccion/comprar', async (req, res) => {
             tipo_entrega,
             compraUuid,
             datosReales.nombre,   
-            datosReales.foto_url  
+            datosReales.foto_url,
+            comisionItem // <--- Guardamos cuánto ganamos en este item
         ]);
+
+        ultimoTransaccionId = txRes.rows[0].transaccion_id;
+    }
+
+    // ============================================================
+    // 5. REPARTO DE GANANCIAS AL SOCIO (REVENUE SHARE) 🤝
+    // ============================================================
+    if (socioId && comisionTotalPlataforma > 0) {
+       
+       // Ganancia Socio = Nuestra Ganancia * (Su Porcentaje / 100)
+       // Ejemplo: Ganamos $100 * (5% del socio) = $5 para él.
+       const gananciaSocio = Math.round((comisionTotalPlataforma * (porcentajeSocio / 100)) * 100) / 100;
+
+       if (gananciaSocio > 0) {
+         // A. Acreditar en Billetera
+         await client.query(`UPDATE socios SET saldo_acumulado = saldo_acumulado + $1 WHERE socio_id = $2`, [gananciaSocio, socioId]);
+
+         // B. Auditoría
+         await client.query(`
+            INSERT INTO historial_comisiones 
+            (socio_id, transaccion_origen_id, local_origen_id, monto_comision, porcentaje_aplicado, base_calculo_plataforma)
+            VALUES ($1, $2, $3, $4, $5, $6)
+         `, [socioId, ultimoTransaccionId, local_id, gananciaSocio, porcentajeSocio, comisionTotalPlataforma]);
+         
+         console.log(`✅ Socio #${socioId} ganó $${gananciaSocio} (Base CercaMío: $${comisionTotalPlataforma})`);
+       }
     }
 
     await client.query('COMMIT');
 
-    // 5. Notificar
+    // 6. Notificar
     const mensajeVendedor = `${nombreComprador} realizó un pedido de ${items.length} items pagados. Total: $${montoTotalPedido}.${infoPremio}`;
-    
     enviarNotificacion(vendedor_id, tituloNotif, mensajeVendedor);
+
+    // Opcional: Notificar al Socio si ganó algo
+    if (socioId) {
+        const sUser = await pool.query('SELECT usuario_id FROM socios WHERE socio_id = $1', [socioId]);
+        if (sUser.rows.length > 0) {
+           // enviarNotificacion(sUser.rows[0].usuario_id, "¡Kaching! 🤑", "Sumaste saldo por ventas de tus referidos.");
+        }
+    }
 
     res.json({ mensaje: 'Compra realizada con éxito', orden_id: compraUuid });
 
@@ -892,13 +923,12 @@ app.post('/api/transaccion/comprar', async (req, res) => {
   }
 });
 
-// RUTA 9: CONVERTIRSE EN VENDEDOR (CON CÓDIGO DE SOCIO)
+// RUTA 9: CONVERTIRSE EN VENDEDOR (CON CÓDIGO DE SOCIO Y LEVEL UP AUTOMÁTICO)
 app.post('/api/auth/convertir-vendedor', async (req, res) => {
   const authHeader = req.headers['authorization'];
   if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
   const token = authHeader.split(' ')[1];
 
-  // AHORA RECIBIMOS 'codigo_socio'
   const { nombre_tienda, categoria, whatsapp, direccion, tipo_actividad, rubro, lat, long, codigo_socio } = req.body;
 
   const client = await pool.connect();
@@ -906,8 +936,7 @@ app.post('/api/auth/convertir-vendedor', async (req, res) => {
     const usuario = jwt.verify(token, JWT_SECRET);
     await client.query('BEGIN');
 
-    // --- LÓGICA DE SOCIOS (VALIDACIÓN ANTI-FRAUDE) ---
-    let socioId = null;
+    let socioIdEncontrado = null;
 
     if (codigo_socio) {
       const socioRes = await client.query('SELECT socio_id, usuario_id FROM socios WHERE codigo_referido = $1', [codigo_socio]);
@@ -915,19 +944,16 @@ app.post('/api/auth/convertir-vendedor', async (req, res) => {
       if (socioRes.rows.length > 0) {
         const datosSocio = socioRes.rows[0];
         
-        // 🛡️ ANTI-FRAUDE: El usuario logueado NO puede usar su propio código de socio
         if (datosSocio.usuario_id === usuario.id) {
            throw new Error("¡No puedes usar tu propio código de socio para tu tienda!");
         }
         
-        socioId = datosSocio.socio_id;
+        socioIdEncontrado = datosSocio.socio_id;
       } else {
         throw new Error(`El código de socio "${codigo_socio}" no es válido.`);
       }
     }
-    // --------------------------------------------------
 
-    // 1. Actualizamos el tipo de usuario
     const nuevoTipoUsuario = (tipo_actividad === 'SERVICIO') ? 'Profesional' : categoria;
 
     await client.query(
@@ -935,7 +961,6 @@ app.post('/api/auth/convertir-vendedor', async (req, res) => {
       [nuevoTipoUsuario, usuario.id]
     );
 
-    // 2. Creamos su Local CON EL SOCIO
     const latitudFinal = lat || -45.86;
     const longitudFinal = long || -67.48;
 
@@ -961,17 +986,23 @@ app.post('/api/auth/convertir-vendedor', async (req, res) => {
       tipo_actividad || 'PRODUCTO',
       rubro || 'General',
       fotoDefecto,
-      socioId // <--- VINCULAMOS AL SOCIO AQUÍ ($11)
+      socioIdEncontrado
     ]);
 
     await client.query('COMMIT');
+
+    // --- NUEVO: SI HUBO SOCIO, RECALCULAMOS SU NIVEL ---
+    if (socioIdEncontrado) {
+       actualizarNivelSocio(socioIdEncontrado);
+    }
+    // ---------------------------------------------------
+
     res.json({ mensaje: '¡Felicidades! Perfil profesional creado y vinculado.' });
 
   } catch (error) {
     await client.query('ROLLBACK');
     console.error(error);
     
-    // Devolvemos el mensaje de error específico (Ej: Codigo invalido o auto-referencia)
     if (error.message.includes("código") || error.message.includes("propio")) {
        return res.status(400).json({ error: error.message });
     }
@@ -3303,7 +3334,7 @@ app.post('/api/socios/solicitar', uploadDNI, async (req, res) => {
 // ===========================================
 
 // ==========================================
-// RUTA 48: DASHBOARD DEL SOCIO (ESTADÍSTICAS)
+// RUTA 48: DASHBOARD DEL SOCIO (CON GAMIFICACIÓN 🎮)
 // ==========================================
 app.get('/api/socios/dashboard', async (req, res) => {
   const authHeader = req.headers['authorization'];
@@ -3313,28 +3344,16 @@ app.get('/api/socios/dashboard', async (req, res) => {
   try {
     const usuario = jwt.verify(token, JWT_SECRET);
 
-    // 1. OBTENER DATOS DEL SOCIO
-    const socioQuery = `
-      SELECT socio_id, codigo_referido, estado, saldo_acumulado, cbu_alias 
-      FROM socios WHERE usuario_id = $1
-    `;
+    // 1. OBTENER DATOS SOCIO
+    const socioQuery = `SELECT socio_id, codigo_referido, estado, saldo_acumulado, cbu_alias, porcentaje_ganancia FROM socios WHERE usuario_id = $1`;
     const socioRes = await pool.query(socioQuery, [usuario.id]);
 
-    if (socioRes.rows.length === 0) {
-      return res.status(404).json({ error: 'No eres socio aún' });
-    }
+    if (socioRes.rows.length === 0) return res.status(404).json({ error: 'No eres socio aún' });
     const socio = socioRes.rows[0];
 
-    // 2. OBTENER SU "FLOTA" (LOCALES RECLUTADOS)
-    // Hacemos un LEFT JOIN con transacciones para ver cuándo fue la última venta
-    // Esto nos permite ponerle "Semáforo" (Verde/Amarillo/Rojo)
+    // 2. OBTENER FLOTA (Contamos locales)
     const flotaQuery = `
-      SELECT 
-        L.local_id, 
-        L.nombre, 
-        L.rubro, 
-        L.foto_url,
-        L.fecha_registro,
+      SELECT L.local_id, L.nombre, L.rubro, L.foto_url, L.fecha_registro,
         COUNT(T.transaccion_id) as total_ventas_historicas,
         MAX(T.fecha_operacion) as ultima_venta
       FROM locales L
@@ -3343,22 +3362,67 @@ app.get('/api/socios/dashboard', async (req, res) => {
       GROUP BY L.local_id
       ORDER BY L.fecha_registro DESC
     `;
-    
     const flotaRes = await pool.query(flotaQuery, [socio.socio_id]);
+    
+    const totalLocales = flotaRes.rows.length;
+    const localesActivos = flotaRes.rows.filter(l => parseInt(l.total_ventas_historicas) > 0).length;
 
-    // 3. RESPUESTA ARMADA
+    // 3. LÓGICA DE GAMIFICACIÓN (Niveles) 🏆
+    // Definimos la escalera
+    const niveles = [
+      { nombre: "BRONCE", meta: 0, ganancia: 5.0 },
+      { nombre: "PLATA", meta: 10, ganancia: 7.5 },
+      { nombre: "ORO", meta: 30, ganancia: 10.0 },
+      { nombre: "PLATINO", meta: 60, ganancia: 12.5 },
+      { nombre: "DIAMANTE", meta: 100, ganancia: 15.0 }
+    ];
+
+    // Calculamos dónde está el socio
+    let nivelActual = niveles[0];
+    let nivelSiguiente = niveles[1];
+    
+    for (let i = 0; i < niveles.length; i++) {
+      if (totalLocales >= niveles[i].meta) {
+        nivelActual = niveles[i];
+        nivelSiguiente = (i + 1 < niveles.length) ? niveles[i + 1] : null; // Si es Diamante, no hay siguiente
+      }
+    }
+
+    // Calculamos progreso (0.0 a 1.0)
+    let progreso = 0.0;
+    let faltan = 0;
+    let mensajeMotivacional = "¡Eres una leyenda! Has alcanzado el máximo nivel. 👑";
+
+    if (nivelSiguiente) {
+      const rango = nivelSiguiente.meta - nivelActual.meta;
+      const avanceEnRango = totalLocales - nivelActual.meta;
+      progreso = avanceEnRango / rango;
+      faltan = nivelSiguiente.meta - totalLocales;
+      mensajeMotivacional = `¡Vamos! Solo te faltan ${faltan} locales para ser ${nivelSiguiente.nombre} y ganar ${nivelSiguiente.ganancia}%`;
+    }
+
+    // 4. RESPUESTA FINAL
     res.json({
       perfil: {
         codigo: socio.codigo_referido,
         saldo: socio.saldo_acumulado,
-        estado: socio.estado, // 'APROBADO', 'PENDIENTE'
+        estado: socio.estado,
         alias: socio.cbu_alias
       },
-      metricas: {
-        total_locales: flotaRes.rows.length,
-        locales_activos: flotaRes.rows.filter(l => l.total_ventas_historicas > 0).length
+      gamification: {
+        nivel_actual: nivelActual.nombre,
+        porcentaje_actual: socio.porcentaje_ganancia, // Usamos el real de la DB
+        nivel_siguiente: nivelSiguiente ? nivelSiguiente.nombre : "MAX",
+        meta_siguiente: nivelSiguiente ? nivelSiguiente.meta : totalLocales,
+        progreso_decimal: progreso, // Ej: 0.5 para 50%
+        mensaje: mensajeMotivacional,
+        faltan_locales: faltan
       },
-      flota: flotaRes.rows // La lista para el ListView
+      metricas: {
+        total_locales: totalLocales,
+        locales_activos: localesActivos
+      },
+      flota: flotaRes.rows
     });
 
   } catch (error) {
@@ -3366,6 +3430,53 @@ app.get('/api/socios/dashboard', async (req, res) => {
     res.status(500).json({ error: 'Error al cargar tu tablero' });
   }
 });
+
+// ==========================================
+// FUNCIÓN AUXILIAR: CALCULAR NIVEL DE SOCIO 📈
+// ==========================================
+const actualizarNivelSocio = async (socioId) => {
+  try {
+    // 1. Contamos cuántos locales activos tiene este socio
+    const countRes = await pool.query(
+      'SELECT COUNT(*) FROM locales WHERE referido_por_socio_id = $1', 
+      [socioId]
+    );
+    
+    const cantidadLocales = parseInt(countRes.rows[0].count);
+    
+    // 2. Definimos la escalera de éxito (Tus reglas)
+    let nuevoPorcentaje = 5.00; // Nivel Base (Bronce)
+    let nombreNivel = "BRONCE";
+
+    if (cantidadLocales >= 100) {
+      nuevoPorcentaje = 15.00;
+      nombreNivel = "DIAMANTE";
+    } else if (cantidadLocales >= 60) {
+      nuevoPorcentaje = 12.50; // Ajusté un intermedio
+      nombreNivel = "PLATINO";
+    } else if (cantidadLocales >= 30) {
+      nuevoPorcentaje = 10.00;
+      nombreNivel = "ORO";
+    } else if (cantidadLocales >= 10) {
+      nuevoPorcentaje = 7.50;
+      nombreNivel = "PLATA";
+    }
+
+    // 3. Actualizamos en la base de datos
+    await pool.query(
+      'UPDATE socios SET porcentaje_ganancia = $1 WHERE socio_id = $2',
+      [nuevoPorcentaje, socioId]
+    );
+
+    console.log(`📈 Socio #${socioId} actualizado: ${cantidadLocales} locales -> Nivel ${nombreNivel} (${nuevoPorcentaje}%)`);
+    
+    // Opcional: Podrías enviar notificación si subió de nivel
+    // if (subioNivel) enviarNotificacion(...)
+
+  } catch (error) {
+    console.error("Error actualizando nivel socio:", error);
+  }
+};
 
 
 // ENCENDEMOS EL SERVIDOR
