@@ -410,7 +410,9 @@ app.get('/api/buscar', async (req, res) => {
 // MÓDULO DE GESTIÓN (PANEL DEL VENDEDOR)
 // ==========================================
 
-// RUTA 6: VER MIS PRODUCTOS
+// ==========================================
+// RUTA 6: VER MIS PRODUCTOS + ESTADO DE MISIONES 🏆
+// ==========================================
 app.get('/api/mi-negocio/productos', async (req, res) => {
   const authHeader = req.headers['authorization'];
   if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
@@ -419,25 +421,45 @@ app.get('/api/mi-negocio/productos', async (req, res) => {
   try {
     const usuario = jwt.verify(token, JWT_SECRET);
 
-    // Buscamos productos DONDE el dueño del local sea el usuario logueado
-    const consulta = `
-  SELECT 
-    I.inventario_id,
-    C.nombre_oficial,
-    C.descripcion,
-    C.codigo_barras,
-    C.foto_url,  -- <--- NUEVO
-    I.precio,
-    I.stock
+    // 1. PRIMERO: Obtener datos del Local (Vital para la barra de Misiones)
+    const localRes = await pool.query(
+      'SELECT local_id, misiones_puntos, estado_manual, plan_tipo FROM locales WHERE usuario_id = $1',
+      [usuario.id]
+    );
+
+    if (localRes.rows.length === 0) return res.status(404).json({ error: 'Local no encontrado' });
+    const datosLocal = localRes.rows[0];
+
+    // 2. SEGUNDO: Obtener Productos (Mejorado para aceptar productos manuales y globales)
+    // Usamos LEFT JOIN para que no desaparezcan los productos que creaste manualmente
+    const productosQuery = `
+      SELECT 
+        I.inventario_id,
+        COALESCE(I.nombre, C.nombre_oficial) as nombre_oficial, -- Si tiene nombre manual, úsalo
+        COALESCE(I.descripcion, C.descripcion) as descripcion,
+        COALESCE(I.foto_url, C.foto_url) as foto_url,           -- Si tiene foto manual, úsala
+        I.precio,
+        I.stock,
+        I.tipo_item
       FROM inventario_local I
       JOIN locales L ON I.local_id = L.local_id
-      JOIN catalogo_global C ON I.global_id = C.global_id
+      LEFT JOIN catalogo_global C ON I.global_id = C.global_id
       WHERE L.usuario_id = $1
-      ORDER BY C.nombre_oficial ASC
+      ORDER BY I.inventario_id DESC
     `;
     
-    const respuesta = await pool.query(consulta, [usuario.id]);
-    res.json(respuesta.rows);
+    const productosRes = await pool.query(productosQuery, [usuario.id]);
+
+    // 3. RESPUESTA COMBINADA (Status + Items)
+    res.json({
+      status: {
+        local_id: datosLocal.local_id,
+        misiones_puntos: datosLocal.misiones_puntos || 0, // Aquí va el progreso 0-100
+        estado_manual: datosLocal.estado_manual || 'AUTO',
+        plan_tipo: datosLocal.plan_tipo
+      },
+      items: productosRes.rows
+    });
 
   } catch (error) {
     console.error(error);
@@ -1469,7 +1491,9 @@ app.get('/api/perfil-publico/:id', async (req, res) => {
   }
 });
 
-// RUTA 17: TOGGLE FAVORITO (DAR/QUITAR LIKE)
+// ==========================================
+// RUTA 17: TOGGLE FAVORITO (CON MISIONES ESCALONADAS 🏆)
+// ==========================================
 app.post('/api/favoritos/toggle', async (req, res) => {
   const authHeader = req.headers['authorization'];
   if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
@@ -1479,21 +1503,85 @@ app.post('/api/favoritos/toggle', async (req, res) => {
   try {
     const usuario = jwt.verify(token, JWT_SECRET);
 
-    // 1. Verificar si ya existe
+    // 1. Toggle Favorito (Estándar)
     const check = await pool.query(
       'SELECT favorito_id FROM favoritos WHERE usuario_id = $1 AND local_id = $2', 
       [usuario.id, local_id]
     );
 
+    let accion = '';
     if (check.rows.length > 0) {
-      // SI EXISTE -> BORRAR (DESMARCAR)
       await pool.query('DELETE FROM favoritos WHERE usuario_id = $1 AND local_id = $2', [usuario.id, local_id]);
-      res.json({ estado: false, mensaje: 'Eliminado de favoritos' });
+      accion = 'borrado';
     } else {
-      // NO EXISTE -> AGREGAR (MARCAR)
       await pool.query('INSERT INTO favoritos (usuario_id, local_id) VALUES ($1, $2)', [usuario.id, local_id]);
-      res.json({ estado: true, mensaje: 'Agregado a favoritos' });
+      accion = 'agregado';
     }
+
+    // =================================================================
+    // 2. LÓGICA DE MISIONES ESCALONADAS (20 -> 60 -> 100)
+    // =================================================================
+    if (accion === 'agregado') {
+        // A. Anti-Fraude: Solo cuentan usuarios que compraron alguna vez
+        const checkCompras = await pool.query(
+            'SELECT 1 FROM transacciones_p2p WHERE comprador_id = $1 AND estado = $2 LIMIT 1', 
+            [usuario.id, 'APROBADO']
+        );
+
+        if (checkCompras.rows.length > 0) {
+            // B. Sumar Punto
+            const updateRes = await pool.query(
+                'UPDATE locales SET misiones_puntos = misiones_puntos + 1 WHERE local_id = $1 RETURNING misiones_puntos, usuario_id', 
+                [local_id]
+            );
+            
+            const puntos = updateRes.rows[0].misiones_puntos;
+            const idVendedor = updateRes.rows[0].usuario_id;
+            
+            // C. Evaluar Escalones de Premios 🎁
+            let mesesRegalo = 0;
+            let mensajePremio = "";
+
+            if (puntos === 20) {
+                mesesRegalo = 1;
+                mensajePremio = "¡Nivel 1 Completado! (20 Fans). Ganaste 1 Mes Premium GRATIS.";
+            } else if (puntos === 60) {
+                mesesRegalo = 2;
+                mensajePremio = "¡Nivel 2 Completado! (60 Fans). Ganaste 2 Meses Premium GRATIS.";
+            } else if (puntos === 100) {
+                mesesRegalo = 3;
+                mensajePremio = "¡Nivel MÁXIMO Completado! (100 Fans). Ganaste 3 Meses Premium GRATIS.";
+            }
+
+            // D. Si alcanzó un hito, aplicamos el premio
+            if (mesesRegalo > 0) {
+                // Query dinámica para sumar X meses
+                const intervaloSQL = `${mesesRegalo} months`; // Ej: '2 months'
+                
+                await pool.query(`
+                    UPDATE locales 
+                    SET 
+                      plan_tipo = 'PREMIUM',
+                      plan_vencimiento = CASE 
+                        WHEN plan_vencimiento > NOW() THEN plan_vencimiento + INTERVAL '${intervaloSQL}' 
+                        ELSE NOW() + INTERVAL '${intervaloSQL}' 
+                      END
+                    WHERE local_id = $1
+                `, [local_id]);
+
+                console.log(`🏆 Local ${local_id} alcanzó ${puntos} puntos. Premio: ${mesesRegalo} meses.`);
+                
+                // Notificar al Vendedor
+                enviarNotificacion(idVendedor, "¡Misión Cumplida! 🚀", mensajePremio);
+            }
+        }
+    }
+    // =================================================================
+
+    res.json({ 
+        estado: accion === 'agregado', 
+        mensaje: accion === 'agregado' ? 'Guardado en favoritos' : 'Eliminado de favoritos' 
+    });
 
   } catch (error) {
     console.error(error);
