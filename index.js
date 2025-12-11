@@ -3983,7 +3983,8 @@ app.get('/api/producto/scan/:codigo', async (req, res) => {
                 estado: 'EN_GLOBAL', // Reutilizamos este estado para disparar el autocompletado
                 producto: {
                     nombre_oficial: p.product_name_es || p.product_name || "",
-                    descripcion: `Marca: ${p.brands || 'S/D'}. Categoría: ${p.categories || 'General'}`,
+                    descripcion: `Agregar descripción`,
+                    //descripcion: `Marca: ${p.brands || 'S/D'}. Categoría: ${p.categories || 'General'}`,
                     foto_url: p.image_front_url || p.image_url || null,
                     codigo_barras: codigo
                 }
