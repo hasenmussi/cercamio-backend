@@ -6,6 +6,7 @@ const cors = require('cors');
 const cron = require('node-cron');
 const crypto = require('crypto');
 const nodemailer = require('nodemailer');
+const axios = require('axios');
 
 // 2. CONFIGURACIÓN DE IMÁGENES (CLOUDINARY + MULTER)
 const cloudinary = require('cloudinary').v2;
@@ -3914,7 +3915,7 @@ app.post('/api/uploads/imagen', upload.single('imagen'), (req, res) => {
 });
 
 // ==========================================
-// RUTA 50: ESCÁNER INTELIGENTE (FIX NOMBRE NULL) 🧠
+// RUTA 50: ESCÁNER INTELIGENTE (LOCAL -> GLOBAL -> INTERNET) 🧠🌐
 // ==========================================
 app.get('/api/producto/scan/:codigo', async (req, res) => {
   const authHeader = req.headers['authorization'];
@@ -3931,24 +3932,15 @@ app.get('/api/producto/scan/:codigo', async (req, res) => {
     if (localRes.rows.length === 0) return res.status(404).json({ error: 'Sin local' });
     const localId = localRes.rows[0].local_id;
 
-    console.error(`🔥 [SCAN] Buscando '${codigo}' en Local ${localId}`);
+    console.error(`🔥 [SCAN V3] Buscando '${codigo}' en Local ${localId}`);
 
-    // --- CAPA 1: BÚSQUEDA LOCAL (CON HERENCIA DE DATOS) ---
-    // AQUÍ ESTÁ EL ARREGLO: Hacemos JOIN para rellenar los datos NULL
+    // --- CAPA 1: BÚSQUEDA LOCAL (CON HERENCIA) ---
     const queryLocal = `
       SELECT 
-        I.inventario_id,
-        I.local_id,
-        I.precio,
-        I.stock,
-        I.tipo_item,
-        I.codigo_barras,
-        
-        -- SI EL LOCAL TIENE NULL, USAMOS EL GLOBAL
+        I.inventario_id, I.local_id, I.precio, I.stock, I.tipo_item, I.codigo_barras,
         COALESCE(I.nombre, C.nombre_oficial) as nombre, 
         COALESCE(I.descripcion, C.descripcion) as descripcion,
         COALESCE(I.foto_url, C.foto_url) as foto_url
-
       FROM inventario_local I
       LEFT JOIN catalogo_global C ON I.global_id = C.global_id
       WHERE I.local_id = $1 
@@ -3958,14 +3950,14 @@ app.get('/api/producto/scan/:codigo', async (req, res) => {
     const localProduct = await pool.query(queryLocal, [localId, codigo]);
 
     if (localProduct.rows.length > 0) {
-      console.error("✅ ENCONTRADO EN LOCAL (Datos completos)");
+      console.error("✅ ENCONTRADO EN LOCAL");
       return res.json({
         estado: 'EN_INVENTARIO', 
         producto: localProduct.rows[0]
       });
     }
 
-    // --- CAPA 2: BÚSQUEDA GLOBAL ---
+    // --- CAPA 2: BÚSQUEDA GLOBAL (CercaMío) ---
     const globalProduct = await pool.query('SELECT * FROM catalogo_global WHERE CAST(codigo_barras AS TEXT) = $1', [codigo]);
 
     if (globalProduct.rows.length > 0) {
@@ -3976,7 +3968,32 @@ app.get('/api/producto/scan/:codigo', async (req, res) => {
       });
     }
 
-    // --- CAPA 3: NUEVO ---
+    // --- CAPA 3: INTERNET (OpenFoodFacts) 🌐 ---
+    console.error("🌍 Buscando en OpenFoodFacts...");
+    try {
+        const offUrl = `https://world.openfoodfacts.org/api/v0/product/${codigo}.json`;
+        const apiRes = await axios.get(offUrl, { timeout: 3000 });
+
+        if (apiRes.data.status === 1) {
+            const p = apiRes.data.product;
+            console.error("🎉 ENCONTRADO EN INTERNET: " + p.product_name);
+            
+            // Retornamos mapeado para que la App lo use
+            return res.json({
+                estado: 'EN_GLOBAL', // Reutilizamos este estado para disparar el autocompletado
+                producto: {
+                    nombre_oficial: p.product_name_es || p.product_name || "",
+                    descripcion: `Marca: ${p.brands || 'S/D'}. Categoría: ${p.categories || 'General'}`,
+                    foto_url: p.image_front_url || p.image_url || null,
+                    codigo_barras: codigo
+                }
+            });
+        }
+    } catch (apiError) {
+        console.error("⚠️ Error API Externa (No bloqueante):", apiError.message);
+    }
+
+    // --- CAPA 4: NUEVO (Si todo lo anterior falló) ---
     console.error("🆕 NO EXISTE. ES NUEVO.");
     res.json({
       estado: 'NUEVO', 
