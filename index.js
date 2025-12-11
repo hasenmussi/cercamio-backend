@@ -1,242 +1,173 @@
 // 1. IMPORTAMOS LAS LIBRERÍAS
-require('dotenv').config();
+require('dotenv').config(); // <--- ESTO SIEMPRE PRIMERO
 const express = require('express');
 const { Pool } = require('pg');
 const cors = require('cors');
+const cron = require('node-cron');
+const crypto = require('crypto');
+const nodemailer = require('nodemailer');
 
-// IMPORTACIONES DE IMAGENES
+// 2. CONFIGURACIÓN DE IMÁGENES (CLOUDINARY + MULTER)
 const cloudinary = require('cloudinary').v2;
 const { CloudinaryStorage } = require('multer-storage-cloudinary');
 const multer = require('multer');
-// const upload = multer({ dest: 'uploads/' }); // Carpeta temporal
 
-// --- IMPORTS ---
-const cron = require('node-cron'); // Importar al inicio del archivo
-
-const crypto = require('crypto'); // Nativo de Node.js, no hace falta npm install
-
-
-// --- IMPORTACIÓN MERCADO PAGO ---
-const { MercadoPagoConfig, Preference } = require('mercadopago');
-
-// Configura con tu ACCESS TOKEN de PRUEBA (Ponlo en .env en el futuro)
-const client = new MercadoPagoConfig({ accessToken: 'APP_USR-7458384450787340-120216-78724c3a5f2c37e72886e52c26816cc0-161693502' });
-
-// APP_USR-7458384450787340-120216-78724c3a5f2c37e72886e52c26816cc0-161693502 producción
-// APP_USR-6372969451024117-120216-c0b561a0dbe692690a56e2696d333ea2-3035329953 prueba
-
-// --- IMPORTACIONES ---
-const nodemailer = require('nodemailer');
-
-
-// --- CONFIGURACIÓN DE EMAIL (MODO RESISTENTE) ---
-const transporter = nodemailer.createTransport({
-  host: 'smtp.gmail.com',
-  port: 587, // Probamos el puerto alternativo (TLS)
-  secure: false, 
-  auth: {
-    user: 'cercamioapp@gmail.com', 
-    pass: 'wdnb ewmc lsyp labk' 
-  },
-  tls: {
-    rejectUnauthorized: false // Esto ayuda a saltar bloqueos de certificados en Render
-  }
-});
-
-
-// Función auxiliar BLINDADA
-const enviarEmail = async (destinatario, asunto, texto) => {
-  console.log("========================================");
-  console.log(`📨 INTENTANDO ENVIAR EMAIL A: ${destinatario}`);
-  console.log(`📝 CONTENIDO (Por si falla): ${texto}`); // <--- AQUÍ VERÁS EL CÓDIGO
-  console.log("========================================");
-
-  try {
-    await transporter.sendMail({
-      from: '"Soporte CercaMío" <tu_email_de_empresa@gmail.com>',
-      to: destinatario,
-      subject: asunto,
-      text: texto,
-    });
-    console.log('✅ Email enviado correctamente por SMTP.');
-  } catch (error) {
-    // AQUÍ ESTÁ EL TRUCO: Capturamos el error pero NO lo lanzamos (throw).
-    // Solo avisamos en consola y dejamos que el código siga.
-    console.error("⚠️ EL EMAIL FALLÓ (TIMEOUT/BLOQUEO), PERO SEGUIMOS.");
-    console.error("👉 Usa el código que se imprimió arriba para probar.");
-  }
-};
-
-// Función para generar código de 6 números
-const generarCodigo = () => Math.floor(100000 + Math.random() * 900000).toString();
-
-// Función para capitalizar nombres (ej: "juan perez" -> "Juan Perez")
-const capitalizarNombre = (texto) => {
-  if (!texto) return "";
-  return texto
-    .toLowerCase()
-    .split(' ')
-    .map(palabra => palabra.charAt(0).toUpperCase() + palabra.slice(1))
-    .join(' ');
-};
-
-
-// CONFIGURACIÓN DE CLOUDINARY (¡Pon tus datos aquí!)
 cloudinary.config({ 
-  cloud_name: 'dd7yzrvpn', 
-  api_key: '328861189229127', 
-  api_secret: 'mMehF9awKrLWZTd-br3VdzBKS5g' 
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME, 
+  api_key: process.env.CLOUDINARY_API_KEY, 
+  api_secret: process.env.CLOUDINARY_API_SECRET 
 });
 
-// 3. MOTOR DE ALMACENAMIENTO (ESTO ES LO NUEVO)
-const storage = new CloudinaryStorage({
+// A) Storage PÚBLICO (Reseñas, Productos)
+const storagePublico = new CloudinaryStorage({
   cloudinary: cloudinary,
   params: {
-    folder: 'fotosresenas', // Nombre de carpeta en tu nube
+    folder: 'cercamio_public', 
     allowed_formats: ['jpg', 'png', 'jpeg', 'webp'],
   },
 });
 
-// 4. INICIALIZAR MULTER CON CLOUDINARY
-const upload = multer({ storage: storage });
-
-// 2. CONFIGURAMOS LA APP
-const app = express();
-const port = process.env.PORT || 3000;
-
-const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
-
-// CLAVE SECRETA PARA LOS TOKENS (En producción esto va en variables de entorno)
-const JWT_SECRET = process.env.JWT_SECRET || 'mi_secreto_super_seguro_globaltrade_2024';
-
-// --- CONFIGURACIÓN FIREBASE ADMIN (PROFESIONAL) ---
-const admin = require('firebase-admin');
-const fs = require('fs'); // Necesitamos 'fs' para verificar si el archivo existe
-
-// Definimos las dos rutas posibles
-const rutaLocal = './serviceAccountKey.json';
-const rutaRender = '/etc/secrets/serviceAccountKey.json'; // Render guarda aquí los Secret Files
-
-let serviceAccount;
-
-try {
-  if (fs.existsSync(rutaRender)) {
-    // Estamos en RENDER
-    console.log('🔒 Cargando credenciales desde Secret Files (Render)...');
-    serviceAccount = require(rutaRender);
-  } else if (fs.existsSync(rutaLocal)) {
-    // Estamos en LOCAL
-    console.log('💻 Cargando credenciales locales...');
-    serviceAccount = require(rutaLocal);
-  } else {
-    // NO SE ENCONTRÓ
-    console.error('❌ ERROR CRÍTICO: No se encontró serviceAccountKey.json ni en local ni en secrets.');
-    // No detenemos el proceso, pero las notificaciones fallarán.
-  }
-
-  // Inicializar solo si tenemos credenciales y no se ha iniciado antes
-  if (serviceAccount && !admin.apps.length) {
-    admin.initializeApp({
-      credential: admin.credential.cert(serviceAccount)
-    });
-    console.log('✅ Firebase Admin inicializado correctamente.');
-  }
-
-} catch (error) {
-  console.error('❌ Error inicializando Firebase:', error);
-}
-
-
-app.use(cors({
-  origin: '*', // <--- Permite conexiones desde CUALQUIER lugar (incluido localhost)
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
-}));
-app.use(express.json()); // Permitir recibir datos en formato JSON
-
-// Asegúrate de requerir dotenv al principio de tu archivo si estás en local
-// require('dotenv').config(); 
-
-app.get('/ping', (req, res) => {
-  res.send('pong');
-});
-
-// OBTENER LA URL (Prioridad: Variable de Entorno -> Hardcode -> String vacío)
-// IMPORTANTE: Asegúrate de que NO haya comillas extras si usas el string directo
-const connectionString = process.env.DATABASE_URL || 'postgresql://neondb_owner:npg_5IHPFzWvme9g@ep-dawn-pond-ac51t2cr-pooler.sa-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require';
-
-// --- DIAGNÓSTICO (Esto saldrá en los logs de Render) ---
-console.log("------------------------------------------------");
-console.log("INTENTANDO CONECTAR A BASE DE DATOS...");
-if (!process.env.DATABASE_URL) {
-    console.warn("⚠️ ADVERTENCIA: No se detectó process.env.DATABASE_URL. Usando fallback hardcodeado.");
-} else {
-    console.log("✅ Variable de entorno detectada.");
-    // Imprimimos solo los primeros 10 caracteres para verificar que no sea "undefined" o tenga comillas, sin revelar la clave
-    console.log("Valor inicia con:", process.env.DATABASE_URL.substring(0, 15) + "..."); 
-}
-console.log("------------------------------------------------");
-
-const pool = new Pool({
-  connectionString: connectionString,
-  ssl: {
-    require: true,
-    rejectUnauthorized: false // <--- ESTO ES VITAL PARA NEON A VECES
+// B) Storage PRIVADO (DNI / Documentación) 🔒
+const storagePrivado = new CloudinaryStorage({
+  cloudinary: cloudinary,
+  params: {
+    folder: 'cercamio_documentacion_privada',
+    type: 'private', // Bloquea acceso público
+    access_mode: 'authenticated',
+    allowed_formats: ['jpg', 'png', 'jpeg', 'pdf'],
   },
 });
 
+const upload = multer({ storage: storagePublico }); 
+const uploadPrivado = multer({ storage: storagePrivado }); 
 
+// 3. MERCADO PAGO (Solo importamos clases, instanciamos en las rutas)
+const { MercadoPagoConfig, Preference, Payment } = require('mercadopago');
 
-// --- FUNCIÓN AUXILIAR PARA ENVIAR NOTIFICACIONES (AUTO-CLEANUP) ---
+// 4. CONFIGURACIÓN DE EMAIL (NODEMAILER)
+const transporter = nodemailer.createTransport({
+  host: 'smtp.gmail.com',
+  port: 587, 
+  secure: false, 
+  auth: {
+    user: process.env.EMAIL_USER, 
+    pass: process.env.EMAIL_PASS 
+  },
+  tls: {
+    rejectUnauthorized: false 
+  }
+});
+
+// Función auxiliar de Email
+const enviarEmail = async (destinatario, asunto, texto) => {
+  console.log(`📨 Enviando email a: ${destinatario}`);
+  try {
+    await transporter.sendMail({
+      from: '"Soporte CercaMío" <soporte@cercamio.app>',
+      to: destinatario,
+      subject: asunto,
+      text: texto,
+    });
+    console.log('✅ Email enviado.');
+  } catch (error) {
+    console.error("⚠️ Falló envío de email:", error.message);
+  }
+};
+
+// 5. FUNCIONES AUXILIARES SIMPLES
+const generarCodigo = () => Math.floor(100000 + Math.random() * 900000).toString();
+const capitalizarNombre = (texto) => {
+  if (!texto) return "";
+  return texto.toLowerCase().split(' ').map(p => p.charAt(0).toUpperCase() + p.slice(1)).join(' ');
+};
+
+// ==========================================
+// FUNCIÓN AUXILIAR: ENVIAR NOTIFICACIONES PUSH (FCM) 📲
+// ==========================================
 const enviarNotificacion = async (usuarioIdDestino, titulo, mensaje, dataPayload = {}) => {
   try {
-    // 1. Buscamos el token en la base de datos
+    // 1. Buscamos el token del usuario en la BD
     const query = 'SELECT fcm_token FROM usuarios WHERE usuario_id = $1';
     const res = await pool.query(query, [usuarioIdDestino]);
 
-    // Si no tiene token, no hacemos nada
+    // Si no existe el usuario o no tiene token, salimos
     if (res.rows.length === 0 || !res.rows[0].fcm_token) {
-      console.log(`⚠️ El usuario ${usuarioIdDestino} no tiene token activo.`);
       return; 
     }
 
     const fcmToken = res.rows[0].fcm_token;
 
-    // 2. Preparamos el mensaje
+    // 2. Preparamos el mensaje para Firebase
     const message = {
       notification: { title: titulo, body: mensaje },
       token: fcmToken,
-      data: dataPayload // Datos ocultos (ej: ID de pedido para abrir pantalla exacta)
+      data: dataPayload // Datos extra (ej: ID de pedido)
     };
 
     // 3. Enviamos
     await admin.messaging().send(message);
-    console.log(`✅ Notificación enviada a ${usuarioIdDestino}`);
+    // console.log(`📲 Notificación enviada a usuario ${usuarioIdDestino}`);
 
   } catch (error) {
-    console.error('❌ Error enviando notificación:', error);
+    // console.error('Error enviando notificación:', error.message);
 
-    // --- LÓGICA DE AUTO-LIMPIEZA ---
-    // Si Firebase nos dice que el token no existe (App desinstalada o datos borrados)
-    if (error.codePrefix === 'messaging' && 
-       (error.errorInfo.code === 'messaging/registration-token-not-registered' || 
-        error.errorInfo.code === 'messaging/invalid-argument')) {
-      
-      console.log(`🗑️ Token inválido detectado para usuario ${usuarioIdDestino}. Limpiando base de datos...`);
-      
-      // Borramos el token muerto para que no de error la próxima vez
-      try {
-        await pool.query('UPDATE usuarios SET fcm_token = NULL WHERE usuario_id = $1', [usuarioIdDestino]);
-        console.log("✨ Base de datos actualizada (Token eliminado).");
-      } catch (dbError) {
-        console.error("Error al limpiar token de DB:", dbError);
-      }
+    // --- AUTO-LIMPIEZA DE TOKENS MUERTOS ---
+    // Si Firebase nos dice que el token ya no sirve (App desinstalada), lo borramos de la BD
+    if (error.code === 'messaging/registration-token-not-registered' || 
+        error.code === 'messaging/invalid-argument') {
+       
+       await pool.query('UPDATE usuarios SET fcm_token = NULL WHERE usuario_id = $1', [usuarioIdDestino]);
+       console.log(`🗑️ Token inválido eliminado para usuario ${usuarioIdDestino}`);
     }
   }
 };
 
-// 4. CREAMOS LAS RUTAS (LOS "PEDIDOS" QUE ACEPTA EL MESERO)
+// 6. CONFIGURAMOS LA APP EXPRESS
+const app = express();
+const port = process.env.PORT || 3000;
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const JWT_SECRET = process.env.JWT_SECRET; // Lee del .env
+
+// 7. FIREBASE ADMIN
+const admin = require('firebase-admin');
+const fs = require('fs'); 
+const rutaLocal = './serviceAccountKey.json';
+const rutaRender = '/etc/secrets/serviceAccountKey.json';
+
+let serviceAccount;
+try {
+  if (fs.existsSync(rutaRender)) {
+    serviceAccount = require(rutaRender);
+    console.log('🔒 Firebase: Usando credenciales de Render.');
+  } else if (fs.existsSync(rutaLocal)) {
+    serviceAccount = require(rutaLocal);
+    console.log('💻 Firebase: Usando credenciales locales.');
+  }
+  
+  if (serviceAccount && !admin.apps.length) {
+    admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+  }
+} catch (error) {
+  console.error('❌ Error Firebase:', error.message);
+}
+
+// 8. MIDDLEWARES
+app.use(cors({ origin: '*', methods: ['GET', 'POST', 'PUT', 'DELETE'] }));
+app.use(express.json());
+
+// 9. BASE DE DATOS (NEON)
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL, // Lee del .env
+  ssl: { require: true, rejectUnauthorized: false },
+});
+
+// Test de conexión
+pool.connect()
+  .then(() => console.log('✅ Conectado a Neon DB'))
+  .catch(err => console.error('❌ Error DB:', err.message));
+
+app.get('/ping', (req, res) => res.send('pong'));
 
 // Ruta de prueba básica
 app.get('/', (req, res) => {
@@ -245,7 +176,7 @@ app.get('/', (req, res) => {
 
 
 // ==========================================
-// RUTA 1: OBTENER LOCALES (CON GEO + OFERTAS FLASH + HISTORIAS)
+// RUTA 1: OBTENER LOCALES (CON GEO + OFERTAS + PREMIUM 💎)
 // ==========================================
 app.get('/api/locales', async (req, res) => {
   // Pedimos latitud, longitud y un radio (por defecto 5km)
@@ -263,9 +194,11 @@ app.get('/api/locales', async (req, res) => {
         L.nombre, 
         L.categoria, 
         L.plan_tipo,
+        L.plan_vencimiento, -- <--- NUEVO: Útil para debugging o avisos
         L.modo_operacion, 
         L.reputacion, 
-        L.foto_url, 
+        COALESCE(L.foto_perfil, L.foto_url) as foto_url, 
+        L.foto_portada, 
         L.tipo_actividad, 
         L.rubro,
         L.hora_apertura,
@@ -277,6 +210,10 @@ app.get('/api/locales', async (req, res) => {
         L.pago_efectivo,
         L.pago_transferencia,
         L.pago_tarjeta,
+        
+        -- 💎 LÓGICA PREMIUM: Solo es true si es PREMIUM y NO ha vencido
+        (L.plan_tipo = 'PREMIUM' AND L.plan_vencimiento > NOW()) as es_premium,
+
         ST_X(L.ubicacion::geometry) as long, 
         ST_Y(L.ubicacion::geometry) as lat,
         
@@ -294,10 +231,9 @@ app.get('/api/locales', async (req, res) => {
             'fecha_fin', O.fecha_fin
           )
           ELSE NULL 
-        END as oferta_flash,  -- <--- ¡AQUÍ FALTABA UNA COMA!
+        END as oferta_flash,
 
         -- 2. DETECCIÓN HISTORIAS (ANILLO DE COLOR 🟣)
-        -- Devuelve true si hay al menos una historia vigente
         (EXISTS (
           SELECT 1 FROM historias H 
           WHERE H.local_id = L.local_id 
@@ -306,7 +242,7 @@ app.get('/api/locales', async (req, res) => {
 
       FROM locales L
       
-      -- UNIÓN INTELIGENTE (LEFT JOIN)
+      -- UNIÓN INTELIGENTE CON OFERTAS
       LEFT JOIN ofertas_flash O ON L.local_id = O.local_id 
         AND O.activa = TRUE 
         AND O.fecha_fin > NOW()
@@ -320,11 +256,11 @@ app.get('/api/locales', async (req, res) => {
         )
     `;
     
-    // Parámetros SQL: Longitud, Latitud, Radio
+    // Parámetros SQL
     let params = [parseFloat(lng), parseFloat(lat), parseFloat(radio)]; 
     let paramCounter = 4; 
 
-    // Filtro de texto opcional
+    // Filtro de texto opcional (Buscador)
     if (filtro) {
       consulta += ` 
         AND (
@@ -337,8 +273,13 @@ app.get('/api/locales', async (req, res) => {
       params.push(`%${filtro}%`);
     }
 
-    // Ordenamos: Primero cercanía
-    consulta += ` ORDER BY distancia_metros ASC`;
+    // ORDENAMIENTO:
+    // Opción A (Actual): Solo por cercanía.
+    // consulta += ` ORDER BY distancia_metros ASC`;
+
+    // Opción B (Estrategia Comercial): Los Premium primero, luego por cercanía.
+    // Si querés activar esto, borrá la línea de arriba y descomentá esta:
+    consulta += ` ORDER BY (L.plan_tipo = 'PREMIUM' AND L.plan_vencimiento > NOW()) DESC, distancia_metros ASC`;
 
     const respuesta = await pool.query(consulta, params);
     res.json(respuesta.rows);
@@ -407,46 +348,69 @@ app.get('/api/buscar', async (req, res) => {
 });
 
 // ==========================================
-// MÓDULO DE GESTIÓN (PANEL DEL VENDEDOR)
+// RUTA 6: VER MIS PRODUCTOS + ESTADO DE MISIONES 🏆 (ACTUALIZADA)
 // ==========================================
-
-// RUTA 6: VER MIS PRODUCTOS
 app.get('/api/mi-negocio/productos', async (req, res) => {
   const authHeader = req.headers['authorization'];
   if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
   const token = authHeader.split(' ')[1];
 
   try {
-    const usuario = jwt.verify(token, JWT_SECRET);
+    const usuario = jwt.verify(token, process.env.JWT_SECRET); // Usar process.env por seguridad
 
-    // Buscamos productos DONDE el dueño del local sea el usuario logueado
-    const consulta = `
-  SELECT 
-    I.inventario_id,
-    C.nombre_oficial,
-    C.descripcion,
-    C.codigo_barras,
-    C.foto_url,  -- <--- NUEVO
-    I.precio,
-    I.stock
+    // 1. PRIMERO: Obtener datos del Local (Vital para la barra de Misiones)
+    const localRes = await pool.query(
+      'SELECT local_id, misiones_puntos, estado_manual, plan_tipo FROM locales WHERE usuario_id = $1',
+      [usuario.id]
+    );
+
+    if (localRes.rows.length === 0) return res.status(404).json({ error: 'Local no encontrado' });
+    const datosLocal = localRes.rows[0];
+
+    // 2. SEGUNDO: Obtener Productos (Con Código de Barras)
+    const productosQuery = `
+      SELECT 
+        I.inventario_id,
+        
+        -- Prioridad: Datos manuales > Datos globales
+        COALESCE(I.nombre, C.nombre_oficial) as nombre_oficial, 
+        COALESCE(I.descripcion, C.descripcion) as descripcion,
+        COALESCE(I.foto_url, C.foto_url) as foto_url,
+        
+        -- 🔥 AGREGADO: Código de Barras (Local o Global) 🔥
+        COALESCE(I.codigo_barras, C.codigo_barras) as codigo_barras,
+        
+        I.precio,
+        I.stock,
+        I.tipo_item
       FROM inventario_local I
       JOIN locales L ON I.local_id = L.local_id
-      JOIN catalogo_global C ON I.global_id = C.global_id
+      LEFT JOIN catalogo_global C ON I.global_id = C.global_id
       WHERE L.usuario_id = $1
-      ORDER BY C.nombre_oficial ASC
+      ORDER BY I.inventario_id DESC
     `;
     
-    const respuesta = await pool.query(consulta, [usuario.id]);
-    res.json(respuesta.rows);
+    const productosRes = await pool.query(productosQuery, [usuario.id]);
+
+    // 3. RESPUESTA COMBINADA (Status + Items)
+    res.json({
+      status: {
+        local_id: datosLocal.local_id,
+        misiones_puntos: datosLocal.misiones_puntos || 0,
+        estado_manual: datosLocal.estado_manual || 'AUTO',
+        plan_tipo: datosLocal.plan_tipo
+      },
+      items: productosRes.rows
+    });
 
   } catch (error) {
-    console.error(error);
+    console.error("Error en GET productos:", error);
     res.status(500).json({ error: 'Error al obtener inventario' });
   }
 });
 
 // ==========================================
-// RUTA 7: ACTUALIZAR NEGOCIO (HÍBRIDO: GPS O PRODUCTOS)
+// RUTA 7: ACTUALIZAR NEGOCIO (HÍBRIDO: GPS O PRODUCTOS) [ACTUALIZADA]
 // ==========================================
 app.put('/api/mi-negocio/actualizar', async (req, res) => {
   const authHeader = req.headers['authorization'];
@@ -458,17 +422,22 @@ app.put('/api/mi-negocio/actualizar', async (req, res) => {
     // Para GPS
     lat, long,
     // Para Productos
-    inventario_id, nuevo_precio, nuevo_stock, nueva_foto, nuevo_nombre, nuevo_desc 
+    inventario_id, 
+    nuevo_precio, 
+    nuevo_stock, 
+    nuevo_foto, 
+    nuevo_nombre, 
+    nuevo_desc,
+    codigo_barras // <--- NUEVO: Recibimos el código al editar
   } = req.body;
 
   try {
-    const usuario = jwt.verify(token, JWT_SECRET);
+    const usuario = jwt.verify(token, process.env.JWT_SECRET);
 
     // ---------------------------------------------------------
     // CASO A: ACTUALIZAR UBICACIÓN GPS (PIN DEL MAPA)
     // ---------------------------------------------------------
     if (lat && long) {
-      // MAGIA POSTGIS: (Longitud primero, Latitud segundo)
       const queryGPS = `
         UPDATE locales 
         SET ubicacion = ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography
@@ -480,16 +449,22 @@ app.put('/api/mi-negocio/actualizar', async (req, res) => {
     }
 
     // ---------------------------------------------------------
-    // CASO B: ACTUALIZAR PRODUCTO (TU CÓDIGO ANTERIOR)
+    // CASO B: ACTUALIZAR PRODUCTO
     // ---------------------------------------------------------
     if (inventario_id) {
-      // 1. Actualizamos INVENTARIO LOCAL (Precio/Stock)
+      // 1. Actualizamos INVENTARIO LOCAL (Precio, Stock y CÓDIGO)
+      // Usamos COALESCE para que si el dato viene null, no borre lo que ya existía.
       const updateInventario = `
         UPDATE inventario_local 
-        SET precio = $1, stock = $2
+        SET 
+          precio = $1, 
+          stock = $2,
+          codigo_barras = COALESCE($4, codigo_barras) -- <--- AQUÍ ACTUALIZAMOS EL CÓDIGO
         WHERE inventario_id = $3
       `;
-      await pool.query(updateInventario, [nuevo_precio, nuevo_stock, inventario_id]);
+      
+      // El orden del array es: precio ($1), stock ($2), ID ($3), codigo ($4)
+      await pool.query(updateInventario, [nuevo_precio, nuevo_stock, inventario_id, codigo_barras]);
 
       // 2. Actualizamos CATALOGO GLOBAL (Nombre, Descripción, Foto)
       const getGlobal = await pool.query('SELECT global_id FROM inventario_local WHERE inventario_id = $1', [inventario_id]);
@@ -502,10 +477,11 @@ app.put('/api/mi-negocio/actualizar', async (req, res) => {
           SET nombre_oficial = $1, descripcion = $2 
           WHERE global_id = $3
         `;
-        await pool.query(queryCatalogo, [nuevo_nombre, nueva_desc, globalId]);
+        
+        await pool.query(queryCatalogo, [nuevo_nombre, nuevo_desc, globalId]);
 
-        if (nueva_foto) {
-          await pool.query('UPDATE catalogo_global SET foto_url = $1 WHERE global_id = $2', [nueva_foto, globalId]);
+        if (nuevo_foto) {
+          await pool.query('UPDATE catalogo_global SET foto_url = $1 WHERE global_id = $2', [nuevo_foto, globalId]);
         }
       }
 
@@ -525,12 +501,10 @@ app.put('/api/mi-negocio/actualizar', async (req, res) => {
 // MÓDULO DE AUTENTICACIÓN (SEGURIDAD)
 // ==========================================
 
-// RUTA 3: REGISTRO AVANZADO (CON CÓDIGO DE SOCIO)
+// RUTA 3: REGISTRO AVANZADO (CON CÓDIGO DE SOCIO Y LEVEL UP AUTOMÁTICO)
 app.post('/api/auth/registro', async (req, res) => {
-  // AHORA RECIBIMOS 'codigo_socio'
   const { nombre, email, password, tipo, nombre_tienda, categoria, whatsapp, direccion, tipo_actividad, rubro, lat, long, codigo_socio } = req.body;
 
-  // 1. Validaciones básicas
   if (!email || !password || !nombre || !tipo) {
     return res.status(400).json({ error: 'Faltan datos obligatorios' });
   }
@@ -544,11 +518,9 @@ app.post('/api/auth/registro', async (req, res) => {
   try {
     await client.query('BEGIN'); 
 
-    // 2. Encriptar contraseña
     const salt = await bcrypt.genSalt(10);
     const passwordEncriptada = await bcrypt.hash(password, salt);
 
-    // 3. Crear el USUARIO
     const userQuery = `
       INSERT INTO usuarios (nombre_completo, email, password_hash, tipo, nivel_confianza)
       VALUES ($1, $2, $3, $4, 0)
@@ -557,34 +529,26 @@ app.post('/api/auth/registro', async (req, res) => {
     const userRes = await client.query(userQuery, [nombre, email, passwordEncriptada, tipo]);
     const nuevoUsuario = userRes.rows[0];
 
-    // 4. Si es VENDEDOR, procesamos Local y SOCIO
+    // Variable para guardar el ID del socio si se usó código
+    let socioIdEncontrado = null; 
+
     if (tipo === 'Minorista' || tipo === 'Mayorista') {
       
-      let socioId = null; // Por defecto nadie lo refirió
-
-      // --- LÓGICA DE SOCIOS (NUEVO) ---
       if (codigo_socio) {
-        // A. Buscamos al dueño del código
         const socioRes = await client.query('SELECT socio_id, usuario_id FROM socios WHERE codigo_referido = $1', [codigo_socio]);
         
         if (socioRes.rows.length > 0) {
           const datosSocio = socioRes.rows[0];
           
-          // B. Anti-Fraude: No puedes referirte a ti mismo
-          // (Aunque es un usuario nuevo, verificamos por si acaso hay lógica cruzada futura)
           if (datosSocio.usuario_id === nuevoUsuario.usuario_id) {
-             // Si pasa esto, ignoramos el código silenciosamente o lanzamos error. 
-             // En registro nuevo es raro que pase, pero mejor prevenir.
              console.warn("Intento de auto-referencia en registro.");
           } else {
-             socioId = datosSocio.socio_id; // ¡Código Válido!
+             socioIdEncontrado = datosSocio.socio_id; 
           }
         } else {
-          // Si el código no existe, lanzamos error para que el usuario corrija
           throw new Error(`El código de socio "${codigo_socio}" no existe. Verifica si lo escribiste bien.`);
         }
       }
-      // -------------------------------
 
       const latitudFinal = lat || -45.86;
       const longitudFinal = long || -67.48;
@@ -594,7 +558,6 @@ app.post('/api/auth/registro', async (req, res) => {
           fotoDefecto = 'https://cdn-icons-png.flaticon.com/512/1063/1063376.png'; 
       }
 
-      // INSERTAMOS EL LOCAL CON EL SOCIO VINCULADO
       const localQuery = `
         INSERT INTO locales 
         (usuario_id, nombre, categoria, ubicacion, whatsapp, permite_retiro, permite_delivery, direccion_fisica, tipo_actividad, rubro, foto_url, referido_por_socio_id)
@@ -616,18 +579,24 @@ app.post('/api/auth/registro', async (req, res) => {
         tipo_actividad || 'PRODUCTO',
         rubro || 'General',
         fotoDefecto,
-        socioId // <--- EL DATO DEL SOCIO ($13)
+        socioIdEncontrado 
       ]);
     }
 
     await client.query('COMMIT'); 
+
+    // --- NUEVO: SI HUBO SOCIO, RECALCULAMOS SU NIVEL AUTOMÁTICAMENTE ---
+    if (socioIdEncontrado) {
+       // Ejecutamos en segundo plano (sin await para no demorar la respuesta)
+       actualizarNivelSocio(socioIdEncontrado);
+    }
+    // -------------------------------------------------------------------
 
     res.json({ mensaje: 'Registro exitoso', usuario: nuevoUsuario });
 
   } catch (error) {
     await client.query('ROLLBACK');
     console.error(error);
-    // Manejo de errores amigable
     if (error.message.includes("código de socio")) {
         return res.status(400).json({ error: error.message });
     }
@@ -743,7 +712,7 @@ app.get('/api/transaccion/mis-compras', async (req, res) => {
 });
 
 // ==========================================
-// RUTA 5: COMPRA MÚLTIPLE (CARRITO) - CON SNAPSHOT Y CUPONES 🎁
+// RUTA 5: COMPRA MÚLTIPLE (CARRITO) - CON SNAPSHOT, CUPONES Y SOCIOS 🤝
 // ==========================================
 app.post('/api/transaccion/comprar', async (req, res) => {
   const authHeader = req.headers['authorization'];
@@ -764,104 +733,108 @@ app.post('/api/transaccion/comprar', async (req, res) => {
 
     await client.query('BEGIN');
 
-    // 2. Buscamos al vendedor
-    const vendedorRes = await client.query('SELECT usuario_id FROM locales WHERE local_id = $1', [local_id]);
-    if (vendedorRes.rows.length === 0) throw new Error('Local no encontrado');
-    const vendedor_id = vendedorRes.rows[0].usuario_id;
+    // 2. Buscamos al vendedor Y DATOS DEL SOCIO (PADRINO)
+    // --- ACTUALIZACIÓN: Traemos referido_por_socio_id y porcentaje_ganancia ---
+    const localRes = await client.query(`
+      SELECT 
+        L.usuario_id, 
+        L.referido_por_socio_id,
+        S.porcentaje_ganancia -- El nivel del socio (5%, 7.5%, etc)
+      FROM locales L
+      LEFT JOIN socios S ON L.referido_por_socio_id = S.socio_id
+      WHERE L.local_id = $1
+    `, [local_id]);
+
+    if (localRes.rows.length === 0) throw new Error('Local no encontrado');
+    
+    const vendedor_id = localRes.rows[0].usuario_id;
+    const socioId = localRes.rows[0].referido_por_socio_id; // ID del Socio
+    // Si tiene socio, usamos su porcentaje de la BD, si no, 0. (Default 5.00 si es null)
+    const porcentajeSocio = socioId ? parseFloat(localRes.rows[0].porcentaje_ganancia || 5.00) : 0;
 
     if (comprador_id === vendedor_id) {
       throw new Error('No puedes realizar compras en tu propio negocio.');
     }
 
     // ============================================================
-    // 3. LÓGICA DE CANJE DE CUPÓN (CON INSERCIÓN EN BD) 🎟️
+    // 3. LÓGICA DE CANJE DE CUPÓN 🎟️ (Sin cambios, se mantiene tu lógica)
     // ============================================================
     let infoPremio = ""; 
     let tituloNotif = "¡Nueva Orden Entrante! 📦";
 
     if (usar_cupon === true) {
-      // A. Verificar si tiene cupones reales disponibles
       const checkCupón = await client.query(
         'SELECT cupones_disponibles FROM progreso_fidelizacion WHERE usuario_id = $1 AND local_id = $2 FOR UPDATE',
         [comprador_id, local_id]
       );
 
       if (checkCupón.rows.length > 0 && checkCupón.rows[0].cupones_disponibles > 0) {
-        // B. Descontar 1 cupón
         await client.query(
           'UPDATE progreso_fidelizacion SET cupones_disponibles = cupones_disponibles - 1 WHERE usuario_id = $1 AND local_id = $2',
           [comprador_id, local_id]
         );
         
-        // C. Buscar nombre del premio
         const premioRes = await client.query('SELECT premio_descripcion FROM config_fidelizacion WHERE local_id = $1', [local_id]);
         const nombrePremio = premioRes.rows[0]?.premio_descripcion || "Premio Sorpresa";
         
         infoPremio = `\n🎁 DEBES ENTREGAR PREMIO: ${nombrePremio}`;
         tituloNotif = "¡Venta con PREMIO CANJEADO! 🎁";
 
-        // --- D. INSERTAR EL PREMIO COMO UN ITEM DE VENTA ($0) ---
-        // Esto es lo que faltaba: Creamos una fila física en la orden
+        // Insertamos el premio ($0 costo, $0 comisión)
         const insertPremio = `
             INSERT INTO transacciones_p2p 
-            (comprador_id, vendedor_id, producto_global_id, cantidad, monto_total, estado, tipo_entrega, compra_uuid, nombre_snapshot, foto_snapshot)
-            VALUES ($1, $2, NULL, 1, 0, 'APROBADO', $3, $4, $5, $6)
+            (comprador_id, vendedor_id, producto_global_id, cantidad, monto_total, estado, tipo_entrega, compra_uuid, nombre_snapshot, foto_snapshot, comision_plataforma)
+            VALUES ($1, $2, NULL, 1, 0, 'APROBADO', $3, $4, $5, $6, 0)
         `;
-        
-        // Usamos una foto genérica de regalo o null
         const fotoRegalo = "https://cdn-icons-png.flaticon.com/512/4213/4213958.png"; 
 
         await client.query(insertPremio, [
-            comprador_id, 
-            vendedor_id, 
-            tipo_entrega,
-            compraUuid,
-            `🎁 PREMIO: ${nombrePremio}`, // Nombre destacado
-            fotoRegalo
+            comprador_id, vendedor_id, tipo_entrega, compraUuid,
+            `🎁 PREMIO: ${nombrePremio}`, fotoRegalo
         ]);
-        // --------------------------------------------------------
         
       } else {
-        throw new Error("Error: No tienes cupones disponibles para canjear en este local.");
+        throw new Error("Error: No tienes cupones disponibles.");
       }
     }
+
     // ============================================================
-
+    // 4. ITEMS PAGADOS (Con cálculo de comisión individual) 💰
+    // ============================================================
     let montoTotalPedido = 0; 
+    let comisionTotalPlataforma = 0; // Acumulador para saber cuánto ganamos nosotros
+    let ultimoTransaccionId = null;  // Para vincular el historial
 
-    // 4. Iteramos items normales (PAGOS)
     for (const item of items) {
-        // A. Validar Stock y Obtener SNAPSHOT
-        const stockQuery = `
-            SELECT stock, global_id, tipo_item, nombre, foto_url 
-            FROM inventario_local 
-            WHERE inventario_id = $1 FOR UPDATE
-        `;
+        // A. Validar Stock
+        const stockQuery = `SELECT stock, global_id, tipo_item, nombre, foto_url FROM inventario_local WHERE inventario_id = $1 FOR UPDATE`;
         const stockRes = await client.query(stockQuery, [item.inventario_id]);
         
         if (stockRes.rows.length === 0) throw new Error(`Producto no disponible`);
         const datosReales = stockRes.rows[0];
 
         if (datosReales.tipo_item === 'PRODUCTO_STOCK') {
-            if (datosReales.stock < item.cantidad) {
-                throw new Error(`Stock insuficiente para ${datosReales.nombre}`);
-            }
-            // B. Restar Stock
-            await client.query('UPDATE inventario_local SET stock = stock - $1 WHERE inventario_id = $2', 
-                [item.cantidad, item.inventario_id]);
+            if (datosReales.stock < item.cantidad) throw new Error(`Stock insuficiente para ${datosReales.nombre}`);
+            await client.query('UPDATE inventario_local SET stock = stock - $1 WHERE inventario_id = $2', [item.cantidad, item.inventario_id]);
         }
 
-        // C. Insertar con SNAPSHOT
+        // B. Cálculos Monetarios
         const totalItem = item.precio * item.cantidad;
         montoTotalPedido += totalItem;
 
+        // Calculamos el 1% de CercaMío para este item específico
+        const comisionItem = Math.round((totalItem * 0.01) * 100) / 100;
+        comisionTotalPlataforma += comisionItem;
+
+        // C. Insertar Transacción (Agregamos comision_plataforma)
         const insertTx = `
             INSERT INTO transacciones_p2p 
-            (comprador_id, vendedor_id, producto_global_id, cantidad, monto_total, estado, tipo_entrega, compra_uuid, nombre_snapshot, foto_snapshot)
-            VALUES ($1, $2, $3, $4, $5, 'APROBADO', $6, $7, $8, $9)
+            (comprador_id, vendedor_id, producto_global_id, cantidad, monto_total, estado, tipo_entrega, compra_uuid, nombre_snapshot, foto_snapshot, comision_plataforma)
+            VALUES ($1, $2, $3, $4, $5, 'APROBADO', $6, $7, $8, $9, $10)
+            RETURNING transaccion_id
         `;
         
-        await client.query(insertTx, [
+        const txRes = await client.query(insertTx, [
             comprador_id, 
             vendedor_id, 
             datosReales.global_id, 
@@ -870,16 +843,50 @@ app.post('/api/transaccion/comprar', async (req, res) => {
             tipo_entrega,
             compraUuid,
             datosReales.nombre,   
-            datosReales.foto_url  
+            datosReales.foto_url,
+            comisionItem // <--- Guardamos cuánto ganamos en este item
         ]);
+
+        ultimoTransaccionId = txRes.rows[0].transaccion_id;
+    }
+
+    // ============================================================
+    // 5. REPARTO DE GANANCIAS AL SOCIO (REVENUE SHARE) 🤝
+    // ============================================================
+    if (socioId && comisionTotalPlataforma > 0) {
+       
+       // Ganancia Socio = Nuestra Ganancia * (Su Porcentaje / 100)
+       // Ejemplo: Ganamos $100 * (5% del socio) = $5 para él.
+       const gananciaSocio = Math.round((comisionTotalPlataforma * (porcentajeSocio / 100)) * 100) / 100;
+
+       if (gananciaSocio > 0) {
+         // A. Acreditar en Billetera
+         await client.query(`UPDATE socios SET saldo_acumulado = saldo_acumulado + $1 WHERE socio_id = $2`, [gananciaSocio, socioId]);
+
+         // B. Auditoría
+         await client.query(`
+            INSERT INTO historial_comisiones 
+            (socio_id, transaccion_origen_id, local_origen_id, monto_comision, porcentaje_aplicado, base_calculo_plataforma)
+            VALUES ($1, $2, $3, $4, $5, $6)
+         `, [socioId, ultimoTransaccionId, local_id, gananciaSocio, porcentajeSocio, comisionTotalPlataforma]);
+         
+         console.log(`✅ Socio #${socioId} ganó $${gananciaSocio} (Base CercaMío: $${comisionTotalPlataforma})`);
+       }
     }
 
     await client.query('COMMIT');
 
-    // 5. Notificar
+    // 6. Notificar
     const mensajeVendedor = `${nombreComprador} realizó un pedido de ${items.length} items pagados. Total: $${montoTotalPedido}.${infoPremio}`;
-    
     enviarNotificacion(vendedor_id, tituloNotif, mensajeVendedor);
+
+    // Opcional: Notificar al Socio si ganó algo
+    if (socioId) {
+        const sUser = await pool.query('SELECT usuario_id FROM socios WHERE socio_id = $1', [socioId]);
+        if (sUser.rows.length > 0) {
+           // enviarNotificacion(sUser.rows[0].usuario_id, "¡Kaching! 🤑", "Sumaste saldo por ventas de tus referidos.");
+        }
+    }
 
     res.json({ mensaje: 'Compra realizada con éxito', orden_id: compraUuid });
 
@@ -892,58 +899,59 @@ app.post('/api/transaccion/comprar', async (req, res) => {
   }
 });
 
-// RUTA 9: CONVERTIRSE EN VENDEDOR (CON CÓDIGO DE SOCIO)
+// ==========================================
+// RUTA 9: CONVERTIRSE EN VENDEDOR (VERSIÓN LIMPIA 🛡️)
+// ==========================================
 app.post('/api/auth/convertir-vendedor', async (req, res) => {
   const authHeader = req.headers['authorization'];
   if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
   const token = authHeader.split(' ')[1];
 
-  // AHORA RECIBIMOS 'codigo_socio'
+  // Recibimos los datos del formulario
   const { nombre_tienda, categoria, whatsapp, direccion, tipo_actividad, rubro, lat, long, codigo_socio } = req.body;
 
   const client = await pool.connect();
+
   try {
-    const usuario = jwt.verify(token, JWT_SECRET);
-    await client.query('BEGIN');
+    const usuario = jwt.verify(token, process.env.JWT_SECRET);
+    
+    await client.query('BEGIN'); // Iniciamos la transacción
 
-    // --- LÓGICA DE SOCIOS (VALIDACIÓN ANTI-FRAUDE) ---
-    let socioId = null;
+    let socioIdEncontrado = null;
 
+    // 1. VALIDAR CÓDIGO DE SOCIO (Si existe)
     if (codigo_socio) {
+      // Solo pedimos IDs, no nombres, para evitar errores de SQL
       const socioRes = await client.query('SELECT socio_id, usuario_id FROM socios WHERE codigo_referido = $1', [codigo_socio]);
       
       if (socioRes.rows.length > 0) {
         const datosSocio = socioRes.rows[0];
-        
-        // 🛡️ ANTI-FRAUDE: El usuario logueado NO puede usar su propio código de socio
         if (datosSocio.usuario_id === usuario.id) {
-           throw new Error("¡No puedes usar tu propio código de socio para tu tienda!");
+           throw new Error("¡No puedes usar tu propio código de socio!");
         }
-        
-        socioId = datosSocio.socio_id;
+        socioIdEncontrado = datosSocio.socio_id;
       } else {
-        throw new Error(`El código de socio "${codigo_socio}" no es válido.`);
+        throw new Error(`El código "${codigo_socio}" no es válido.`);
       }
     }
-    // --------------------------------------------------
 
-    // 1. Actualizamos el tipo de usuario
+    // 2. ACTUALIZAR EL TIPO DE USUARIO
     const nuevoTipoUsuario = (tipo_actividad === 'SERVICIO') ? 'Profesional' : categoria;
-
     await client.query(
       'UPDATE usuarios SET tipo = $1 WHERE usuario_id = $2',
       [nuevoTipoUsuario, usuario.id]
     );
 
-    // 2. Creamos su Local CON EL SOCIO
+    // 3. PREPARAR DATOS GEOGRÁFICOS Y FOTO
     const latitudFinal = lat || -45.86;
     const longitudFinal = long || -67.48;
-
+    
     let fotoDefecto = 'https://cdn-icons-png.flaticon.com/512/3081/3081559.png';
     if (tipo_actividad === 'SERVICIO') {
         fotoDefecto = 'https://cdn-icons-png.flaticon.com/512/1063/1063376.png';
     }
 
+    // 4. INSERTAR EL LOCAL (LA TIENDA)
     const localQuery = `
       INSERT INTO locales 
       (usuario_id, nombre, categoria, ubicacion, whatsapp, permite_retiro, permite_delivery, direccion_fisica, tipo_actividad, rubro, foto_url, referido_por_socio_id)
@@ -961,22 +969,34 @@ app.post('/api/auth/convertir-vendedor', async (req, res) => {
       tipo_actividad || 'PRODUCTO',
       rubro || 'General',
       fotoDefecto,
-      socioId // <--- VINCULAMOS AL SOCIO AQUÍ ($11)
+      socioIdEncontrado
     ]);
 
-    await client.query('COMMIT');
-    res.json({ mensaje: '¡Felicidades! Perfil profesional creado y vinculado.' });
+    await client.query('COMMIT'); // 🔒 GUARDAMOS CAMBIOS
+
+    // 5. RESPONDER AL FRONTEND INMEDIATAMENTE
+    console.log(`✅ Tienda creada para usuario ID: ${usuario.id}`);
+    res.json({ mensaje: '¡Perfil profesional creado exitosamente!' });
+
+    // 6. TAREAS SECUNDARIAS (Nivel Socio)
+    // Lo hacemos fuera del flujo principal para que si falla, no rompa la tienda creada.
+    if (socioIdEncontrado) {
+       // Llamamos a la función auxiliar sin await bloqueante o con catch propio
+       actualizarNivelSocio(socioIdEncontrado).catch(err => console.error("Error actualizando nivel (ignorable):", err.message));
+    }
 
   } catch (error) {
-    await client.query('ROLLBACK');
-    console.error(error);
+    await client.query('ROLLBACK'); // Si algo falló antes del commit, deshacemos
+    console.error("❌ Error creando tienda:", error);
     
-    // Devolvemos el mensaje de error específico (Ej: Codigo invalido o auto-referencia)
-    if (error.message.includes("código") || error.message.includes("propio")) {
+    if (error.message && (error.message.includes("código") || error.message.includes("propio"))) {
        return res.status(400).json({ error: error.message });
     }
     
-    res.status(500).json({ error: 'Error al actualizar cuenta' });
+    // Solo respondemos si no se respondió antes
+    if (!res.headersSent) {
+        res.status(500).json({ error: 'Error al crear la tienda.' });
+    }
   } finally {
     client.release();
   }
@@ -1182,71 +1202,106 @@ app.post('/api/upload', upload.single('imagen'), async (req, res) => {
   }
 });
 
-// RUTA 13: CREAR PRODUCTO/SERVICIO (ALTA)
+// RUTA 13: CREAR PRODUCTO (BLINDADA 🛡️)
 app.post('/api/mi-negocio/crear-item', async (req, res) => {
   const authHeader = req.headers['authorization'];
   if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
   const token = authHeader.split(' ')[1];
 
-  // Recibimos todos los datos del formulario
   const { 
-    nombre, 
-    descripcion, 
-    precio, 
-    foto_url, 
-    tipo_item, // 'PRODUCTO_STOCK', 'PRODUCTO_PEDIDO', 'SERVICIO'
-    stock_inicial 
+    nombre, descripcion, precio, foto_url, tipo_item, stock_inicial,
+    codigo_barras // <--- ESTE DATO ES CRÍTICO
   } = req.body;
 
   const client = await pool.connect();
 
   try {
-    const usuario = jwt.verify(token, JWT_SECRET);
+    const usuario = jwt.verify(token, process.env.JWT_SECRET);
     await client.query('BEGIN');
 
-    // 1. Buscar el ID del local del usuario
+    // 1. Obtener Local
     const localRes = await client.query('SELECT local_id, categoria FROM locales WHERE usuario_id = $1', [usuario.id]);
-    if (localRes.rows.length === 0) throw new Error('No tienes un local registrado');
-    const localId = localRes.rows[0].local_id;
-    const categoriaLocal = localRes.rows[0].categoria; // Para saber la categoría del producto
+    if (localRes.rows.length === 0) throw new Error('No tienes local');
+    const { local_id, categoria } = localRes.rows[0];
 
-    // 2. Insertar en CATALOGO GLOBAL
-    // Usamos un código de barras ficticio aleatorio para evitar choques por ahora
-    const randomEAN = Math.floor(Math.random() * 1000000000).toString();
-    
-    const catalogoQuery = `
-      INSERT INTO catalogo_global (nombre_oficial, descripcion, foto_url, categoria, codigo_barras)
-      VALUES ($1, $2, $3, $4, $5)
-      RETURNING global_id
-    `;
-    // Usamos la categoría del local como categoría del producto por defecto
-    const catRes = await client.query(catalogoQuery, [nombre, descripcion, foto_url, categoriaLocal, randomEAN]);
-    const globalId = catRes.rows[0].global_id;
+    let globalId = null;
 
-    // 3. Insertar en INVENTARIO LOCAL
-    // Si es Servicio o Por Pedido, el stock es irrelevante (ponemos 999 o null), si es stock fisico usamos el dato.
-    let stockFinal = stock_inicial;
-    if (tipo_item !== 'PRODUCTO_STOCK') {
-        stockFinal = 9999; // Stock infinito lógico
+    // 2. LOGICA GLOBAL (Solo si hay código)
+    if (codigo_barras) {
+        // Buscamos si existe en global
+        const checkGlobal = await client.query('SELECT global_id FROM catalogo_global WHERE codigo_barras = $1', [codigo_barras]);
+        
+        if (checkGlobal.rows.length > 0) {
+            globalId = checkGlobal.rows[0].global_id; // Vinculamos
+        } else {
+            // Creamos en global para ayudar a otros
+            const insertGlobal = `
+              INSERT INTO catalogo_global (nombre_oficial, descripcion, foto_url, categoria, codigo_barras, creado_por_usuario_id)
+              VALUES ($1, $2, $3, $4, $5, $6) RETURNING global_id
+            `;
+            const resG = await client.query(insertGlobal, [nombre, descripcion, foto_url, categoria, codigo_barras, usuario.id]);
+            globalId = resG.rows[0].global_id;
+        }
+    } else {
+        // Producto sin código (Manual)
+        const insertGlobal = `INSERT INTO catalogo_global (nombre_oficial, descripcion, foto_url, categoria) VALUES ($1, $2, $3, $4) RETURNING global_id`;
+        const resG = await client.query(insertGlobal, [nombre, descripcion, foto_url, categoria]);
+        globalId = resG.rows[0].global_id;
     }
 
-    const invQuery = `
-      INSERT INTO inventario_local (local_id, global_id, precio, stock, tipo_item)
-      VALUES ($1, $2, $3, $4, $5)
+    // 3. INSERTAR EN INVENTARIO LOCAL (AQUÍ ESTABA EL POSIBLE ERROR)
+    let stock = tipo_item === 'PRODUCTO_STOCK' ? stock_inicial : 9999;
+
+    const insertLocal = `
+      INSERT INTO inventario_local 
+      (local_id, global_id, precio, stock, tipo_item, codigo_barras)
+      VALUES ($1, $2, $3, $4, $5, $6) -- <--- Aseguramos que $6 se guarde
     `;
-    await client.query(invQuery, [localId, globalId, precio, stockFinal, tipo_item]);
+    
+    await client.query(insertLocal, [local_id, globalId, precio, stock, tipo_item, codigo_barras]);
 
     await client.query('COMMIT');
-    res.json({ mensaje: 'Ítem creado exitosamente' });
+    res.json({ mensaje: 'Producto creado correctamente' });
 
   } catch (error) {
     await client.query('ROLLBACK');
-    console.error(error);
-    res.status(500).json({ error: 'Error al crear ítem' });
+    console.error("Error creando item:", error);
   } finally {
     client.release();
   }
 });
+
+// ==========================================
+// RUTA 13-2: ESCÁNER DE PRODUCTOS (BUSCA EN GLOBAL O EXTERNO) 🔍
+// ==========================================
+app.get('/api/producto/scan/:codigo', async (req, res) => {
+  const { codigo } = req.params;
+
+  try {
+    // 1. Buscamos en NUESTRO Catálogo Global
+    const globalRes = await pool.query(
+      'SELECT * FROM catalogo_global WHERE codigo_barras = $1', 
+      [codigo]
+    );
+
+    if (globalRes.rows.length > 0) {
+      return res.json({ 
+        encontrado: true, 
+        fuente: 'CercaMío Global',
+        producto: globalRes.rows[0] 
+      });
+    }
+
+    // 2. (Futuro) Aquí podrías conectar a OpenFoodFacts API
+    // Por ahora devolvemos "No encontrado" para que el usuario lo cree
+    res.json({ encontrado: false });
+
+  } catch (error) {
+    console.error("Error escáner:", error);
+    res.status(500).json({ error: 'Error al buscar producto' });
+  }
+});
+
 
 // RUTA 14: ELIMINAR ÍTEM
 app.delete('/api/mi-negocio/eliminar/:id', async (req, res) => {
@@ -1324,7 +1379,9 @@ app.post('/api/transaccion/calificar', upload.single('foto'), async (req, res) =
   }
 });
 
-// RUTA 16: PERFIL PÚBLICO (CON FIDELIZACIÓN 🎟️)
+// ==========================================
+// RUTA 16: PERFIL PÚBLICO (CON FOTOS, PORTADA Y FIDELIZACIÓN 📸🎟️)
+// ==========================================
 app.get('/api/perfil-publico/:id', async (req, res) => {
   const local_id = req.params.id;
   
@@ -1334,16 +1391,23 @@ app.get('/api/perfil-publico/:id', async (req, res) => {
   if (authHeader) {
     try {
       const token = authHeader.split(' ')[1];
-      const decoded = jwt.verify(token, JWT_SECRET);
+      const decoded = jwt.verify(token, process.env.JWT_SECRET); // Usar process.env por seguridad
       usuarioId = decoded.id;
     } catch(e) {}
   }
 
   try {
-    // 1. DATOS DEL LOCAL
+    // 1. DATOS DEL LOCAL (ACTUALIZADO CON BRANDING)
     const queryLocal = `
       SELECT 
-        usuario_id, local_id, nombre, categoria, rubro, foto_url, reputacion, 
+        usuario_id, local_id, nombre, categoria, rubro, 
+        
+        -- 🔥 FOTOS INTELIGENTES 🔥
+        -- Si hay foto de perfil nueva, la usa. Si no, usa la vieja.
+        COALESCE(foto_perfil, foto_url) as foto_url,
+        foto_portada, -- <--- NUEVA COLUMNA AGREGADA
+        
+        reputacion, 
         direccion_fisica, whatsapp, hora_apertura, hora_cierre, dias_atencion,
         estado_manual, permite_delivery, permite_retiro,
         pago_efectivo, pago_transferencia, pago_tarjeta
@@ -1367,6 +1431,7 @@ app.get('/api/perfil-publico/:id', async (req, res) => {
       FROM inventario_local I 
       LEFT JOIN catalogo_global C ON I.global_id = C.global_id 
       WHERE I.local_id = $1
+      ORDER BY I.inventario_id DESC
     `;
 
     const prodRes = await pool.query(queryProductos, [local_id]);
@@ -1399,7 +1464,7 @@ app.get('/api/perfil-publico/:id', async (req, res) => {
       }
     }
 
-    // 5. FIDELIZACIÓN (NUEVO AGREGADO 🎟️)
+    // 5. FIDELIZACIÓN
     let datosFidelidad = null;
     
     const queryFidelidad = `
@@ -1407,13 +1472,13 @@ app.get('/api/perfil-publico/:id', async (req, res) => {
         C.meta_sellos,
         C.premio_descripcion,
         C.monto_minimo,
-        C.estado as es_activo, -- <--- AHORA TRAEMOS EL ESTADO
+        C.estado as es_activo,
         COALESCE(P.sellos_acumulados, 0) as mis_sellos,
         COALESCE(P.cupones_disponibles, 0) as mis_cupones
       FROM config_fidelizacion C
       LEFT JOIN progreso_fidelizacion P 
         ON C.local_id = P.local_id AND P.usuario_id = $2
-      WHERE C.local_id = $1 -- <--- QUITAMOS EL FILTRO "AND estado = TRUE"
+      WHERE C.local_id = $1
     `;
     
     const fidelidadRes = await pool.query(queryFidelidad, [local_id, usuarioId]);
@@ -1429,7 +1494,7 @@ app.get('/api/perfil-publico/:id', async (req, res) => {
       reseñas: reviewRes.rows,
       es_favorito: esFavorito,
       es_propio: esPropio,
-      fidelizacion: datosFidelidad // <--- Objeto con reglas y sellos (o null)
+      fidelizacion: datosFidelidad
     });
 
   } catch (error) {
@@ -1438,7 +1503,9 @@ app.get('/api/perfil-publico/:id', async (req, res) => {
   }
 });
 
-// RUTA 17: TOGGLE FAVORITO (DAR/QUITAR LIKE)
+// ==========================================
+// RUTA 17: TOGGLE FAVORITO (CON MISIONES ESCALONADAS 🏆)
+// ==========================================
 app.post('/api/favoritos/toggle', async (req, res) => {
   const authHeader = req.headers['authorization'];
   if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
@@ -1448,21 +1515,85 @@ app.post('/api/favoritos/toggle', async (req, res) => {
   try {
     const usuario = jwt.verify(token, JWT_SECRET);
 
-    // 1. Verificar si ya existe
+    // 1. Toggle Favorito (Estándar)
     const check = await pool.query(
       'SELECT favorito_id FROM favoritos WHERE usuario_id = $1 AND local_id = $2', 
       [usuario.id, local_id]
     );
 
+    let accion = '';
     if (check.rows.length > 0) {
-      // SI EXISTE -> BORRAR (DESMARCAR)
       await pool.query('DELETE FROM favoritos WHERE usuario_id = $1 AND local_id = $2', [usuario.id, local_id]);
-      res.json({ estado: false, mensaje: 'Eliminado de favoritos' });
+      accion = 'borrado';
     } else {
-      // NO EXISTE -> AGREGAR (MARCAR)
       await pool.query('INSERT INTO favoritos (usuario_id, local_id) VALUES ($1, $2)', [usuario.id, local_id]);
-      res.json({ estado: true, mensaje: 'Agregado a favoritos' });
+      accion = 'agregado';
     }
+
+    // =================================================================
+    // 2. LÓGICA DE MISIONES ESCALONADAS (20 -> 60 -> 100)
+    // =================================================================
+    if (accion === 'agregado') {
+        // A. Anti-Fraude: Solo cuentan usuarios que compraron alguna vez
+        const checkCompras = await pool.query(
+            'SELECT 1 FROM transacciones_p2p WHERE comprador_id = $1 AND estado = $2 LIMIT 1', 
+            [usuario.id, 'APROBADO']
+        );
+
+        if (checkCompras.rows.length > 0) {
+            // B. Sumar Punto
+            const updateRes = await pool.query(
+                'UPDATE locales SET misiones_puntos = misiones_puntos + 1 WHERE local_id = $1 RETURNING misiones_puntos, usuario_id', 
+                [local_id]
+            );
+            
+            const puntos = updateRes.rows[0].misiones_puntos;
+            const idVendedor = updateRes.rows[0].usuario_id;
+            
+            // C. Evaluar Escalones de Premios 🎁
+            let mesesRegalo = 0;
+            let mensajePremio = "";
+
+            if (puntos === 20) {
+                mesesRegalo = 1;
+                mensajePremio = "¡Nivel 1 Completado! (20 Fans). Ganaste 1 Mes Premium GRATIS.";
+            } else if (puntos === 60) {
+                mesesRegalo = 2;
+                mensajePremio = "¡Nivel 2 Completado! (60 Fans). Ganaste 2 Meses Premium GRATIS.";
+            } else if (puntos === 100) {
+                mesesRegalo = 3;
+                mensajePremio = "¡Nivel MÁXIMO Completado! (100 Fans). Ganaste 3 Meses Premium GRATIS.";
+            }
+
+            // D. Si alcanzó un hito, aplicamos el premio
+            if (mesesRegalo > 0) {
+                // Query dinámica para sumar X meses
+                const intervaloSQL = `${mesesRegalo} months`; // Ej: '2 months'
+                
+                await pool.query(`
+                    UPDATE locales 
+                    SET 
+                      plan_tipo = 'PREMIUM',
+                      plan_vencimiento = CASE 
+                        WHEN plan_vencimiento > NOW() THEN plan_vencimiento + INTERVAL '${intervaloSQL}' 
+                        ELSE NOW() + INTERVAL '${intervaloSQL}' 
+                      END
+                    WHERE local_id = $1
+                `, [local_id]);
+
+                console.log(`🏆 Local ${local_id} alcanzó ${puntos} puntos. Premio: ${mesesRegalo} meses.`);
+                
+                // Notificar al Vendedor
+                enviarNotificacion(idVendedor, "¡Misión Cumplida! 🚀", mensajePremio);
+            }
+        }
+    }
+    // =================================================================
+
+    res.json({ 
+        estado: accion === 'agregado', 
+        mensaje: accion === 'agregado' ? 'Guardado en favoritos' : 'Eliminado de favoritos' 
+    });
 
   } catch (error) {
     console.error(error);
@@ -1543,25 +1674,24 @@ app.get('/api/mi-negocio/analytics', async (req, res) => {
 });
 
 // ==========================================
-// RUTA 20: ACTUALIZAR CONFIGURACIÓN COMPLETA (DATOS + PAGOS + VACACIONES)
+// RUTA 20: ACTUALIZAR CONFIGURACIÓN COMPLETA (CORREGIDA ✅)
 // ==========================================
 app.put('/api/mi-negocio/actualizar-todo', async (req, res) => {
   const authHeader = req.headers['authorization'];
   if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
   const token = authHeader.split(' ')[1];
 
-  // Recibimos TODO el paquete de datos del formulario Flutter
   const { 
     nombre, direccion, whatsapp, rubro,
     hora_apertura, hora_cierre, dias_atencion,
     permite_delivery, permite_retiro,
     pago_efectivo, pago_transferencia, pago_tarjeta,
-    // NUEVOS CAMPOS:
-    en_vacaciones, notif_nuevas_ventas, notif_preguntas
+    en_vacaciones, notif_nuevas_ventas, notif_preguntas, 
+    foto_perfil, foto_portada // Campos nuevos
   } = req.body;
 
   try {
-    const usuario = jwt.verify(token, JWT_SECRET);
+    const usuario = jwt.verify(token, process.env.JWT_SECRET);
 
     const updateQuery = `
       UPDATE locales 
@@ -1578,25 +1708,34 @@ app.put('/api/mi-negocio/actualizar-todo', async (req, res) => {
         pago_efectivo = $10,
         pago_transferencia = $11,
         pago_tarjeta = $12,
-        -- NUEVAS COLUMNAS
         en_vacaciones = $13,
         notif_nuevas_ventas = $14,
         notif_preguntas = $15,
-        -- LÓGICA INTELIGENTE: Si vacaciones=TRUE, forzamos estado a 'CERRADO'
-        estado_manual = CASE WHEN $13 = TRUE THEN 'CERRADO' ELSE estado_manual END
+        
+        -- LÓGICA DE ESTADO (Aquí faltaba la coma) 👇
+        estado_manual = CASE WHEN $13 = TRUE THEN 'CERRADO' ELSE estado_manual END, 
+        
+        -- FOTOS (Con COALESCE para no borrar si viene null)
+        foto_perfil = COALESCE($17, foto_perfil),
+        foto_portada = COALESCE($18, foto_portada)
+
       WHERE usuario_id = $16
     `;
     
+    // El orden del array debe coincidir EXACTAMENTE con los números $
     await pool.query(updateQuery, [
-      nombre, direccion, whatsapp, 
-      hora_apertura, hora_cierre, dias_atencion,
-      rubro, permite_delivery, permite_retiro,
-      pago_efectivo, pago_transferencia, pago_tarjeta,
-      en_vacaciones, notif_nuevas_ventas, notif_preguntas, // Params 13, 14, 15
-      usuario.id // ID al final ($16)
+      nombre, direccion, whatsapp,                        // $1, $2, $3
+      hora_apertura, hora_cierre, dias_atencion,          // $4, $5, $6
+      rubro, permite_delivery, permite_retiro,            // $7, $8, $9
+      pago_efectivo, pago_transferencia, pago_tarjeta,    // $10, $11, $12
+      en_vacaciones, notif_nuevas_ventas, notif_preguntas,// $13, $14, $15
+      
+      usuario.id,   // $16 (Va en el WHERE)
+      foto_perfil,  // $17
+      foto_portada  // $18
     ]);
 
-    res.json({ mensaje: 'Configuración y preferencias guardadas' });
+    res.json({ mensaje: 'Configuración y perfil guardados correctamente' });
 
   } catch (error) {
     console.error("Error actualizando todo:", error);
@@ -1628,49 +1767,55 @@ app.put('/api/mi-negocio/estado-manual', async (req, res) => {
 });
 
 // ==========================================
-// RUTA 22: LEER MI CONFIGURACIÓN (CON ESTADO MP)
+// RUTA 22: LEER CONFIGURACIÓN (BLINDADA CON ALIAS) 🛡️
 // ==========================================
 app.get('/api/mi-negocio/config', async (req, res) => {
   const authHeader = req.headers['authorization'];
   if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
-  const token = authHeader.split(' ')[1];
-
+  
   try {
-    const usuario = jwt.verify(token, JWT_SECRET);
+    const token = authHeader.split(' ')[1];
+    const usuario = jwt.verify(token, process.env.JWT_SECRET);
 
+    // Usamos 'l.' para asegurarnos de que pedimos datos de la tabla LOCALES
     const consulta = `
       SELECT 
-        nombre, 
-        direccion_fisica, 
-        whatsapp, 
-        hora_apertura, 
-        hora_cierre, 
-        dias_atencion,
-        rubro,
-        permite_delivery,
-        permite_retiro,
-        pago_efectivo,
-        pago_transferencia,
-        pago_tarjeta,
-        en_vacaciones,
-        notif_nuevas_ventas,
-        notif_preguntas,
-
-        -- 👇 ESTA ES LA LÍNEA MÁGICA 👇
-        -- Devuelve true si ya vinculó, false si no
-        (mp_access_token IS NOT NULL) as mp_vinculado
+        l.nombre, 
+        l.direccion_fisica as direccion, -- Alias para que Flutter lo entienda
+        l.whatsapp, 
+        l.rubro,
+        l.hora_apertura, 
+        l.hora_cierre, 
+        l.dias_atencion,
+        l.permite_delivery,
+        l.permite_retiro,
+        l.pago_efectivo,
+        l.pago_transferencia,
+        l.pago_tarjeta,
+        l.en_vacaciones,
+        l.notif_nuevas_ventas,
+        l.notif_preguntas,
+        l.foto_perfil,
+        l.foto_portada,
         
-      FROM locales WHERE usuario_id = $1
+        -- Verificamos si tiene token de MP
+        (l.mp_access_token IS NOT NULL) as mp_vinculado
+        
+      FROM locales l 
+      WHERE l.usuario_id = $1
     `;
     
     const respuesta = await pool.query(consulta, [usuario.id]);
 
-    if (respuesta.rows.length === 0) return res.status(404).json({ error: 'Local no encontrado' });
+    if (respuesta.rows.length === 0) {
+        // Si no tiene local, devolvemos 404 pero manejado
+        return res.status(404).json({ error: 'Local no encontrado' });
+    }
 
     res.json(respuesta.rows[0]);
 
   } catch (error) {
-    console.error(error);
+    console.error("Error GET Config:", error);
     res.status(500).json({ error: 'Error al leer configuración' });
   }
 });
@@ -2413,23 +2558,23 @@ app.post('/api/transaccion/avisar-llegada', async (req, res) => {
 
 
 // ==========================================
-// RUTA DE PAGOS: CHECKOUT MARKETPLACE (CON METADATA) 💸
+// RUTA DE PAGOS: CHECKOUT MARKETPLACE (OPTIMIZADO v3 - MP 100%) 🌟
 // ==========================================
 app.post('/api/pagos/crear-preferencia', async (req, res) => {
   const authHeader = req.headers['authorization'];
   if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
   
-  // Frontend nos manda items y el ID del local donde compra
+  // Frontend nos manda items y el ID del local
   const { items, local_id, tipo_entrega } = req.body; 
 
   if (!local_id) return res.status(400).json({ error: 'Falta el ID del local' });
 
   try {
-    // 0. Identificar al COMPRADOR (para guardarlo en metadata)
+    // 0. Identificar al COMPRADOR
     const token = authHeader.split(' ')[1];
     const usuarioComprador = jwt.verify(token, JWT_SECRET);
 
-    // 1. BUSCAR CREDENCIALES DEL VENDEDOR EN NEON
+    // 1. BUSCAR CREDENCIALES DEL VENDEDOR
     const queryLocal = 'SELECT mp_access_token, nombre, usuario_id FROM locales WHERE local_id = $1';
     const localRes = await pool.query(queryLocal, [local_id]);
 
@@ -2440,23 +2585,25 @@ app.post('/api/pagos/crear-preferencia', async (req, res) => {
     const sellerData = localRes.rows[0];
     const sellerToken = sellerData.mp_access_token;
 
-    // VALIDACIÓN CRÍTICA: ¿El vendedor vinculó su cuenta?
     if (!sellerToken) {
       return res.status(400).json({ 
-        error: `El local "${sellerData.nombre}" aún no ha configurado sus pagos. Avísale para que lo active.` 
+        error: `El local "${sellerData.nombre}" no tiene pagos activos.` 
       });
     }
 
-    // 2. CALCULAR TOTAL Y PREPARAR ITEMS PARA MP
+    // 2. GENERAR REFERENCIA EXTERNA ÚNICA (Acción Obligatoria MP)
+    // Formato: CM (CercaMio) - Timestamp - ID Usuario
+    const externalRef = `CM-${Date.now()}-${usuarioComprador.id}`;
+
+    // 3. PREPARAR ITEMS
     let totalVenta = 0;
     
-    // Creamos un array ligero para guardar en metadata (JSON)
-    // Solo guardamos IDs y Cantidades para reconstruir la orden luego
+    // Metadata ligera
     const itemsParaMetadata = items.map(i => ({
-      id: i.inventario_id, // ID del producto en tu BD
+      id: i.inventario_id,
       cant: Number(i.cantidad),
       precio: Number(i.precio),
-      title: i.nombre // Opcional, útil para debug
+      title: i.nombre
     }));
 
     const itemsMP = items.map(item => {
@@ -2464,37 +2611,45 @@ app.post('/api/pagos/crear-preferencia', async (req, res) => {
       const cantidad = Number(item.cantidad);
       totalVenta += precio * cantidad;
       
+      // LÓGICA DE DESCRIPCIÓN Y CATEGORÍA (Acciones Recomendadas MP)
+      // Si tiene descripción, la usamos (recortada a 200 chars por seguridad)
+      // Si no tiene, repetimos el nombre.
+      const descripcionItem = item.descripcion 
+          ? item.descripcion.substring(0, 250) 
+          : item.nombre;
+
       return {
         id: item.inventario_id.toString(),
         title: item.nombre,
+        description: descripcionItem, // <--- RECOMENDADO AGREGADO
+        category_id: 'others',        // <--- RECOMENDADO AGREGADO (Comodín)
         quantity: cantidad,
         unit_price: precio,
         currency_id: 'ARS',
       };
     });
+    // COMISIÓN CERCAMÍO CONFIGURABLE - ACTUAL 1%
+    const comisionCercaMio = Math.round((totalVenta * 0.01) * 100) / 100;
 
-    // TU GANANCIA: 1% (Ajustable)
-    const comisionCercaMio = Math.round((totalVenta * 0.01) * 100) / 100; // 1%
-
-    // 3. CONFIGURAR CLIENTE CON TOKEN DEL VENDEDOR
+    // 4. CONFIGURAR CLIENTE
     const sellerClient = new MercadoPagoConfig({ accessToken: sellerToken });
     const preference = new Preference(sellerClient);
 
-    // 4. CREAR PREFERENCIA CON FEE Y METADATA (¡LO IMPORTANTE!)
+    // 5. CREAR PREFERENCIA
     const body = {
       items: itemsMP,
-      marketplace_fee: comisionCercaMio, 
+      marketplace_fee: comisionCercaMio,
       
-      // --- AQUÍ ESTÁ LA MAGIA ---
-      // Guardamos todo lo necesario para procesar la orden en el futuro
+      // --- OBLIGATORIO PARA CONCILIACIÓN ---
+      external_reference: externalRef, 
+
       metadata: {
         comprador_id: usuarioComprador.id,
-        vendedor_id: sellerData.usuario_id, // El ID de usuario del dueño del local
+        vendedor_id: sellerData.usuario_id,
         local_id: local_id,
-        tipo_entrega: tipo_entrega || 'RETIRO', // Default
-        items_json: JSON.stringify(itemsParaMetadata) // Guardamos el array como texto
+        tipo_entrega: tipo_entrega || 'RETIRO',
+        items_json: JSON.stringify(itemsParaMetadata)
       },
-      // ---------------------------
 
       back_urls: {
         success: "cercamio://payment-result", 
@@ -2502,13 +2657,15 @@ app.post('/api/pagos/crear-preferencia', async (req, res) => {
         pending: "cercamio://payment-result"
       },
       auto_return: "approved",
-      statement_descriptor: "CERCAMIO APP",
-      notification_url: "https://cercamio-backend.onrender.com/api/pagos/webhook" 
+      
+      // La URL del Webhook
+      notification_url: "https://cercamio-backend.onrender.com/api/pagos/webhook",
+      
+      statement_descriptor: "CERCAMIO APP"
     };
 
     const result = await preference.create({ body });
 
-    // 5. DEVOLVER LINK
     res.json({ 
       id: result.id, 
       link_pago: result.init_point 
@@ -2516,7 +2673,7 @@ app.post('/api/pagos/crear-preferencia', async (req, res) => {
 
   } catch (error) {
     console.error("Error Split Payment:", error);
-    res.status(500).json({ error: 'Error al procesar el pago con el vendedor' });
+    res.status(500).json({ error: 'Error procesando pago' });
   }
 });
 
@@ -2556,29 +2713,30 @@ app.get('/api/pagos/auth-url', async (req, res) => { // <--- Ahora es async
 });
 
 // ==========================================
-// RUTA 36: CALLBACK Y GUARDADO DE CREDENCIALES
+// RUTA 36: CALLBACK Y GUARDADO DE CREDENCIALES (CORREGIDO)
 // ==========================================
 app.get('/api/pagos/callback', async (req, res) => {
-  const { code, state } = req.query; // 'state' trae el local_id que mandamos antes
+  const { code, state } = req.query; // 'state' es el local_id
 
   if (!code || !state) {
     return res.send("Error: Datos incompletos desde Mercado Pago.");
   }
 
   try {
-    // 1. Canjeamos el código por las credenciales del vendedor
+    // 1. Canjeamos el código por las credenciales
+    // USAMOS VARIABLES DE ENTORNO POR SEGURIDAD
     const response = await fetch('https://api.mercadopago.com/oauth/token', {
       method: 'POST',
       headers: { 
         'Content-Type': 'application/json',
-        // Tu token de ADMIN (Producción) para autorizar el canje
-        'Authorization': 'Bearer APP_USR-7458384450787340-120216-78724c3a5f2c37e72886e52c26816cc0-161693502' 
+        'Authorization': `Bearer ${process.env.MP_ACCESS_TOKEN_PROD}` 
       },
       body: JSON.stringify({
-        client_secret: 'TBMpvQ5C8yYtzMJFsvFyJLMwnQBlub3W', // Tu Client Secret
-        client_id: '7458384450787340',
+        client_secret: process.env.MP_CLIENT_SECRET, // <--- AGREGAR A .ENV
+        client_id: process.env.MP_CLIENT_ID,         // <--- AGREGAR A .ENV
         grant_type: 'authorization_code',
         code: code,
+        // Esta URL debe coincidir EXACTAMENTE con la configurada en MP
         redirect_uri: 'https://cercamio-backend.onrender.com/api/pagos/callback'
       })
     });
@@ -2586,11 +2744,7 @@ app.get('/api/pagos/callback', async (req, res) => {
     const data = await response.json();
 
     if (data.access_token) {
-      // 2. ¡ÉXITO! Guardamos las llaves en la base de datos
-      // data.access_token = El token para cobrar a nombre del vendedor
-      // data.user_id = El ID de usuario de MP del vendedor
-      // data.refresh_token = Para renovar en 6 meses
-      
+      // 2. Guardamos en Base de Datos
       const updateQuery = `
         UPDATE locales 
         SET 
@@ -2604,21 +2758,45 @@ app.get('/api/pagos/callback', async (req, res) => {
         data.access_token, 
         data.user_id, 
         data.refresh_token, 
-        state // El local_id que recuperamos
+        state 
       ]);
 
-      console.log(`✅ Local ${state} vinculado exitosamente con Mercado Pago.`);
+      console.log(`✅ Local ${state} vinculado exitosamente.`);
 
-      // 3. HTML de Éxito bonito para el celular
+      // 3. RESPUESTA INTELIGENTE (Deep Link)
+      // Esto hace que el celular abra la App automáticamente
+      const deepLink = `cercamio://success?local_id=${state}`;
+
       res.send(`
-        <div style="font-family: sans-serif; text-align: center; padding: 20px;">
-          <h1 style="color: #4CAF50;">¡Cuenta Vinculada! 🎉</h1>
-          <p>Has conectado tu Mercado Pago exitosamente.</p>
-          <p>Tus ventas ahora se acreditarán en tu cuenta.</p>
-          <br>
-          <a href="https://google.com" style="padding: 10px 20px; background: #2196F3; color: white; text-decoration: none; border-radius: 5px;">Volver a la App</a>
-        </div>
+        <html>
+          <head>
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <style>
+              body { font-family: sans-serif; text-align: center; padding: 40px; }
+              .btn { 
+                background-color: #009EE3; color: white; padding: 15px 30px; 
+                text-decoration: none; border-radius: 5px; font-weight: bold; font-size: 16px;
+              }
+            </style>
+          </head>
+          <body>
+            <h1 style="color: #4CAF50;">¡Vinculación Exitosa! 🎉</h1>
+            <p>Ya puedes recibir cobros en CercaMío.</p>
+            <br><br>
+            
+            <!-- EL BOTÓN QUE ABRE LA APP -->
+            <a href="${deepLink}" class="btn">VOLVER A LA APP</a>
+            
+            <!-- SCRIPT DE AUTO-REDIRECCIÓN -->
+            <script>
+              setTimeout(function() {
+                window.location.href = "${deepLink}";
+              }, 1000);
+            </script>
+          </body>
+        </html>
       `);
+
     } else {
       console.error("Error MP OAuth:", data);
       res.send(`<h1>Error</h1><p>${data.message || 'No se pudo vincular.'}</p>`);
@@ -2631,130 +2809,154 @@ app.get('/api/pagos/callback', async (req, res) => {
 });
 
 // ==========================================
-// RUTA 37: WEBHOOK (PROCESAMIENTO AUTOMÁTICO DE PAGOS) 🤖
+// RUTA 37: WEBHOOK MAESTRO (VENTAS + SUSCRIPCIONES) 🤖 [CORREGIDO]
 // ==========================================
 app.post('/api/pagos/webhook', async (req, res) => {
   const { type, data } = req.body;
 
-  // Solo procesamos notificaciones de tipo 'payment'
+  // Solo procesamos pagos
   if (type === 'payment') {
     try {
       const paymentId = data.id;
-      console.log(`🔔 Webhook recibido. Pago ID: ${paymentId}`);
+      
+      // 1. INICIALIZAR CLIENTE MP (LA LÍNEA QUE FALTABA) 🔑
+      // Usamos el token de la plataforma para consultar el pago
+      const client = new MercadoPagoConfig({ accessToken: process.env.MP_ACCESS_TOKEN_PROD });
 
-      // 1. IDEMPOTENCIA: ¿Ya procesamos este pago antes?
-      const checkDuplicado = await pool.query('SELECT 1 FROM transacciones_p2p WHERE mp_payment_id = $1', [paymentId.toString()]);
-      if (checkDuplicado.rows.length > 0) {
-        console.log("⚠️ Pago ya registrado. Ignorando duplicado.");
-        return res.status(200).send("OK");
-      }
-
-      // 2. CONSULTAR ESTADO DEL PAGO A MERCADO PAGO
-      // Usamos el cliente del Admin (Platform) para leer el pago
+      // 2. CONSULTAR ESTADO DEL PAGO
       const paymentClient = new Payment(client); 
       const paymentData = await paymentClient.get({ id: paymentId });
 
-      // 3. SI ESTÁ APROBADO, GUARDAMOS
       if (paymentData.status === 'approved') {
-        const meta = paymentData.metadata;
         
-        // Recuperamos los datos que "pegamos" al crear la preferencia
-        // MP transforma las keys a snake_case (ej: itemsJSON -> items_json)
-        const compradorId = meta.comprador_id;
-        const vendedorId = meta.vendedor_id;
-        const itemsComprados = JSON.parse(meta.items_json); 
-        const tipoEntrega = meta.tipo_entrega;
-        const totalPagado = paymentData.transaction_amount;
+        const externalRef = paymentData.external_reference; // Ej: "SUB-..." o "CM-..."
+        console.log(`🔔 Webhook Aprobado. Ref: ${externalRef}`);
 
-        // Generamos un UUID único para agrupar estos items en una sola "Orden"
-        const compraUuid = crypto.randomUUID();
+        // ====================================================
+        // CASO A: SUSCRIPCIÓN PREMIUM (NUEVO) 💎
+        // ====================================================
+        if (externalRef && externalRef.startsWith('SUB-')) {
+            
+            // Extraemos datos de la metadata
+            const { local_id, dias_duracion } = paymentData.metadata;
+            const diasAgregar = Number(dias_duracion) || 30; 
 
-        console.log(`✅ Pago Aprobado. Procesando orden para vendedor ${vendedorId}...`);
+            console.log(`💎 ACTIVANDO PLAN PREMIUM: Local ${local_id} (+${diasAgregar} días)`);
 
-        const clientDb = await pool.connect();
-        
-        try {
-          await clientDb.query('BEGIN');
+            // Lógica Inteligente de Vencimiento:
+            const updateQuery = `
+              UPDATE locales 
+              SET 
+                plan_tipo = 'PREMIUM',
+                plan_vencimiento = CASE 
+                   WHEN plan_vencimiento > NOW() THEN plan_vencimiento + make_interval(days => $2)
+                   ELSE NOW() + make_interval(days => $2)
+                END
+              WHERE local_id = $1
+            `;
+            
+            await pool.query(updateQuery, [local_id, diasAgregar]);
+            console.log("✅ Suscripción activada exitosamente.");
+        } 
 
-          for (const item of itemsComprados) {
-             // A. BUSCAR DATOS REALES PARA EL SNAPSHOT
-             // El 'item.id' viene de la preferencia, que es tu 'inventario_id'
-             const queryProducto = `
-                SELECT global_id, nombre, foto_url, tipo_item, stock 
-                FROM inventario_local 
-                WHERE inventario_id = $1 FOR UPDATE
-             `;
-             const prodRes = await clientDb.query(queryProducto, [item.id]);
-             
-             // Si el producto fue borrado justo después de comprar (raro, pero posible)
-             // usamos valores fallback para no romper la venta
-             const datosReales = prodRes.rows.length > 0 ? prodRes.rows[0] : {
-                global_id: null,
-                nombre: item.title, // El título que mandó MP
-                foto_url: null,
-                tipo_item: 'PRODUCTO_STOCK',
-                stock: 0
-             };
+        // ====================================================
+        // CASO B: VENTA MARKETPLACE (TU CÓDIGO ORIGINAL) 🛒
+        // ====================================================
+        else if (externalRef && externalRef.startsWith('CM-')) {
+            
+            // 1. IDEMPOTENCIA
+            const checkDuplicado = await pool.query('SELECT 1 FROM transacciones_p2p WHERE mp_payment_id = $1', [paymentId.toString()]);
+            
+            if (checkDuplicado.rows.length > 0) {
+                console.log("⚠️ Venta ya registrada anteriormente. Ignorando.");
+                return res.status(200).send("OK");
+            }
 
-             // B. DESCONTAR STOCK (Si aplica)
-             if (datosReales.tipo_item === 'PRODUCTO_STOCK') {
-                await clientDb.query(
-                  'UPDATE inventario_local SET stock = stock - $1 WHERE inventario_id = $2', 
-                  [item.cant, item.id]
-                );
-             }
+            // 2. PROCESAMIENTO
+            const meta = paymentData.metadata;
+            const compradorId = meta.comprador_id;
+            const vendedorId = meta.vendedor_id;
+            const itemsComprados = typeof meta.items_json === 'string' ? JSON.parse(meta.items_json) : meta.items_json;
+            const tipoEntrega = meta.tipo_entrega;
+            const totalPagado = paymentData.transaction_amount;
 
-             // C. INSERTAR TRANSACCIÓN (Igual que tu ruta manual)
-             const insertTx = `
-                INSERT INTO transacciones_p2p 
-                (
-                  comprador_id, 
-                  vendedor_id, 
-                  producto_global_id, 
-                  cantidad, 
-                  monto_total, 
-                  estado, 
-                  tipo_entrega, 
-                  mp_payment_id, 
-                  fecha_operacion,
-                  compra_uuid,      -- Tu agrupador
-                  nombre_snapshot,  -- Tu snapshot de nombre
-                  foto_snapshot     -- Tu snapshot de foto
-                )
-                VALUES ($1, $2, $3, $4, $5, 'APROBADO', $6, $7, NOW(), $8, $9, $10)
-             `;
-             
-             await clientDb.query(insertTx, [
-                compradorId, 
-                vendedorId, 
-                datosReales.global_id, // Usamos el ID global real de la base
-                item.cant, 
-                item.precio * item.cant, 
-                tipoEntrega,
-                paymentId.toString(),
-                compraUuid,            // El UUID generado arriba
-                datosReales.nombre,    // Snapshot Nombre
-                datosReales.foto_url   // Snapshot Foto
-             ]);
-          }
+            const compraUuid = crypto.randomUUID();
 
-          await clientDb.query('COMMIT');
-          
-          // 5. NOTIFICAR AL VENDEDOR
-          const mensaje = `¡Pago de MP acreditado! Total: $${totalPagado}. Entrega: ${tipoEntrega}`;
-          enviarNotificacion(vendedorId, "¡Nueva Venta Online! 💳", mensaje);
+            console.log(`🛒 Procesando Venta para vendedor ${vendedorId}...`);
 
-        } catch (dbError) {
-          await clientDb.query('ROLLBACK');
-          console.error("❌ Error guardando en BD (Webhook):", dbError);
-          // Importante: No devolver error 500 si es un fallo lógico nuestro,
-          // porque MP seguirá enviando el webhook infinitamente.
-        } finally {
-          clientDb.release();
+            const clientDb = await pool.connect(); 
+            
+            try {
+              await clientDb.query('BEGIN');
+
+              for (const item of itemsComprados) {
+                 // A. BUSCAR DATOS REALES
+                 const queryProducto = `
+                    SELECT global_id, nombre, foto_url, tipo_item, stock 
+                    FROM inventario_local 
+                    WHERE inventario_id = $1 FOR UPDATE
+                 `;
+                 const prodRes = await clientDb.query(queryProducto, [item.id]);
+                 
+                 const datosReales = prodRes.rows.length > 0 ? prodRes.rows[0] : {
+                    global_id: null,
+                    nombre: item.title,
+                    foto_url: null,
+                    tipo_item: 'PRODUCTO_STOCK',
+                    stock: 0
+                 };
+
+                 // B. DESCONTAR STOCK
+                 if (datosReales.tipo_item === 'PRODUCTO_STOCK') {
+                    await clientDb.query(
+                      'UPDATE inventario_local SET stock = stock - $1 WHERE inventario_id = $2', 
+                      [item.cant, item.id]
+                    );
+                 }
+
+                 // C. INSERTAR TRANSACCIÓN
+                 const insertTx = `
+                    INSERT INTO transacciones_p2p 
+                    (
+                      comprador_id, vendedor_id, producto_global_id, cantidad, monto_total, 
+                      estado, tipo_entrega, mp_payment_id, fecha_operacion,
+                      compra_uuid, nombre_snapshot, foto_snapshot
+                    )
+                    VALUES ($1, $2, $3, $4, $5, 'APROBADO', $6, $7, NOW(), $8, $9, $10)
+                 `;
+                 
+                 await clientDb.query(insertTx, [
+                    compradorId, 
+                    vendedorId, 
+                    datosReales.global_id, 
+                    item.cant, 
+                    item.precio * item.cant, 
+                    tipoEntrega,
+                    paymentId.toString(),
+                    compraUuid,            
+                    datosReales.nombre,    
+                    datosReales.foto_url   
+                 ]);
+              }
+
+              await clientDb.query('COMMIT');
+              
+              // 5. NOTIFICAR
+              const mensaje = `¡Pago de MP acreditado! Total: $${totalPagado}. Entrega: ${tipoEntrega}`;
+              if (typeof enviarNotificacion === 'function') {
+                  enviarNotificacion(vendedorId, "¡Nueva Venta Online! 💳", mensaje);
+              }
+
+            } catch (dbError) {
+              await clientDb.query('ROLLBACK');
+              console.error("❌ Error guardando Venta en BD:", dbError);
+            } finally {
+              clientDb.release();
+            }
         }
       }
     } catch (error) {
-      console.error("❌ Error procesando Webhook:", error);
+      console.error("❌ Error general en Webhook:", error);
       return res.status(500).send("Error interno");
     }
   }
@@ -3256,51 +3458,555 @@ app.get('/api/socios/me', async (req, res) => {
   }
 });
 
-// 3. RUTA: SOLICITAR ALTA (SUBIR DNI)
-app.post('/api/socios/solicitar', uploadDNI, async (req, res) => {
+// ==========================================
+// RUTA 10: SOLICITAR ALTA SOCIO (VERSIÓN FINAL Y LIMPIA)
+// ==========================================
+app.post('/api/socios/solicitar', uploadPrivado.fields([
+  { name: 'dni_frente', maxCount: 1 },
+  { name: 'dni_dorso', maxCount: 1 }
+]), async (req, res) => {
+  
   const authHeader = req.headers['authorization'];
   if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
   const token = authHeader.split(' ')[1];
 
   const { cbu_alias, nombre_real } = req.body;
   
+  // Validaciones
   const files = req.files;
   if (!files || !files['dni_frente'] || !files['dni_dorso']) {
     return res.status(400).json({ error: 'Faltan las fotos del DNI' });
   }
 
-  // Cloudinary ya subió las fotos, aquí tenemos los links
   const dniFrenteUrl = files['dni_frente'][0].path;
   const dniDorsoUrl = files['dni_dorso'][0].path;
 
-  try {
-    const usuario = jwt.verify(token, JWT_SECRET);
+  const client = await pool.connect();
 
-    // Generar Código (Ej: NOM-123)
+  try {
+    const usuario = jwt.verify(token, process.env.JWT_SECRET);
+
+    await client.query('BEGIN'); // Inicio transacción
+
+    // 1. Generar Código
     const nombreBase = (nombre_real || "SOCIO").substring(0, 3).toUpperCase().replace(/[^A-Z]/g, "X");
     const rand = Math.floor(100 + Math.random() * 900);
     const codigoGenerado = `${nombreBase}-${rand}`;
 
+    // 2. Insertar Socio
     const insertQuery = `
       INSERT INTO socios (usuario_id, codigo_referido, cbu_alias, dni_frente_url, dni_dorso_url, estado)
       VALUES ($1, $2, $3, $4, $5, 'PENDIENTE')
-      RETURNING codigo_referido
+      RETURNING socio_id
     `;
 
-    await pool.query(insertQuery, [
+    await client.query(insertQuery, [
       usuario.id, codigoGenerado, cbu_alias, dniFrenteUrl, dniDorsoUrl
     ]);
 
-    res.json({ mensaje: 'Solicitud enviada', codigo: codigoGenerado });
+    await client.query('COMMIT'); // 🔒 GUARDADO CONFIRMADO
+
+    // 3. Responder
+    res.json({ mensaje: 'Solicitud enviada correctamente', codigo: codigoGenerado });
+    
+    console.log(`✅ Nueva solicitud de socio guardada para usuario ID: ${usuario.id}`);
 
   } catch (error) {
-    if (error.code === '23505') return res.status(400).json({ error: 'Ya tienes una solicitud en curso.' });
-    console.error("Error alta socio:", error);
+    await client.query('ROLLBACK'); // Solo deshacemos si falla el INSERT
+    
+    if (error.code === '23505') {
+        return res.status(400).json({ error: 'Ya tienes una solicitud en curso.' });
+    }
+    
+    console.error("❌ Error alta socio:", error);
+    if (!res.headersSent) {
+        res.status(500).json({ error: 'Error interno del servidor' });
+    }
+  } finally {
+    client.release();
+  }
+});
+
+// ==========================================
+// RUTA 48: DASHBOARD DEL SOCIO (CON GAMIFICACIÓN Y RETIROS 💸)
+// ==========================================
+app.get('/api/socios/dashboard', async (req, res) => {
+  const authHeader = req.headers['authorization'];
+  if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
+  const token = authHeader.split(' ')[1];
+
+  try {
+    const usuario = jwt.verify(token, JWT_SECRET);
+
+    // 1. OBTENER DATOS SOCIO
+    const socioQuery = `SELECT socio_id, codigo_referido, estado, saldo_acumulado, cbu_alias, porcentaje_ganancia FROM socios WHERE usuario_id = $1`;
+    const socioRes = await pool.query(socioQuery, [usuario.id]);
+
+    if (socioRes.rows.length === 0) return res.status(404).json({ error: 'No eres socio aún' });
+    const socio = socioRes.rows[0];
+
+    // 2. OBTENER FLOTA (Contamos locales)
+    const flotaQuery = `
+      SELECT L.local_id, L.nombre, L.rubro, L.foto_url, L.fecha_registro,
+        COUNT(T.transaccion_id) as total_ventas_historicas,
+        MAX(T.fecha_operacion) as ultima_venta
+      FROM locales L
+      LEFT JOIN transacciones_p2p T ON L.usuario_id = T.vendedor_id
+      WHERE L.referido_por_socio_id = $1
+      GROUP BY L.local_id
+      ORDER BY L.fecha_registro DESC
+    `;
+    const flotaRes = await pool.query(flotaQuery, [socio.socio_id]);
+    
+    const totalLocales = flotaRes.rows.length;
+    const localesActivos = flotaRes.rows.filter(l => parseInt(l.total_ventas_historicas) > 0).length;
+
+    // 3. LÓGICA DE GAMIFICACIÓN (Niveles) 🏆
+    const niveles = [
+      { nombre: "BRONCE", meta: 0, ganancia: 5.0 },
+      { nombre: "PLATA", meta: 10, ganancia: 7.5 },
+      { nombre: "ORO", meta: 30, ganancia: 10.0 },
+      { nombre: "PLATINO", meta: 60, ganancia: 12.5 },
+      { nombre: "DIAMANTE", meta: 100, ganancia: 15.0 }
+    ];
+
+    let nivelActual = niveles[0];
+    let nivelSiguiente = niveles[1];
+    
+    for (let i = 0; i < niveles.length; i++) {
+      if (totalLocales >= niveles[i].meta) {
+        nivelActual = niveles[i];
+        nivelSiguiente = (i + 1 < niveles.length) ? niveles[i + 1] : null; 
+      }
+    }
+
+    let progreso = 0.0;
+    let faltan = 0;
+    let mensajeMotivacional = "¡Eres una leyenda! Has alcanzado el máximo nivel. 👑";
+
+    if (nivelSiguiente) {
+      const rango = nivelSiguiente.meta - nivelActual.meta;
+      const avanceEnRango = totalLocales - nivelActual.meta;
+      progreso = avanceEnRango / rango;
+      faltan = nivelSiguiente.meta - totalLocales;
+      mensajeMotivacional = `¡Vamos! Solo te faltan ${faltan} locales para ser ${nivelSiguiente.nombre} y ganar ${nivelSiguiente.ganancia}%`;
+    }
+
+    // 4. OBTENER ÚLTIMOS RETIROS (NUEVO BLOQUE) 💸
+    // Esto es lo que faltaba para completar el circuito de Cash Out
+    const retirosRes = await pool.query(
+      `SELECT monto, estado, TO_CHAR(fecha_solicitud, 'DD/MM/YY') as fecha 
+       FROM solicitudes_retiro 
+       WHERE socio_id = $1 
+       ORDER BY fecha_solicitud DESC LIMIT 5`,
+      [socio.socio_id]
+    );
+
+    // 5. RESPUESTA FINAL
+    res.json({
+      perfil: {
+        codigo: socio.codigo_referido,
+        saldo: socio.saldo_acumulado,
+        estado: socio.estado,
+        alias: socio.cbu_alias
+      },
+      gamification: {
+        nivel_actual: nivelActual.nombre,
+        porcentaje_actual: socio.porcentaje_ganancia, 
+        nivel_siguiente: nivelSiguiente ? nivelSiguiente.nombre : "MAX",
+        meta_siguiente: nivelSiguiente ? nivelSiguiente.meta : totalLocales,
+        progreso_decimal: progreso, 
+        mensaje: mensajeMotivacional,
+        faltan_locales: faltan
+      },
+      metricas: {
+        total_locales: totalLocales,
+        locales_activos: localesActivos
+      },
+      flota: flotaRes.rows,
+      retiros: retirosRes.rows // <--- Enviamos el historial al Frontend
+    });
+
+  } catch (error) {
+    console.error("Error Dashboard Socio:", error);
+    res.status(500).json({ error: 'Error al cargar tu tablero' });
+  }
+});
+
+// ==========================================
+// FUNCIÓN AUXILIAR: CALCULAR NIVEL DE SOCIO 📈
+// ==========================================
+const actualizarNivelSocio = async (socioId) => {
+  try {
+    // 1. Contamos cuántos locales activos tiene este socio
+    const countRes = await pool.query(
+      'SELECT COUNT(*) FROM locales WHERE referido_por_socio_id = $1', 
+      [socioId]
+    );
+    
+    const cantidadLocales = parseInt(countRes.rows[0].count);
+    
+    // 2. Definimos la escalera de éxito (Tus reglas)
+    let nuevoPorcentaje = 5.00; // Nivel Base (Bronce)
+    let nombreNivel = "BRONCE";
+
+    if (cantidadLocales >= 100) {
+      nuevoPorcentaje = 15.00;
+      nombreNivel = "DIAMANTE";
+    } else if (cantidadLocales >= 60) {
+      nuevoPorcentaje = 12.50; // Ajusté un intermedio
+      nombreNivel = "PLATINO";
+    } else if (cantidadLocales >= 30) {
+      nuevoPorcentaje = 10.00;
+      nombreNivel = "ORO";
+    } else if (cantidadLocales >= 10) {
+      nuevoPorcentaje = 7.50;
+      nombreNivel = "PLATA";
+    }
+
+    // 3. Actualizamos en la base de datos
+    await pool.query(
+      'UPDATE socios SET porcentaje_ganancia = $1 WHERE socio_id = $2',
+      [nuevoPorcentaje, socioId]
+    );
+
+    console.log(`📈 Socio #${socioId} actualizado: ${cantidadLocales} locales -> Nivel ${nombreNivel} (${nuevoPorcentaje}%)`);
+    
+    // Opcional: Podrías enviar notificación si subió de nivel
+    // if (subioNivel) enviarNotificacion(...)
+
+  } catch (error) {
+    console.error("Error actualizando nivel socio:", error);
+  }
+};
+
+// ==========================================
+// RUTA 49: SOLICITAR RETIRO DE FONDOS 💸
+// ==========================================
+app.post('/api/socios/retirar', async (req, res) => {
+  const authHeader = req.headers['authorization'];
+  if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
+  const token = authHeader.split(' ')[1];
+
+  const MONTO_MINIMO = 1000; // Configurable
+
+  const client = await pool.connect();
+
+  try {
+    const usuario = jwt.verify(token, JWT_SECRET);
+    
+    await client.query('BEGIN');
+
+    // 1. Obtener datos del socio bloqueando la fila (FOR UPDATE) para evitar doble click
+    const socioRes = await client.query(
+      'SELECT socio_id, saldo_acumulado, cbu_alias FROM socios WHERE usuario_id = $1 FOR UPDATE',
+      [usuario.id]
+    );
+
+    if (socioRes.rows.length === 0) throw new Error('No eres socio');
+    const socio = socioRes.rows[0];
+    const saldoActual = parseFloat(socio.saldo_acumulado);
+
+    // 2. Validaciones
+    if (saldoActual < MONTO_MINIMO) {
+      throw new Error(`El monto mínimo para retirar es $${MONTO_MINIMO}`);
+    }
+
+    if (!socio.cbu_alias) {
+      throw new Error('No tienes un CBU/Alias configurado');
+    }
+
+    // 3. MOVIMIENTO DE FONDOS (Atomicidad)
+    // A. Restamos el saldo
+    await client.query(
+      'UPDATE socios SET saldo_acumulado = saldo_acumulado - $1 WHERE socio_id = $2',
+      [saldoActual, socio.socio_id]
+    );
+
+    // B. Creamos el ticket de retiro
+    await client.query(
+      'INSERT INTO solicitudes_retiro (socio_id, monto, cbu_destino) VALUES ($1, $2, $3)',
+      [socio.socio_id, saldoActual, socio.cbu_alias]
+    );
+
+    await client.query('COMMIT');
+
+    // 4. Notificar (Opcional: Mandar email al admin avisando que hay que pagar)
+    console.log(`💸 Solicitud de retiro: Socio #${socio.socio_id} pide $${saldoActual}`);
+
+    res.json({ mensaje: 'Solicitud enviada. Tu dinero está en proceso.' });
+
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error(error);
+    res.status(400).json({ error: error.message || 'Error al procesar retiro' });
+  } finally {
+    client.release();
+  }
+});
+
+// =========================================================
+// 💎 GESTIÓN DE SUSCRIPCIONES (PREMIUM)
+// =========================================================
+
+// 1. GET: Obtener planes activos para mostrarlos en la App
+app.get('/api/suscripciones/planes', async (req, res) => {
+  try {
+    // Traemos solo los activos y ordenados por "orden_visual"
+    const query = 'SELECT * FROM planes_suscripcion WHERE es_activo = TRUE ORDER BY orden_visual ASC';
+    const result = await pool.query(query);
+    res.json(result.rows);
+  } catch (error) {
+    console.error("❌ Error obteniendo planes:", error);
+    res.status(500).json({ error: 'Error interno al cargar planes' });
+  }
+});
+
+// =========================================================
+// 💎 CREAR PAGO (VERSIÓN A PRUEBA DE ERRORES)
+// =========================================================
+app.post('/api/suscripciones/crear-pago', async (req, res) => {
+  const authHeader = req.headers['authorization'];
+  if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
+
+  // Recibimos local_id (que a veces viene mal) y plan_codigo
+  let { local_id, plan_codigo } = req.body; 
+
+  try {
+    const token = authHeader.split(' ')[1];
+    const usuario = jwt.verify(token, JWT_SECRET);
+
+    // 1. AUTO-CORRECCIÓN DE ID
+    // Si local_id viene como el token (texto largo) o está vacío, 
+    // lo buscamos nosotros en la base de datos usando el ID del usuario.
+    if (!local_id || isNaN(local_id)) {
+        console.log("⚠️ local_id inválido recibido. Buscando local del usuario...");
+        
+        const localSearch = await pool.query(
+            'SELECT local_id FROM locales WHERE usuario_id = $1 LIMIT 1', 
+            [usuario.id]
+        );
+        
+        if (localSearch.rows.length === 0) {
+            return res.status(404).json({ error: 'No tienes un local registrado.' });
+        }
+        
+        // Asignamos el ID correcto
+        local_id = localSearch.rows[0].local_id;
+        console.log(`✅ Local encontrado automáticamente: ID ${local_id}`);
+    }
+
+    // 2. VERIFICACIÓN DE PROPIEDAD
+    const localCheck = await pool.query(
+        'SELECT nombre FROM locales WHERE local_id = $1 AND usuario_id = $2', 
+        [local_id, usuario.id]
+    );
+    
+    if (localCheck.rows.length === 0) {
+        return res.status(403).json({ error: 'No eres dueño de este local' });
+    }
+
+    // 3. OBTENER PRECIO
+    const planRes = await pool.query(
+        'SELECT * FROM planes_suscripcion WHERE codigo_interno = $1 AND es_activo = TRUE', 
+        [plan_codigo]
+    );
+    
+    if (planRes.rows.length === 0) return res.status(404).json({ error: 'Plan no existe' });
+    const plan = planRes.rows[0];
+
+    // 4. MERCADO PAGO
+    const client = new MercadoPagoConfig({ accessToken: process.env.MP_ACCESS_TOKEN_PROD });
+    const preference = new Preference(client);
+
+    const externalRef = `SUB-${local_id}-${plan.codigo_interno}-${Date.now()}`;
+
+    const body = {
+      items: [{
+        id: `PLAN-${plan.codigo_interno}`,
+        title: `CercaMío PRO: ${plan.titulo}`,
+        description: `Suscripción ${plan.dias_duracion} días - ${localCheck.rows[0].nombre}`,
+        quantity: 1,
+        unit_price: Number(plan.precio),
+        currency_id: 'ARS'
+      }],
+      external_reference: externalRef,
+      metadata: { 
+          local_id: local_id, 
+          plan_codigo: plan.codigo_interno,
+          dias_duracion: plan.dias_duracion
+      },
+      back_urls: {
+        success: "cercamio://premium-success", 
+        failure: "cercamio://premium-fail",
+        pending: "cercamio://premium-pending"
+      },
+      auto_return: "approved",
+      notification_url: "https://cercamio-backend.onrender.com/api/pagos/webhook",
+      statement_descriptor: "CERCAMIO PRO"
+    };
+
+    const result = await preference.create({ body });
+    res.json({ init_point: result.init_point });
+
+  } catch (error) {
+    console.error("❌ Error creando pago:", error);
+    // Devolvemos el error en JSON para que el frontend lo muestre en el SnackBar
+    res.status(500).json({ error: error.message || 'Error interno' });
+  }
+});
+
+// ==========================================
+// RUTA: OBTENER PERFIL (CORREGIDA SEGÚN ESQUEMA REAL)
+// ==========================================
+app.get('/api/auth/me', async (req, res) => {
+  const authHeader = req.headers['authorization'];
+  if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
+  
+  try {
+    const token = authHeader.split(' ')[1];
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    
+    // CONSULTA SQL PRECISA:
+    // u.nombre_completo -> Lo traemos como 'nombre_usuario'
+    // l.nombre          -> Lo traemos como 'nombre_fantasia'
+    const query = `
+      SELECT 
+        u.usuario_id, 
+        u.nombre_completo, -- <--- CAMPO CORRECTO DE USUARIOS
+        u.foto_url, 
+        u.tipo, 
+        
+        l.local_id, 
+        l.nombre as nombre_tienda, -- <--- CAMPO CORRECTO DE LOCALES
+        l.tipo_actividad, 
+        l.mp_access_token,
+        l.foto_perfil, 
+        l.foto_portada,
+        
+        s.socio_id, 
+        s.estado as estado_socio
+      FROM usuarios u
+      LEFT JOIN locales l ON u.usuario_id = l.usuario_id
+      LEFT JOIN socios s ON u.usuario_id = s.usuario_id
+      WHERE u.usuario_id = $1
+    `;
+    
+    const result = await pool.query(query, [decoded.id]);
+    
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Usuario no encontrado' });
+    
+    const row = result.rows[0];
+    
+    // Mapeo para que el Frontend (Flutter) no se rompa
+    const respuesta = {
+      usuario: {
+        id: row.usuario_id,
+        // Al frontend le mandamos 'nombre' genérico usando el nombre_completo real
+        nombre: row.nombre_completo, 
+        foto_url: row.foto_url,
+        tipo: row.tipo
+      },
+      perfil_profesional: row.local_id ? {
+        local_id: row.local_id,
+        nombre_fantasia: row.nombre_tienda, // El nombre del local
+        tipo_actividad: row.tipo_actividad,
+        mp_vinculado: !!row.mp_access_token,
+        foto_perfil: row.foto_perfil, 
+        foto_portada: row.foto_portada
+      } : null,
+      perfil_socio: row.socio_id ? {
+        socio_id: row.socio_id,
+        estado: row.estado_socio
+      } : null
+    };
+
+    res.json(respuesta);
+
+  } catch (error) {
+    console.error("Error en /api/auth/me:", error);
+    res.status(500).json({ error: 'Error al obtener perfil' });
+  }
+});
+
+// ==========================================
+// RUTA AUXILIAR: SUBIR IMAGEN SUELTA 📸
+// ==========================================
+app.post('/api/uploads/imagen', upload.single('imagen'), (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No se subió ningún archivo' });
+    }
+    // Cloudinary/Multer ya subieron el archivo, devolvemos la URL
+    res.json({ url: req.file.path });
+  } catch (error) {
+    console.error("Error subiendo imagen:", error);
+    res.status(500).json({ error: 'Error al subir imagen' });
+  }
+});
+
+// ==========================================
+// RUTA 40: ESCÁNER (VERSIÓN PRIORIDAD LOCAL)
+// ==========================================
+app.get('/api/producto/scan/:codigo', async (req, res) => {
+  const authHeader = req.headers['authorization'];
+  if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
+  
+  const codigo = req.params.codigo.trim();
+
+  try {
+    const token = authHeader.split(' ')[1];
+    const usuario = jwt.verify(token, process.env.JWT_SECRET);
+
+    // 1. Obtener Local ID
+    const localRes = await pool.query('SELECT local_id FROM locales WHERE usuario_id = $1', [usuario.id]);
+    if (localRes.rows.length === 0) return res.status(404).json({ error: 'Sin local' });
+    const localId = localRes.rows[0].local_id;
+
+    console.error(`🔥 [DEBUG SCAN] Buscando '${codigo}' en Local ${localId}`);
+
+    // 2. BUSCAR EN LOCAL PRIMERO (Ignorando tipos de dato con CAST)
+    const queryLocal = `
+      SELECT * FROM inventario_local 
+      WHERE local_id = $1 
+      AND CAST(codigo_barras AS TEXT) = $2
+    `;
+    const localProduct = await pool.query(queryLocal, [localId, codigo]);
+
+    if (localProduct.rows.length > 0) {
+      console.error("✅ ENCONTRADO LOCAL");
+      // RESPUESTA EXACTA QUE ESPERA EL FRONTEND
+      return res.json({
+        estado: 'EN_INVENTARIO', 
+        producto: localProduct.rows[0]
+      });
+    }
+
+    // 3. BUSCAR EN GLOBAL
+    const globalProduct = await pool.query('SELECT * FROM catalogo_global WHERE codigo_barras = $1', [codigo]);
+
+    if (globalProduct.rows.length > 0) {
+      console.error("☁️ ENCONTRADO GLOBAL");
+      return res.json({
+        estado: 'EN_GLOBAL', 
+        producto: globalProduct.rows[0]
+      });
+    }
+
+    // 4. NUEVO
+    console.error("🆕 NUEVO");
+    res.json({
+      estado: 'NUEVO', 
+      codigo_barras: codigo
+    });
+
+  } catch (error) {
+    console.error("❌ ERROR SCAN:", error);
     res.status(500).json({ error: 'Error interno' });
   }
 });
 
-// ===========================================
+
 
 
 // ENCENDEMOS EL SERVIDOR
