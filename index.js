@@ -3914,7 +3914,7 @@ app.post('/api/uploads/imagen', upload.single('imagen'), (req, res) => {
 });
 
 // ==========================================
-// RUTA 40: ESCÁNER (VERSIÓN PRIORIDAD LOCAL)
+// RUTA 50: ESCÁNER INTELIGENTE (FIX NOMBRE NULL) 🧠
 // ==========================================
 app.get('/api/producto/scan/:codigo', async (req, res) => {
   const authHeader = req.headers['authorization'];
@@ -3931,38 +3931,53 @@ app.get('/api/producto/scan/:codigo', async (req, res) => {
     if (localRes.rows.length === 0) return res.status(404).json({ error: 'Sin local' });
     const localId = localRes.rows[0].local_id;
 
-    console.error(`🔥 [DEBUG SCAN] Buscando '${codigo}' en Local ${localId}`);
+    console.error(`🔥 [SCAN] Buscando '${codigo}' en Local ${localId}`);
 
-    // 2. BUSCAR EN LOCAL PRIMERO (Ignorando tipos de dato con CAST)
+    // --- CAPA 1: BÚSQUEDA LOCAL (CON HERENCIA DE DATOS) ---
+    // AQUÍ ESTÁ EL ARREGLO: Hacemos JOIN para rellenar los datos NULL
     const queryLocal = `
-      SELECT * FROM inventario_local 
-      WHERE local_id = $1 
-      AND CAST(codigo_barras AS TEXT) = $2
+      SELECT 
+        I.inventario_id,
+        I.local_id,
+        I.precio,
+        I.stock,
+        I.tipo_item,
+        I.codigo_barras,
+        
+        -- SI EL LOCAL TIENE NULL, USAMOS EL GLOBAL
+        COALESCE(I.nombre, C.nombre_oficial) as nombre, 
+        COALESCE(I.descripcion, C.descripcion) as descripcion,
+        COALESCE(I.foto_url, C.foto_url) as foto_url
+
+      FROM inventario_local I
+      LEFT JOIN catalogo_global C ON I.global_id = C.global_id
+      WHERE I.local_id = $1 
+      AND CAST(I.codigo_barras AS TEXT) = $2
     `;
+    
     const localProduct = await pool.query(queryLocal, [localId, codigo]);
 
     if (localProduct.rows.length > 0) {
-      console.error("✅ ENCONTRADO LOCAL");
-      // RESPUESTA EXACTA QUE ESPERA EL FRONTEND
+      console.error("✅ ENCONTRADO EN LOCAL (Datos completos)");
       return res.json({
         estado: 'EN_INVENTARIO', 
         producto: localProduct.rows[0]
       });
     }
 
-    // 3. BUSCAR EN GLOBAL
-    const globalProduct = await pool.query('SELECT * FROM catalogo_global WHERE codigo_barras = $1', [codigo]);
+    // --- CAPA 2: BÚSQUEDA GLOBAL ---
+    const globalProduct = await pool.query('SELECT * FROM catalogo_global WHERE CAST(codigo_barras AS TEXT) = $1', [codigo]);
 
     if (globalProduct.rows.length > 0) {
-      console.error("☁️ ENCONTRADO GLOBAL");
+      console.error("☁️ ENCONTRADO EN GLOBAL");
       return res.json({
         estado: 'EN_GLOBAL', 
         producto: globalProduct.rows[0]
       });
     }
 
-    // 4. NUEVO
-    console.error("🆕 NUEVO");
+    // --- CAPA 3: NUEVO ---
+    console.error("🆕 NO EXISTE. ES NUEVO.");
     res.json({
       estado: 'NUEVO', 
       codigo_barras: codigo
