@@ -1271,38 +1271,6 @@ app.post('/api/mi-negocio/crear-item', async (req, res) => {
   }
 });
 
-// ==========================================
-// RUTA 13-2: ESCÁNER DE PRODUCTOS (BUSCA EN GLOBAL O EXTERNO) 🔍
-// ==========================================
-app.get('/api/producto/scan/:codigo', async (req, res) => {
-  const { codigo } = req.params;
-
-  try {
-    // 1. Buscamos en NUESTRO Catálogo Global
-    const globalRes = await pool.query(
-      'SELECT * FROM catalogo_global WHERE codigo_barras = $1', 
-      [codigo]
-    );
-
-    if (globalRes.rows.length > 0) {
-      return res.json({ 
-        encontrado: true, 
-        fuente: 'CercaMío Global',
-        producto: globalRes.rows[0] 
-      });
-    }
-
-    // 2. (Futuro) Aquí podrías conectar a OpenFoodFacts API
-    // Por ahora devolvemos "No encontrado" para que el usuario lo cree
-    res.json({ encontrado: false });
-
-  } catch (error) {
-    console.error("Error escáner:", error);
-    res.status(500).json({ error: 'Error al buscar producto' });
-  }
-});
-
-
 // RUTA 14: ELIMINAR ÍTEM
 app.delete('/api/mi-negocio/eliminar/:id', async (req, res) => {
   const authHeader = req.headers['authorization'];
