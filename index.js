@@ -1400,6 +1400,8 @@ app.get('/api/perfil-publico/:id', async (req, res) => {
       FROM inventario_local I 
       LEFT JOIN catalogo_global C ON I.global_id = C.global_id 
       WHERE I.local_id = $1
+      AND I.stock > 0        -- <--- FILTRO DE SEGURIDAD 1 (Hay mercadería)
+      AND I.precio > 0       -- <--- FILTRO DE SEGURIDAD 2 (Tiene precio real)
       ORDER BY I.inventario_id DESC
     `;
 
@@ -4007,7 +4009,95 @@ app.get('/api/producto/scan/:codigo', async (req, res) => {
   }
 });
 
+// ==========================================
+// RUTA 51: IMPORTAR PACK AUTOMÁTICO (SEGÚN RUBRO) 📦
+// ==========================================
+app.post('/api/mi-negocio/importar-pack', async (req, res) => {
+  const authHeader = req.headers['authorization'];
+  if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
+  
+  try {
+    const token = authHeader.split(' ')[1];
+    const usuario = jwt.verify(token, process.env.JWT_SECRET);
 
+    // 1. Obtener datos del local del usuario
+    const localRes = await pool.query('SELECT local_id, rubro FROM locales WHERE usuario_id = $1', [usuario.id]);
+    if (localRes.rows.length === 0) return res.status(404).json({ error: 'Local no encontrado' });
+    
+    const { local_id, rubro } = localRes.rows[0];
+
+    // 2. Buscar qué pack corresponde a este rubro
+    // Usamos ILIKE para coincidencia flexible (ej: "Kiosco" matchea con "Kiosco / Almacén")
+    const packRes = await pool.query('SELECT * FROM packs_plantillas WHERE rubro_target ILIKE $1 LIMIT 1', [`%${rubro}%`]);
+
+    if (packRes.rows.length === 0) {
+      return res.status(404).json({ error: `No hay packs disponibles para el rubro ${rubro}` });
+    }
+
+    const pack = packRes.rows[0];
+
+    // 3. CLONACIÓN MASIVA (Magia SQL)
+    // Insertamos en inventario_local copiando de items_pack.
+    // Solo si el nombre NO existe ya en ese local (para evitar duplicados).
+    const insertQuery = `
+      INSERT INTO inventario_local (local_id, nombre, descripcion, precio, stock, tipo_item, codigo_barras, foto_url)
+      SELECT 
+        $1, 
+        IP.nombre, 
+        'Producto importado automáticamente', 
+        0,   -- Precio 0 para que el usuario lo edite
+        0,   -- Stock 0
+        'PRODUCTO_STOCK',
+        IP.codigo_barras,
+        IP.foto_url
+      FROM items_pack IP
+      WHERE IP.pack_id = $2
+      AND NOT EXISTS (
+          SELECT 1 FROM inventario_local IL 
+          WHERE IL.local_id = $1 AND IL.nombre = IP.nombre
+      )
+    `;
+
+    const result = await pool.query(insertQuery, [local_id, pack.pack_id]);
+
+    res.json({ 
+      mensaje: 'Importación exitosa', 
+      items_agregados: result.rowCount,
+      nombre_pack: pack.nombre_pack
+    });
+
+  } catch (error) {
+    console.error("Error importando pack:", error);
+    res.status(500).json({ error: 'Error al importar pack' });
+  }
+});
+
+// RUTA AUXILIAR: VERIFICAR SI HAY PACK DISPONIBLE (Para mostrar el botón o no)
+app.get('/api/mi-negocio/check-pack', async (req, res) => {
+    const authHeader = req.headers['authorization'];
+    if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
+    try {
+        const token = authHeader.split(' ')[1];
+        const usuario = jwt.verify(token, process.env.JWT_SECRET);
+        
+        // Buscamos local y pack compatible en una sola query
+        const query = `
+            SELECT P.nombre_pack, P.icono, P.descripcion, COUNT(I.item_id) as cantidad_items
+            FROM locales L
+            JOIN packs_plantillas P ON P.rubro_target ILIKE '%' || L.rubro || '%'
+            LEFT JOIN items_pack I ON I.pack_id = P.pack_id
+            WHERE L.usuario_id = $1
+            GROUP BY P.pack_id
+        `;
+        const result = await pool.query(query, [usuario.id]);
+        
+        if (result.rows.length > 0) {
+            res.json({ disponible: true, pack: result.rows[0] });
+        } else {
+            res.json({ disponible: false });
+        }
+    } catch(e) { res.status(500).json({error: 'Error check pack'}); }
+});
 
 
 // ENCENDEMOS EL SERVIDOR
