@@ -349,7 +349,7 @@ app.get('/api/buscar', async (req, res) => {
 });
 
 // ==========================================
-// RUTA 6: VER MIS PRODUCTOS + ESTADO DE MISIONES 🏆 (ACTUALIZADA)
+// RUTA 6: VER MIS PRODUCTOS (CON ORDENAMIENTO DE OFERTAS) 🏆
 // ==========================================
 app.get('/api/mi-negocio/productos', async (req, res) => {
   const authHeader = req.headers['authorization'];
@@ -357,9 +357,9 @@ app.get('/api/mi-negocio/productos', async (req, res) => {
   const token = authHeader.split(' ')[1];
 
   try {
-    const usuario = jwt.verify(token, process.env.JWT_SECRET); // Usar process.env por seguridad
+    const usuario = jwt.verify(token, process.env.JWT_SECRET);
 
-    // 1. PRIMERO: Obtener datos del Local (Vital para la barra de Misiones)
+    // 1. Obtener datos del Local
     const localRes = await pool.query(
       'SELECT local_id, misiones_puntos, estado_manual, plan_tipo FROM locales WHERE usuario_id = $1',
       [usuario.id]
@@ -368,34 +368,43 @@ app.get('/api/mi-negocio/productos', async (req, res) => {
     if (localRes.rows.length === 0) return res.status(404).json({ error: 'Local no encontrado' });
     const datosLocal = localRes.rows[0];
 
-    // 2. SEGUNDO: Obtener Productos (Con Código de Barras)
+    // 2. Obtener Productos (Ordenados por importancia)
     const productosQuery = `
       SELECT 
         I.inventario_id,
-        
-        -- Prioridad: Datos manuales > Datos globales
         COALESCE(I.nombre, C.nombre_oficial) as nombre_oficial, 
         COALESCE(I.descripcion, C.descripcion) as descripcion,
         COALESCE(I.foto_url, C.foto_url) as foto_url,
-        
-        -- 🔥 AGREGADO: Código de Barras (Local o Global) 🔥
         COALESCE(I.codigo_barras, C.codigo_barras) as codigo_barras,
         
         I.precio,
         I.stock,
         I.tipo_item,
-        I.categoria_interna,  -- 'GENERAL', 'OFERTA_FLASH', 'OFERTA_ESPECIAL'
-        I.precio_regular      -- El precio original antes de la oferta
+        
+        -- Datos de Oferta
+        I.categoria_interna,
+        I.precio_regular
+
       FROM inventario_local I
       JOIN locales L ON I.local_id = L.local_id
       LEFT JOIN catalogo_global C ON I.global_id = C.global_id
       WHERE L.usuario_id = $1
-      ORDER BY I.inventario_id DESC
+      
+      -- 🔥 ORDENAMIENTO INTELIGENTE:
+      -- 1. Ofertas Flash primero (Urgente)
+      -- 2. Ofertas Especiales segundo
+      -- 3. Productos normales al final (por fecha)
+      ORDER BY 
+        CASE 
+            WHEN I.categoria_interna = 'OFERTA_FLASH' THEN 1
+            WHEN I.categoria_interna = 'OFERTA_ESPECIAL' THEN 2
+            ELSE 3 
+        END,
+        I.inventario_id DESC
     `;
     
     const productosRes = await pool.query(productosQuery, [usuario.id]);
 
-    // 3. RESPUESTA COMBINADA (Status + Items)
     res.json({
       status: {
         local_id: datosLocal.local_id,
@@ -407,20 +416,19 @@ app.get('/api/mi-negocio/productos', async (req, res) => {
     });
 
   } catch (error) {
-    console.error("Error en GET productos:", error);
+    console.error("Error GET productos:", error);
     res.status(500).json({ error: 'Error al obtener inventario' });
   }
 });
 
 // ==========================================
-// RUTA 7: ACTUALIZAR NEGOCIO (HÍBRIDO: GPS O PRODUCTOS) [ACTUALIZADA]
+// RUTA 7: ACTUALIZAR NEGOCIO (HÍBRIDO + OFERTAS) 🧠
 // ==========================================
 app.put('/api/mi-negocio/actualizar', async (req, res) => {
   const authHeader = req.headers['authorization'];
   if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
   const token = authHeader.split(' ')[1];
   
-  // Extraemos TODO lo posible del body
   const { 
     // Para GPS
     lat, long,
@@ -431,14 +439,15 @@ app.put('/api/mi-negocio/actualizar', async (req, res) => {
     nuevo_foto, 
     nuevo_nombre, 
     nuevo_desc,
-    codigo_barras // <--- NUEVO: Recibimos el código al editar
+    codigo_barras,
+    categoria_interna // <--- NUEVO CAMPO: 'GENERAL', 'OFERTA_FLASH', etc.
   } = req.body;
 
   try {
     const usuario = jwt.verify(token, process.env.JWT_SECRET);
 
     // ---------------------------------------------------------
-    // CASO A: ACTUALIZAR UBICACIÓN GPS (PIN DEL MAPA)
+    // CASO A: ACTUALIZAR UBICACIÓN GPS (Sin cambios)
     // ---------------------------------------------------------
     if (lat && long) {
       const queryGPS = `
@@ -452,24 +461,59 @@ app.put('/api/mi-negocio/actualizar', async (req, res) => {
     }
 
     // ---------------------------------------------------------
-    // CASO B: ACTUALIZAR PRODUCTO
+    // CASO B: ACTUALIZAR PRODUCTO (CON LÓGICA DE PRECIOS)
     // ---------------------------------------------------------
     if (inventario_id) {
-      // 1. Actualizamos INVENTARIO LOCAL (Precio, Stock y CÓDIGO)
-      // Usamos COALESCE para que si el dato viene null, no borre lo que ya existía.
+      
+      // 1. OBTENER ESTADO ACTUAL (Para la lógica de Ofertas)
+      const currentRes = await pool.query('SELECT precio, precio_regular, categoria_interna FROM inventario_local WHERE inventario_id = $1', [inventario_id]);
+      
+      if (currentRes.rows.length === 0) return res.status(404).json({ error: 'Producto no encontrado' });
+      const actual = currentRes.rows[0];
+
+      // --- LÓGICA DE PRECIOS INTELIGENTE ---
+      let precioFinal = nuevo_precio;
+      let precioRegularFinal = actual.precio_regular; // Por defecto mantenemos el backup si existe
+      let catFinal = categoria_interna || actual.categoria_interna; // Si no mandan categoría, queda la que estaba
+
+      // A. Si estamos ACTIVANDO una oferta (y antes era GENERAL)
+      if (catFinal !== 'GENERAL' && actual.categoria_interna === 'GENERAL') {
+          // Guardamos el precio viejo como backup antes de aplicar el nuevo precio de oferta
+          // (Asumimos que 'nuevo_precio' ya viene con el descuento aplicado desde el frontend)
+          precioRegularFinal = actual.precio;
+      }
+      
+      // B. Si estamos QUITANDO una oferta (volvemos a GENERAL)
+      else if (catFinal === 'GENERAL' && actual.categoria_interna !== 'GENERAL') {
+          // Si había un precio backup, lo restauramos automáticamente
+          if (actual.precio_regular) {
+              precioFinal = actual.precio_regular;
+          }
+          precioRegularFinal = null; // Borramos el backup porque ya no es oferta
+      }
+
+      // 2. ACTUALIZAMOS INVENTARIO LOCAL
       const updateInventario = `
         UPDATE inventario_local 
         SET 
           precio = $1, 
           stock = $2,
-          codigo_barras = COALESCE($4, codigo_barras) -- <--- AQUÍ ACTUALIZAMOS EL CÓDIGO
-        WHERE inventario_id = $3
+          codigo_barras = COALESCE($3, codigo_barras),
+          categoria_interna = $4,
+          precio_regular = $5
+        WHERE inventario_id = $6
       `;
       
-      // El orden del array es: precio ($1), stock ($2), ID ($3), codigo ($4)
-      await pool.query(updateInventario, [nuevo_precio, nuevo_stock, inventario_id, codigo_barras]);
+      await pool.query(updateInventario, [
+        precioFinal,        // $1
+        nuevo_stock,        // $2
+        codigo_barras,      // $3
+        catFinal,           // $4 (Nueva Categoría)
+        precioRegularFinal, // $5 (Precio Tachado)
+        inventario_id       // $6
+      ]);
 
-      // 2. Actualizamos CATALOGO GLOBAL (Nombre, Descripción, Foto)
+      // 3. ACTUALIZAMOS CATALOGO GLOBAL (Nombre, Descripción, Foto - Sin cambios)
       const getGlobal = await pool.query('SELECT global_id FROM inventario_local WHERE inventario_id = $1', [inventario_id]);
       
       if (getGlobal.rows.length > 0) {
@@ -491,7 +535,6 @@ app.put('/api/mi-negocio/actualizar', async (req, res) => {
       return res.json({ mensaje: 'Producto actualizado correctamente' });
     }
 
-    // Si no enviaron ni coordenadas ni ID de producto
     res.status(400).json({ error: 'Datos insuficientes para actualizar' });
 
   } catch (error) {
@@ -1351,7 +1394,7 @@ app.post('/api/transaccion/calificar', upload.single('foto'), async (req, res) =
 });
 
 // ==========================================
-// RUTA 16: PERFIL PÚBLICO (CON FOTOS, PORTADA Y FIDELIZACIÓN 📸🎟️)
+// RUTA 16: PERFIL PÚBLICO (CON FOTOS, PORTADA, FIDELIZACIÓN Y OFERTAS 🏷️)
 // ==========================================
 app.get('/api/perfil-publico/:id', async (req, res) => {
   const local_id = req.params.id;
@@ -1362,7 +1405,7 @@ app.get('/api/perfil-publico/:id', async (req, res) => {
   if (authHeader) {
     try {
       const token = authHeader.split(' ')[1];
-      const decoded = jwt.verify(token, process.env.JWT_SECRET); // Usar process.env por seguridad
+      const decoded = jwt.verify(token, process.env.JWT_SECRET);
       usuarioId = decoded.id;
     } catch(e) {}
   }
@@ -1372,12 +1415,8 @@ app.get('/api/perfil-publico/:id', async (req, res) => {
     const queryLocal = `
       SELECT 
         usuario_id, local_id, nombre, categoria, rubro, 
-        
-        -- 🔥 FOTOS INTELIGENTES 🔥
-        -- Si hay foto de perfil nueva, la usa. Si no, usa la vieja.
         COALESCE(foto_perfil, foto_url) as foto_url,
-        foto_portada, -- <--- NUEVA COLUMNA AGREGADA
-        
+        foto_portada, 
         reputacion, 
         direccion_fisica, whatsapp, hora_apertura, hora_cierre, dias_atencion,
         estado_manual, permite_delivery, permite_retiro,
@@ -1389,7 +1428,7 @@ app.get('/api/perfil-publico/:id', async (req, res) => {
     const localRes = await pool.query(queryLocal, [local_id]);
     if (localRes.rows.length === 0) return res.status(404).json({ error: 'Local no encontrado' });
 
-    // 2. PRODUCTOS (HÍBRIDO: MANUAL + GLOBAL)
+    // 2. PRODUCTOS (HÍBRIDO + ORDENAMIENTO OFERTAS)
     const queryProductos = `
       SELECT 
         I.inventario_id, 
@@ -1399,15 +1438,28 @@ app.get('/api/perfil-publico/:id', async (req, res) => {
         I.precio, 
         I.stock, 
         I.tipo_item,
-        -- 🔥 NUEVOS CAMPOS PARA EL COMPRADOR 🔥
+        
+        -- Datos de Oferta
         I.categoria_interna,
         I.precio_regular
+
       FROM inventario_local I 
       LEFT JOIN catalogo_global C ON I.global_id = C.global_id 
       WHERE I.local_id = $1
-      AND I.stock > 0        -- <--- FILTRO DE SEGURIDAD 1 (Hay mercadería)
-      AND I.precio > 0       -- <--- FILTRO DE SEGURIDAD 2 (Tiene precio real)
-      ORDER BY I.inventario_id DESC
+      AND I.stock > 0        -- FILTRO DE SEGURIDAD 1 (Hay mercadería)
+      AND I.precio > 0       -- FILTRO DE SEGURIDAD 2 (Tiene precio real)
+      
+      -- 🔥 ORDENAMIENTO ESTRATÉGICO 🔥
+      -- 1. Ofertas Flash (Urgente)
+      -- 2. Ofertas Especiales
+      -- 3. Productos normales (lo más nuevo arriba)
+      ORDER BY 
+        CASE 
+            WHEN I.categoria_interna = 'OFERTA_FLASH' THEN 1
+            WHEN I.categoria_interna = 'OFERTA_ESPECIAL' THEN 2
+            ELSE 3 
+        END,
+        I.inventario_id DESC
     `;
 
     const prodRes = await pool.query(queryProductos, [local_id]);
@@ -1470,7 +1522,7 @@ app.get('/api/perfil-publico/:id', async (req, res) => {
       reseñas: reviewRes.rows,
       es_favorito: esFavorito,
       es_propio: esPropio,
-      fidelizacion: datosFidelidad
+      fidelizacion: datosFidelidad 
     });
 
   } catch (error) {
