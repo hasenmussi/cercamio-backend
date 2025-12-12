@@ -383,7 +383,9 @@ app.get('/api/mi-negocio/productos', async (req, res) => {
         
         I.precio,
         I.stock,
-        I.tipo_item
+        I.tipo_item,
+        I.categoria_interna,  -- 'GENERAL', 'OFERTA_FLASH', 'OFERTA_ESPECIAL'
+        I.precio_regular      -- El precio original antes de la oferta
       FROM inventario_local I
       JOIN locales L ON I.local_id = L.local_id
       LEFT JOIN catalogo_global C ON I.global_id = C.global_id
@@ -1396,7 +1398,10 @@ app.get('/api/perfil-publico/:id', async (req, res) => {
         COALESCE(I.descripcion, C.descripcion) as descripcion,
         I.precio, 
         I.stock, 
-        I.tipo_item
+        I.tipo_item,
+        -- 🔥 NUEVOS CAMPOS PARA EL COMPRADOR 🔥
+        I.categoria_interna,
+        I.precio_regular
       FROM inventario_local I 
       LEFT JOIN catalogo_global C ON I.global_id = C.global_id 
       WHERE I.local_id = $1
@@ -4097,6 +4102,126 @@ app.get('/api/mi-negocio/check-pack', async (req, res) => {
             res.json({ disponible: false });
         }
     } catch(e) { res.status(500).json({error: 'Error check pack'}); }
+});
+
+// ==========================================
+// RUTA 52: GESTIÓN DE OFERTAS Y PRECIOS (LOGICA INTELIGENTE v2) 🏷️
+// ==========================================
+app.put('/api/mi-negocio/producto/cambiar-categoria', async (req, res) => {
+  const authHeader = req.headers['authorization'];
+  if (!authHeader) return res.status(401).json({ error: 'Sesión expirada. Inicia sesión nuevamente.' });
+  const token = authHeader.split(' ')[1];
+
+  // Recibimos: ID, la categoría nueva y el precio ofertado (opcional)
+  const { inventario_id, nueva_categoria, precio_oferta } = req.body;
+
+  const client = await pool.connect();
+
+  try {
+    const usuario = jwt.verify(token, process.env.JWT_SECRET);
+    await client.query('BEGIN');
+
+    // 1. OBTENER ESTADO ACTUAL DEL PRODUCTO
+    const checkQuery = `
+        SELECT I.nombre, I.precio, I.precio_regular, I.categoria_interna 
+        FROM inventario_local I
+        JOIN locales L ON I.local_id = L.local_id
+        WHERE I.inventario_id = $1 AND L.usuario_id = $2
+    `;
+    const checkRes = await client.query(checkQuery, [inventario_id, usuario.id]);
+    
+    if (checkRes.rows.length === 0) {
+        throw new Error("No encontramos el producto o no tienes permiso.");
+    }
+    
+    const actual = checkRes.rows[0];
+    
+    // Variables para el update
+    let precioFinal = Number(actual.precio);
+    let precioRegularFinal = actual.precio_regular ? Number(actual.precio_regular) : null;
+    let mensajeRespuesta = "Producto actualizado.";
+
+    console.log(`🏷️ [OFERTAS] Modificando '${actual.nombre}' | De: ${actual.categoria_interna} -> A: ${nueva_categoria}`);
+
+    // --- LÓGICA DE NEGOCIO ---
+
+    // CASO A: ACTIVANDO UNA OFERTA (De GENERAL a OFERTA)
+    // El usuario quiere poner un descuento.
+    if (nueva_categoria !== 'GENERAL' && actual.categoria_interna === 'GENERAL') {
+        
+        if (!precio_oferta || Number(precio_oferta) >= Number(actual.precio)) {
+            // Error amigable para el usuario
+            throw new Error("⚠️ El precio de oferta debe ser menor al precio actual.");
+        }
+
+        // Guardamos el precio actual en el "backup" (precio_regular) para no perderlo
+        precioRegularFinal = Number(actual.precio);
+        
+        // El precio activo pasa a ser el de oferta
+        precioFinal = Number(precio_oferta);
+        
+        mensajeRespuesta = `¡Oferta Activada! 🔥 Ahora vale $${precioFinal}`;
+        console.log(`   ↘️ [BAJA PRECIO] Antes: $${precioRegularFinal} -> Ahora: $${precioFinal}`);
+    }
+
+    // CASO B: QUITANDO UNA OFERTA (De OFERTA a GENERAL)
+    // El usuario se arrepintió o se acabó la promo.
+    else if (nueva_categoria === 'GENERAL' && actual.categoria_interna !== 'GENERAL') {
+        
+        // Restauramos el precio original si existe en el backup
+        if (actual.precio_regular) {
+            precioFinal = Number(actual.precio_regular);
+        }
+        // Limpiamos el backup (ya no es oferta)
+        precioRegularFinal = null; 
+        
+        mensajeRespuesta = `Producto restaurado al precio original ($${precioFinal}).`;
+        console.log(`   ↗️ [RESTAURAR] Precio volvió a normalidad.`);
+    }
+
+    // CASO C: MODIFICANDO DENTRO DE OFERTA (De FLASH a ESPECIAL o corregir precio)
+    // El usuario cambia de tipo de oferta o ajusta el número.
+    else if (nueva_categoria !== 'GENERAL') {
+        if (precio_oferta) {
+            // Validamos contra el precio regular (si existe) para no cometer errores
+            if (precioRegularFinal && Number(precio_oferta) >= precioRegularFinal) {
+                 throw new Error("⚠️ La oferta no puede ser mayor al precio original.");
+            }
+            precioFinal = Number(precio_oferta);
+            mensajeRespuesta = `Precio de oferta actualizado a $${precioFinal}.`;
+        }
+    }
+
+    // 2. EJECUTAR ACTUALIZACIÓN
+    const updateQuery = `
+        UPDATE inventario_local 
+        SET 
+            categoria_interna = $1,
+            precio = $2,
+            precio_regular = $3
+        WHERE inventario_id = $4
+    `;
+    
+    await client.query(updateQuery, [nueva_categoria, precioFinal, precioRegularFinal, inventario_id]);
+
+    await client.query('COMMIT');
+    
+    // Respondemos con datos listos para mostrar en la UI
+    res.json({ 
+        mensaje: mensajeRespuesta, 
+        precio_actual: precioFinal,
+        precio_regular: precioRegularFinal,
+        categoria: nueva_categoria
+    });
+
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error("❌ Error en gestión de ofertas:", error.message);
+    // Devolvemos el mensaje limpio (sin "Error: ...") para el SnackBar
+    res.status(400).json({ error: error.message.replace('Error: ', '') }); 
+  } finally {
+    client.release();
+  }
 });
 
 
