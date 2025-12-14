@@ -1849,46 +1849,89 @@ app.get('/api/mi-negocio/config', async (req, res) => {
 });
 
 // ==========================================
-// RUTA 23: CREAR/ACTUALIZAR OFERTA FLASH (24hs)
+// RUTA 23: ENCENDER FUEGO (ACTIVACIÓN) 🔥
 // ==========================================
 app.post('/api/mi-negocio/oferta-flash', async (req, res) => {
   const authHeader = req.headers['authorization'];
   if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
   const token = authHeader.split(' ')[1];
 
-  const { titulo, descripcion } = req.body;
-
   try {
-    const usuario = jwt.verify(token, JWT_SECRET);
+    const usuario = jwt.verify(token, process.env.JWT_SECRET);
     
-    // 1. Obtenemos el ID del local del usuario
     const localRes = await pool.query('SELECT local_id FROM locales WHERE usuario_id = $1', [usuario.id]);
-    if (localRes.rows.length === 0) return res.status(404).json({ error: 'No tienes un local registrado' });
+    if (localRes.rows.length === 0) return res.status(404).json({ error: 'No tienes local' });
     const local_id = localRes.rows[0].local_id;
 
-    // 2. Lógica "Upsert" (Si ya tiene una, la sobrescribimos, si no, creamos)
-    // La oferta dura 24 horas a partir de AHORA
-    const query = `
-      INSERT INTO ofertas_flash (local_id, titulo, descripcion, fecha_fin, activa)
-      VALUES ($1, $2, $3, NOW() + INTERVAL '24 hours', TRUE)
-      ON CONFLICT (oferta_id) DO UPDATE -- (Esto requiere un constraint, pero usaremos lógica simple abajo)
-      -- Simplificación: Borramos las viejas y creamos una nueva
-    `;
+    // 1. Verificamos que tenga productos flash cargados (Seguridad)
+    const checkProd = await pool.query("SELECT 1 FROM inventario_local WHERE local_id = $1 AND categoria_interna = 'OFERTA_FLASH'", [local_id]);
+    
+    if (checkProd.rowCount === 0) {
+        return res.status(400).json({ error: 'No tienes productos marcados como Flash en tu inventario.' });
+    }
 
-    // A. Desactivamos cualquier oferta anterior de este local
+    // 2. Apagamos anteriores
     await pool.query('UPDATE ofertas_flash SET activa = FALSE WHERE local_id = $1', [local_id]);
 
-    // B. Creamos la nueva
+    // 3. Encendemos nueva (Título genérico automático)
+    const tituloAuto = "¡OFERTAS FLASH DISPONIBLES!";
+    const descAuto = "Toca para ver los productos en liquidación.";
+
     await pool.query(`
       INSERT INTO ofertas_flash (local_id, titulo, descripcion, fecha_fin, activa)
       VALUES ($1, $2, $3, NOW() + INTERVAL '24 hours', TRUE)
-    `, [local_id, titulo, descripcion]);
+    `, [local_id, tituloAuto, descAuto]);
 
-    res.json({ mensaje: '¡Oferta Flash activada por 24 horas! 🔥' });
+    res.json({ mensaje: '¡Modo Fuego Activado! 🔥 Tu local ahora destaca en el mapa.' });
 
   } catch (error) {
     console.error(error);
-    res.status(500).json({ error: 'Error al crear oferta' });
+    res.status(500).json({ error: 'Error al activar' });
+  }
+});
+
+// ==========================================
+// RUTA 23.2: VER PRODUCTOS CANDIDATOS A FLASH 🔥
+// ==========================================
+app.get('/api/mi-negocio/ofertas-flash-list', async (req, res) => {
+  const authHeader = req.headers['authorization'];
+  if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
+  const token = authHeader.split(' ')[1];
+
+  try {
+    const usuario = jwt.verify(token, process.env.JWT_SECRET);
+
+    // Buscamos productos que el usuario YA etiquetó como Flash
+    const query = `
+      SELECT I.nombre, I.precio, I.precio_regular, I.foto_url 
+      FROM inventario_local I
+      JOIN locales L ON I.local_id = L.local_id
+      WHERE L.usuario_id = $1 
+      AND I.categoria_interna = 'OFERTA_FLASH'
+      AND I.stock > 0
+    `;
+    
+    const result = await pool.query(query, [usuario.id]);
+    
+    // Verificamos si ya hay un fuego encendido (para mostrar tiempo restante si quisieras)
+    const activeQuery = `
+      SELECT fecha_fin FROM ofertas_flash 
+      WHERE local_id = (SELECT local_id FROM locales WHERE usuario_id = $1) 
+      AND activa = TRUE 
+      AND fecha_fin > NOW()
+    `;
+    const activeRes = await pool.query(activeQuery, [usuario.id]);
+
+    res.json({
+      productos: result.rows,
+      cantidad: result.rowCount,
+      oferta_activa: activeRes.rows.length > 0,
+      vence_en: activeRes.rows.length > 0 ? activeRes.rows[0].fecha_fin : null
+    });
+
+  } catch (error) {
+    console.error("Error fetching flash items:", error);
+    res.status(500).json({ error: 'Error al obtener ofertas' });
   }
 });
 
