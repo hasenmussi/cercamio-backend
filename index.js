@@ -234,6 +234,15 @@ app.get('/api/locales', async (req, res) => {
           ELSE NULL 
         END as oferta_flash,
 
+        -- 2.5 DETECCIÓN DE OFERTA ESPECIAL (NUEVO) 🏷️
+        -- Devuelve true si existe al menos 1 producto especial con stock
+        (EXISTS (
+          SELECT 1 FROM inventario_local I 
+          WHERE I.local_id = L.local_id 
+          AND I.categoria_interna = 'OFERTA_ESPECIAL'
+          AND I.stock > 0
+        )) as tiene_oferta_especial,
+
         -- 2. DETECCIÓN HISTORIAS (ANILLO DE COLOR 🟣)
         (EXISTS (
           SELECT 1 FROM historias H 
