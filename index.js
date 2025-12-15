@@ -177,17 +177,22 @@ app.get('/', (req, res) => {
 
 
 // ==========================================
-// RUTA 1: OBTENER LOCALES (CON GEO + OFERTAS + PREMIUM 💎)
+// RUTA 1: OBTENER LOCALES (GPS REAL + BÚSQUEDA VISUAL) 📍
 // ==========================================
 app.get('/api/locales', async (req, res) => {
-  // Pedimos latitud, longitud y un radio (por defecto 5km)
-  const { filtro, lat, lng, radio = 5000 } = req.query; 
+  // Recibimos coordenadas de la cámara (lat, lng) Y del usuario (user_lat, user_lng)
+  const { filtro, lat, lng, user_lat, user_lng, radio = 5000 } = req.query; 
 
   try {
-    // Validamos que vengan las coordenadas (Vital para PostGIS)
     if (!lat || !lng) {
-      return res.status(400).json({ error: "Se requiere latitud y longitud del usuario" });
+      return res.status(400).json({ error: "Faltan coordenadas del centro del mapa" });
     }
+
+    // Definimos el origen para calcular la distancia:
+    // Si el celular mandó su GPS real (user_lat), usamos ese.
+    // Si no (ej: permiso denegado), usamos el centro del mapa como fallback.
+    const origenLat = user_lat || lat;
+    const origenLng = user_lng || lng;
 
     let consulta = `
       SELECT 
@@ -195,7 +200,7 @@ app.get('/api/locales', async (req, res) => {
         L.nombre, 
         L.categoria, 
         L.plan_tipo,
-        L.plan_vencimiento, -- <--- NUEVO: Útil para debugging o avisos
+        L.plan_vencimiento,
         L.modo_operacion, 
         L.reputacion, 
         COALESCE(L.foto_perfil, L.foto_url) as foto_url, 
@@ -212,19 +217,19 @@ app.get('/api/locales', async (req, res) => {
         L.pago_transferencia,
         L.pago_tarjeta,
         
-        -- 💎 LÓGICA PREMIUM: Solo es true si es PREMIUM y NO ha vencido
         (L.plan_tipo = 'PREMIUM' AND L.plan_vencimiento > NOW()) as es_premium,
 
         ST_X(L.ubicacion::geometry) as long, 
         ST_Y(L.ubicacion::geometry) as lat,
         
-        -- Distancia en metros
+        -- 📏 CÁLCULO DE DISTANCIA REAL 📏
+        -- Usamos los parámetros $4 y $5 (Ubicación del Usuario)
         ST_Distance(
           L.ubicacion::geometry, 
-          ST_SetSRID(ST_MakePoint($1, $2), 4326)::geometry
+          ST_SetSRID(ST_MakePoint($4, $5), 4326)::geometry
         ) as distancia_metros,
 
-        -- 1. DETECCIÓN DE OFERTA FLASH 🔥
+        -- 1. OFERTA FLASH
         CASE 
           WHEN O.oferta_id IS NOT NULL THEN json_build_object(
             'titulo', O.titulo,
@@ -234,8 +239,7 @@ app.get('/api/locales', async (req, res) => {
           ELSE NULL 
         END as oferta_flash,
 
-        -- 2.5 DETECCIÓN DE OFERTA ESPECIAL (NUEVO) 🏷️
-        -- Devuelve true si existe al menos 1 producto especial con stock
+        -- 2. OFERTA ESPECIAL
         (EXISTS (
           SELECT 1 FROM inventario_local I 
           WHERE I.local_id = L.local_id 
@@ -243,7 +247,7 @@ app.get('/api/locales', async (req, res) => {
           AND I.stock > 0
         )) as tiene_oferta_especial,
 
-        -- 2. DETECCIÓN HISTORIAS (ANILLO DE COLOR 🟣)
+        -- 3. HISTORIAS
         (EXISTS (
           SELECT 1 FROM historias H 
           WHERE H.local_id = L.local_id 
@@ -251,14 +255,11 @@ app.get('/api/locales', async (req, res) => {
         )) as tiene_historias
 
       FROM locales L
-      
-      -- UNIÓN INTELIGENTE CON OFERTAS
-      LEFT JOIN ofertas_flash O ON L.local_id = O.local_id 
-        AND O.activa = TRUE 
-        AND O.fecha_fin > NOW()
+      LEFT JOIN ofertas_flash O ON L.local_id = O.local_id AND O.activa = TRUE AND O.fecha_fin > NOW()
 
       WHERE 
-        -- Filtro Geoespacial: Solo dentro del radio
+        -- 🎯 FILTRO DE BÚSQUEDA (LO QUE VEO) 🎯
+        -- Usamos los parámetros $1 y $2 (Centro del Mapa)
         ST_DWithin(
           L.ubicacion::geometry,
           ST_SetSRID(ST_MakePoint($1, $2), 4326)::geometry,
@@ -266,11 +267,16 @@ app.get('/api/locales', async (req, res) => {
         )
     `;
     
-    // Parámetros SQL
-    let params = [parseFloat(lng), parseFloat(lat), parseFloat(radio)]; 
-    let paramCounter = 4; 
+    // Parámetros SQL:
+    // $1, $2, $3 -> Filtran (Centro del Mapa + Radio)
+    // $4, $5     -> Miden (GPS del Usuario)
+    let params = [
+        parseFloat(lng), parseFloat(lat), parseFloat(radio),      // 1, 2, 3
+        parseFloat(origenLng), parseFloat(origenLat)              // 4, 5
+    ]; 
+    
+    let paramCounter = 6; // El próximo filtro arranca en $6
 
-    // Filtro de texto opcional (Buscador)
     if (filtro) {
       consulta += ` 
         AND (
@@ -283,12 +289,7 @@ app.get('/api/locales', async (req, res) => {
       params.push(`%${filtro}%`);
     }
 
-    // ORDENAMIENTO:
-    // Opción A (Actual): Solo por cercanía.
-    // consulta += ` ORDER BY distancia_metros ASC`;
-
-    // Opción B (Estrategia Comercial): Los Premium primero, luego por cercanía.
-    // Si querés activar esto, borrá la línea de arriba y descomentá esta:
+    // Ordenamos por Premium y luego por cercanía al usuario
     consulta += ` ORDER BY (L.plan_tipo = 'PREMIUM' AND L.plan_vencimiento > NOW()) DESC, distancia_metros ASC`;
 
     const respuesta = await pool.query(consulta, params);
