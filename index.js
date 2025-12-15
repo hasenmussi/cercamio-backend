@@ -301,25 +301,33 @@ app.get('/api/locales', async (req, res) => {
   }
 });
 
-// RUTA 2: Buscar productos (CORREGIDA)
+// ==========================================
+// RUTA 2: BUSCADOR AVANZADO (TRIGRAMAS + GEO + FILTROS) 🔍
+// ==========================================
 app.get('/api/buscar', async (req, res) => {
   const { q, lat, lng } = req.query; 
   
   if (!q) return res.status(400).json({ error: 'Falta el término de búsqueda' });
   
-  // Validamos coordenadas de nuevo. 
-  // OJO: Si quieres permitir buscar sin ubicación, avísame y cambiamos la lógica.
+  // Validación de GPS
   if (!lat || !lng) {
-      return res.status(400).json({ error: "Se requiere ubicación para buscar productos cercanos" });
+      return res.status(400).json({ error: "Se requiere ubicación para buscar" });
   }
 
   try {
+    // Preparamos el término para búsqueda parcial (%texto%)
+    const terminoBusqueda = `%${q}%`;
+
     const consulta = `
       SELECT 
         L.local_id,
         I.inventario_id,
-        C.nombre_oficial, 
-        C.descripcion,
+        
+        -- DATOS INTELIGENTES (COALESCE)
+        COALESCE(I.nombre, C.nombre_oficial) as nombre_oficial, 
+        COALESCE(I.descripcion, C.descripcion) as descripcion,
+        COALESCE(I.foto_url, C.foto_url) as foto_producto,
+        
         I.precio, 
         L.nombre as tienda,
         L.categoria,
@@ -327,34 +335,62 @@ app.get('/api/buscar', async (req, res) => {
         L.tipo_actividad,
         L.reputacion,
         L.whatsapp,
-        L.foto_url as foto_local,
-        C.foto_url as foto_producto,
+        
+        -- FOTO DEL LOCAL (Con lógica de perfil nueva)
+        COALESCE(L.foto_perfil, L.foto_url) as foto_local,
+
         ST_X(L.ubicacion::geometry) as long, 
         ST_Y(L.ubicacion::geometry) as lat,
+        
+        -- Distancia Real
         ST_Distance(
           L.ubicacion::geometry, 
           ST_SetSRID(ST_MakePoint($2, $3), 4326)::geometry
         ) as distancia_metros
+
       FROM inventario_local I
-      JOIN catalogo_global C ON I.global_id = C.global_id
+      LEFT JOIN catalogo_global C ON I.global_id = C.global_id
       JOIN locales L ON I.local_id = L.local_id
+      
       WHERE 
-        (C.nombre_oficial ILIKE $1 OR L.nombre ILIKE $1 OR L.rubro ILIKE $1)
-        AND
+        -- 1. FILTRO GEOESPACIAL (Radio 10km)
         ST_DWithin(
           L.ubicacion::geometry,
           ST_SetSRID(ST_MakePoint($2, $3), 4326)::geometry,
-          10000 -- Radio fijo de 10km para búsqueda de productos (ajustable)
+          10000 
         )
+        AND
+        -- 2. FILTRO DE SEGURIDAD (Solo productos vendibles)
+        I.stock > 0 AND I.precio > 0
+        AND
+        -- 3. BÚSQUEDA INTELIGENTE (Usa los índices GIN creados)
+        (
+          -- Busca en nombre del producto (sin acentos)
+          public.immutable_unaccent(COALESCE(I.nombre, C.nombre_oficial)) ILIKE public.immutable_unaccent($1)
+          OR 
+          -- Busca en descripción del producto
+          public.immutable_unaccent(COALESCE(I.descripcion, C.descripcion)) ILIKE public.immutable_unaccent($1)
+          OR
+          -- Busca en nombre de la tienda
+          public.immutable_unaccent(L.nombre) ILIKE public.immutable_unaccent($1)
+          OR 
+          -- Busca en el rubro (ej: "Ferretería")
+          public.immutable_unaccent(L.rubro) ILIKE public.immutable_unaccent($1)
+        )
+
+      -- ORDENAMIENTO: Primero lo más cerca
       ORDER BY distancia_metros ASC
+      LIMIT 50 -- Límite para no saturar la red
     `;
     
-    // Parámetros: [Query, Longitud, Latitud]
-    const respuesta = await pool.query(consulta, [`%${q}%`, parseFloat(lng), parseFloat(lat)]);
+    // Parámetros: [Query con %, Longitud, Latitud]
+    const respuesta = await pool.query(consulta, [terminoBusqueda, parseFloat(lng), parseFloat(lat)]);
+    
     res.json(respuesta.rows);
+
   } catch (error) {
     console.error("Error en GET /api/buscar:", error);
-    res.status(500).json({ error: 'Error al buscar' });
+    res.status(500).json({ error: 'Error al buscar productos' });
   }
 });
 
