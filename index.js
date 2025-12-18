@@ -178,6 +178,7 @@ app.get('/', (req, res) => {
 
 // ==========================================
 // RUTA 1: OBTENER LOCALES (GPS REAL + BÚSQUEDA VISUAL) 📍
+// (OPTIMIZADO v10.1 - PostGIS Geography)
 // ==========================================
 app.get('/api/locales', async (req, res) => {
   // Recibimos coordenadas de la cámara (lat, lng) Y del usuario (user_lat, user_lng)
@@ -222,11 +223,11 @@ app.get('/api/locales', async (req, res) => {
         ST_X(L.ubicacion::geometry) as long, 
         ST_Y(L.ubicacion::geometry) as lat,
         
-        -- 📏 CÁLCULO DE DISTANCIA REAL 📏
-        -- Usamos los parámetros $4 y $5 (Ubicación del Usuario)
+        -- 📏 CÁLCULO DE DISTANCIA REAL (CORREGIDO: Metros) 📏
+        -- Usamos ::geography para calcular metros sobre la curvatura de la tierra
         ST_Distance(
-          L.ubicacion::geometry, 
-          ST_SetSRID(ST_MakePoint($4, $5), 4326)::geometry
+          L.ubicacion::geography, 
+          ST_SetSRID(ST_MakePoint($4, $5), 4326)::geography
         ) as distancia_metros,
 
         -- 1. OFERTA FLASH
@@ -259,10 +260,10 @@ app.get('/api/locales', async (req, res) => {
 
       WHERE 
         -- 🎯 FILTRO DE BÚSQUEDA (LO QUE VEO) 🎯
-        -- Usamos los parámetros $1 y $2 (Centro del Mapa)
+        -- Usamos ::geography para que el radio ($3) sea interpretado en METROS
         ST_DWithin(
-          L.ubicacion::geometry,
-          ST_SetSRID(ST_MakePoint($1, $2), 4326)::geometry,
+          L.ubicacion::geography,
+          ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography,
           $3
         )
     `;
@@ -270,6 +271,7 @@ app.get('/api/locales', async (req, res) => {
     // Parámetros SQL:
     // $1, $2, $3 -> Filtran (Centro del Mapa + Radio)
     // $4, $5     -> Miden (GPS del Usuario)
+    // Nota: PostGIS usa (Lng, Lat), por eso el orden es lng, lat
     let params = [
         parseFloat(lng), parseFloat(lat), parseFloat(radio),      // 1, 2, 3
         parseFloat(origenLng), parseFloat(origenLat)              // 4, 5
