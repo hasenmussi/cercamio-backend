@@ -1796,10 +1796,11 @@ app.put('/api/mi-negocio/actualizar-todo', async (req, res) => {
         foto_portada = COALESCE($18, foto_portada)
 
       WHERE usuario_id = $16
+      RETURNING nombre, foto_perfil, foto_portada, estado_manual, rubro
     `;
     
     // El orden del array debe coincidir EXACTAMENTE con los números $
-    await pool.query(updateQuery, [
+    const result = await pool.query(updateQuery, [
       nombre, direccion, whatsapp,                        // $1, $2, $3
       hora_apertura, hora_cierre, dias_atencion,          // $4, $5, $6
       rubro, permite_delivery, permite_retiro,            // $7, $8, $9
@@ -1811,7 +1812,9 @@ app.put('/api/mi-negocio/actualizar-todo', async (req, res) => {
       foto_portada  // $18
     ]);
 
-    res.json({ mensaje: 'Configuración y perfil guardados correctamente' });
+    res.json({ mensaje: 'Configuración guardada', 
+      perfil: result.rows[0] // <--- Esto permite al Frontend actualizarse sin recargar 
+      });
 
   } catch (error) {
     console.error("Error actualizando todo:", error);
@@ -4115,53 +4118,61 @@ app.post('/api/uploads/imagen', upload.single('imagen'), (req, res) => {
 });
 
 // ==========================================
-// RUTA 50: ESCÁNER INTELIGENTE (LOCAL -> GLOBAL -> INTERNET) 🧠🌐
+// RUTA 50: ESCÁNER INTELIGENTE (OPTIMIZADO v10.1) 🚀
 // ==========================================
 app.get('/api/producto/scan/:codigo', async (req, res) => {
   const authHeader = req.headers['authorization'];
   if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
   
+  // Limpiamos el código (a veces los lectores mandan espacios o saltos de línea)
   const codigo = req.params.codigo.trim();
 
   try {
     const token = authHeader.split(' ')[1];
     const usuario = jwt.verify(token, process.env.JWT_SECRET);
 
-    // 1. Obtener Local ID
+    // 1. Obtener Local ID (Cacheable en el futuro, por ahora DB directa es rápida por PK)
     const localRes = await pool.query('SELECT local_id FROM locales WHERE usuario_id = $1', [usuario.id]);
-    if (localRes.rows.length === 0) return res.status(404).json({ error: 'Sin local' });
+    if (localRes.rows.length === 0) return res.status(404).json({ error: 'Sin local asociado' });
     const localId = localRes.rows[0].local_id;
 
-    console.error(`🔥 [SCAN V3] Buscando '${codigo}' en Local ${localId}`);
+    // console.log(`🔍 Escaneando: ${codigo} en Local ${localId}`);
 
-    // --- CAPA 1: BÚSQUEDA LOCAL (CON HERENCIA) ---
+    // --- CAPA 1: BÚSQUEDA LOCAL (PRIORIDAD MÁXIMA) ---
+    // NOTA: Quitamos el CAST(). Asumimos que codigo_barras es VARCHAR o BIGINT. 
+    // Postgres manejará la comparación usando el índice.
     const queryLocal = `
       SELECT 
         I.inventario_id, I.local_id, I.precio, I.stock, I.tipo_item, I.codigo_barras,
         COALESCE(I.nombre, C.nombre_oficial) as nombre, 
         COALESCE(I.descripcion, C.descripcion) as descripcion,
-        COALESCE(I.foto_url, C.foto_url) as foto_url
+        COALESCE(I.foto_url, C.foto_url) as foto_url,
+        I.categoria_interna
       FROM inventario_local I
       LEFT JOIN catalogo_global C ON I.global_id = C.global_id
       WHERE I.local_id = $1 
-      AND CAST(I.codigo_barras AS TEXT) = $2
+      AND I.codigo_barras = $2 
     `;
     
     const localProduct = await pool.query(queryLocal, [localId, codigo]);
 
     if (localProduct.rows.length > 0) {
-      console.error("✅ ENCONTRADO EN LOCAL");
+      // console.log("✅ ENCONTRADO EN LOCAL");
       return res.json({
         estado: 'EN_INVENTARIO', 
         producto: localProduct.rows[0]
       });
     }
 
-    // --- CAPA 2: BÚSQUEDA GLOBAL (CercaMío) ---
-    const globalProduct = await pool.query('SELECT * FROM catalogo_global WHERE CAST(codigo_barras AS TEXT) = $1', [codigo]);
+    // --- CAPA 2: BÚSQUEDA GLOBAL (CercaMío DB) ---
+    // Usamos el índice de catalogo_global
+    const globalProduct = await pool.query(
+        'SELECT * FROM catalogo_global WHERE codigo_barras = $1 LIMIT 1', 
+        [codigo]
+    );
 
     if (globalProduct.rows.length > 0) {
-      console.error("☁️ ENCONTRADO EN GLOBAL");
+      // console.log("☁️ ENCONTRADO EN GLOBAL");
       return res.json({
         estado: 'EN_GLOBAL', 
         producto: globalProduct.rows[0]
@@ -4169,33 +4180,45 @@ app.get('/api/producto/scan/:codigo', async (req, res) => {
     }
 
     // --- CAPA 3: INTERNET (OpenFoodFacts) 🌐 ---
-    console.error("🌍 Buscando en OpenFoodFacts...");
+    // console.log("🌍 Buscando en OpenFoodFacts...");
     try {
         const offUrl = `https://world.openfoodfacts.org/api/v0/product/${codigo}.json`;
-        const apiRes = await axios.get(offUrl, { timeout: 3000 });
+        
+        const apiRes = await axios.get(offUrl, { 
+            timeout: 2500, // 2.5s es el límite de paciencia del usuario
+            headers: {
+                // OFF pide User-Agent para no bloquear
+                'User-Agent': 'CercaMioApp - Android - Version 1.0 - www.cercamio.app' 
+            }
+        });
 
         if (apiRes.data.status === 1) {
             const p = apiRes.data.product;
-            console.error("🎉 ENCONTRADO EN INTERNET: " + p.product_name);
+            // console.log("🎉 ENCONTRADO EN INTERNET: " + p.product_name);
             
-            // Retornamos mapeado para que la App lo use
+            // Mapeo inteligente de datos (Prioriza Español, luego Inglés)
+            const nombreOFF = p.product_name_es || p.product_name || p.generic_name || "";
+            const imagenOFF = p.image_front_url || p.image_url || null;
+            
             return res.json({
-                estado: 'EN_GLOBAL', // Reutilizamos este estado para disparar el autocompletado
+                estado: 'EN_GLOBAL', // Simulamos global para activar autocompletado en front
                 producto: {
-                    nombre_oficial: p.product_name_es || p.product_name || "",
-                    descripcion: `Agregar descripción`,
-                    //descripcion: `Marca: ${p.brands || 'S/D'}. Categoría: ${p.categories || 'General'}`,
-                    foto_url: p.image_front_url || p.image_url || null,
-                    codigo_barras: codigo
+                    nombre_oficial: nombreOFF,
+                    descripcion: p.brands ? `Marca: ${p.brands}` : "",
+                    foto_url: imagenOFF,
+                    codigo_barras: codigo,
+                    origen: 'OFF' // Flag para debugging
                 }
             });
         }
     } catch (apiError) {
-        console.error("⚠️ Error API Externa (No bloqueante):", apiError.message);
+        // Si falla OFF (timeout o error 500), no bloqueamos el flujo. 
+        // Simplemente pasamos a "NUEVO".
+        console.warn("⚠️ OFF API falló o tardó:", apiError.message);
     }
 
-    // --- CAPA 4: NUEVO (Si todo lo anterior falló) ---
-    console.error("🆕 NO EXISTE. ES NUEVO.");
+    // --- CAPA 4: NO EXISTE (CREAR NUEVO) ---
+    // console.log("🆕 PRODUCTO NUEVO");
     res.json({
       estado: 'NUEVO', 
       codigo_barras: codigo
@@ -4203,7 +4226,7 @@ app.get('/api/producto/scan/:codigo', async (req, res) => {
 
   } catch (error) {
     console.error("❌ ERROR SCAN:", error);
-    res.status(500).json({ error: 'Error interno' });
+    res.status(500).json({ error: 'Error interno en escáner' });
   }
 });
 
