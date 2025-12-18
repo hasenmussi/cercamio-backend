@@ -2928,58 +2928,94 @@ app.get('/api/pagos/callback', async (req, res) => {
 });
 
 // ==========================================
-// RUTA 37: WEBHOOK MAESTRO (VENTAS + SUSCRIPCIONES) 🤖 [CORREGIDO]
+// RUTA 37: WEBHOOK MAESTRO (VENTAS + SUSCRIPCIONES) 🤖 [AUDITADO & BLINDADO]
 // ==========================================
 app.post('/api/pagos/webhook', async (req, res) => {
   const { type, data } = req.body;
 
-  // Solo procesamos pagos
+  // Respondemos rápido a MP para que no reintente mientras procesamos
+  // (Técnica: Responder 200 al final, pero procesar asíncrono. 
+  // Node permite esto, pero cuidado con timeouts en serverless. 
+  // Mantenemos tu flujo actual de responder al final, es seguro para Render).
+
   if (type === 'payment') {
     try {
       const paymentId = data.id;
       
-      // 1. INICIALIZAR CLIENTE MP (LA LÍNEA QUE FALTABA) 🔑
-      // Usamos el token de la plataforma para consultar el pago
+      // 1. CONSULTAR ESTADO REAL A MERCADO PAGO 🔒
       const client = new MercadoPagoConfig({ accessToken: process.env.MP_ACCESS_TOKEN_PROD });
-
-      // 2. CONSULTAR ESTADO DEL PAGO
       const paymentClient = new Payment(client); 
       const paymentData = await paymentClient.get({ id: paymentId });
 
       if (paymentData.status === 'approved') {
         
-        const externalRef = paymentData.external_reference; // Ej: "SUB-..." o "CM-..."
-        console.log(`🔔 Webhook Aprobado. Ref: ${externalRef}`);
+        const externalRef = paymentData.external_reference; 
+        console.log(`🔔 Webhook Aprobado. ID: ${paymentId} | Ref: ${externalRef}`);
 
         // ====================================================
-        // CASO A: SUSCRIPCIÓN PREMIUM (NUEVO) 💎
+        // CASO A: SUSCRIPCIÓN PREMIUM (SaaS) 💎
         // ====================================================
         if (externalRef && externalRef.startsWith('SUB-')) {
             
-            // Extraemos datos de la metadata
+            // 🚨 IDEMPOTENCIA CRÍTICA: Verificar si ya procesamos este pago
+            const checkSusc = await pool.query(
+              'SELECT 1 FROM pagos_suscripciones WHERE mp_payment_id = $1', 
+              [paymentId.toString()]
+            );
+
+            if (checkSusc.rows.length > 0) {
+              console.log("⚠️ Suscripción duplicada recibida. Ignorando.");
+              return res.status(200).send("OK");
+            }
+
+            // Datos de la metadata
             const { local_id, dias_duracion } = paymentData.metadata;
             const diasAgregar = Number(dias_duracion) || 30; 
+            const monto = paymentData.transaction_amount;
 
             console.log(`💎 ACTIVANDO PLAN PREMIUM: Local ${local_id} (+${diasAgregar} días)`);
 
-            // Lógica Inteligente de Vencimiento:
-            const updateQuery = `
-              UPDATE locales 
-              SET 
-                plan_tipo = 'PREMIUM',
-                plan_vencimiento = CASE 
-                   WHEN plan_vencimiento > NOW() THEN plan_vencimiento + make_interval(days => $2)
-                   ELSE NOW() + make_interval(days => $2)
-                END
-              WHERE local_id = $1
-            `;
-            
-            await pool.query(updateQuery, [local_id, diasAgregar]);
-            console.log("✅ Suscripción activada exitosamente.");
+            const clientDb = await pool.connect();
+            try {
+                await clientDb.query('BEGIN');
+
+                // A. Actualizar Local (Sumar días)
+                const updateQuery = `
+                  UPDATE locales 
+                  SET 
+                    plan_tipo = 'PREMIUM',
+                    plan_vencimiento = CASE 
+                       WHEN plan_vencimiento > NOW() THEN plan_vencimiento + make_interval(days => $2)
+                       ELSE NOW() + make_interval(days => $2)
+                    END
+                  WHERE local_id = $1
+                `;
+                await clientDb.query(updateQuery, [local_id, diasAgregar]);
+
+                // B. Registrar Pago (Para Idempotencia y Contabilidad)
+                const insertPago = `
+                  INSERT INTO pagos_suscripciones (mp_payment_id, local_id, monto_pagado, dias_agregados)
+                  VALUES ($1, $2, $3, $4)
+                `;
+                await clientDb.query(insertPago, [paymentId.toString(), local_id, monto, diasAgregar]);
+
+                await clientDb.query('COMMIT');
+                console.log("✅ Suscripción activada y registrada.");
+
+                // C. Notificar al dueño (Opcional)
+                enviarNotificacion(paymentData.metadata.user_id_dueno, "¡Plan Activado! 🚀", "Tu suscripción Premium ya está vigente.");
+
+            } catch (errSusc) {
+                await clientDb.query('ROLLBACK');
+                console.error("❌ Error DB Suscripción:", errSusc);
+                // No retornamos 500 aquí para no bloquear la cola de MP, solo logueamos.
+            } finally {
+                clientDb.release();
+            }
         } 
 
         // ====================================================
-        // CASO B: VENTA MARKETPLACE (TU CÓDIGO ORIGINAL) 🛒
+        // CASO B: VENTA MARKETPLACE (E-COMMERCE) 🛒
         // ====================================================
         else if (externalRef && externalRef.startsWith('CM-')) {
             
@@ -2995,10 +3031,17 @@ app.post('/api/pagos/webhook', async (req, res) => {
             const meta = paymentData.metadata;
             const compradorId = meta.comprador_id;
             const vendedorId = meta.vendedor_id;
-            const itemsComprados = typeof meta.items_json === 'string' ? JSON.parse(meta.items_json) : meta.items_json;
+            // Parseo seguro de items
+            let itemsComprados = [];
+            try {
+               itemsComprados = typeof meta.items_json === 'string' ? JSON.parse(meta.items_json) : meta.items_json;
+            } catch (e) {
+               console.error("Error parseando items_json", e);
+               // Si falla el parseo, no podemos procesar el stock, pero no crasheamos.
+            }
+            
             const tipoEntrega = meta.tipo_entrega;
             const totalPagado = paymentData.transaction_amount;
-
             const compraUuid = crypto.randomUUID();
 
             console.log(`🛒 Procesando Venta para vendedor ${vendedorId}...`);
@@ -3009,7 +3052,7 @@ app.post('/api/pagos/webhook', async (req, res) => {
               await clientDb.query('BEGIN');
 
               for (const item of itemsComprados) {
-                 // A. BUSCAR DATOS REALES
+                 // A. BUSCAR DATOS REALES & BLOQUEO (FOR UPDATE)
                  const queryProducto = `
                     SELECT global_id, nombre, foto_url, tipo_item, stock 
                     FROM inventario_local 
@@ -3025,7 +3068,7 @@ app.post('/api/pagos/webhook', async (req, res) => {
                     stock: 0
                  };
 
-                 // B. DESCONTAR STOCK
+                 // B. DESCONTAR STOCK (Solo si es item físico)
                  if (datosReales.tipo_item === 'PRODUCTO_STOCK') {
                     await clientDb.query(
                       'UPDATE inventario_local SET stock = stock - $1 WHERE inventario_id = $2', 
@@ -3060,15 +3103,20 @@ app.post('/api/pagos/webhook', async (req, res) => {
 
               await clientDb.query('COMMIT');
               
-              // 5. NOTIFICAR
-              const mensaje = `¡Pago de MP acreditado! Total: $${totalPagado}. Entrega: ${tipoEntrega}`;
+              // 5. NOTIFICAR AL VENDEDOR
               if (typeof enviarNotificacion === 'function') {
-                  enviarNotificacion(vendedorId, "¡Nueva Venta Online! 💳", mensaje);
+                  enviarNotificacion(vendedorId, "¡Nueva Venta Online! 💳", `Recibiste $${totalPagado}. Entrega: ${tipoEntrega}`, { tipo: 'VENTA', uuid: compraUuid });
+              }
+              // 6. NOTIFICAR AL COMPRADOR (Confirmación)
+              if (typeof enviarNotificacion === 'function') {
+                  enviarNotificacion(compradorId, "¡Compra Exitosa! 🛍️", `Tu pedido a ${meta.nombre_local || 'el local'} fue confirmado.`);
               }
 
             } catch (dbError) {
               await clientDb.query('ROLLBACK');
               console.error("❌ Error guardando Venta en BD:", dbError);
+              // Aquí sí es grave, podríamos devolver 500 para que MP reintente si fue error de DB temporal
+              return res.status(500).send("DB Error");
             } finally {
               clientDb.release();
             }
@@ -3076,10 +3124,12 @@ app.post('/api/pagos/webhook', async (req, res) => {
       }
     } catch (error) {
       console.error("❌ Error general en Webhook:", error);
+      // Devolvemos 500 para que MP sepa que algo explotó en nuestro servidor
       return res.status(500).send("Error interno");
     }
   }
 
+  // Siempre responder OK si no es Payment o si ya procesamos
   res.status(200).send("OK");
 });
 
