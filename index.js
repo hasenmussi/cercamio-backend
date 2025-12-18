@@ -3460,30 +3460,31 @@ app.get('/api/users/me', async (req, res) => {
   }
 });
 
-// RUTA 47: ACTUALIZAR PERFIL (CON FOTO Y CAPITALIZACIÓN)
+// ==========================================
+// RUTA 47: ACTUALIZAR PERFIL DE USUARIO (OPTIMIZADA v10.1) 👤
+// ==========================================
 app.put('/api/users/update', upload.single('foto'), async (req, res) => {
   const authHeader = req.headers['authorization'];
   if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
   const token = authHeader.split(' ')[1];
 
-  // Desestructuramos para tener claridad
   const { nombre, telefono, fecha_nacimiento, direccion, barrio, ciudad, provincia, pais } = req.body;
   
-  // Foto: Si subió una nueva, usamos esa.
+  // Si Cloudinary procesó la foto, req.file.path tiene la URL nueva
   const nuevaFotoUrl = req.file ? req.file.path : null;
 
   try {
-    const usuario = jwt.verify(token, JWT_SECRET);
+    const usuario = jwt.verify(token, process.env.JWT_SECRET);
     
-    // Función auxiliar para capitalizar (si no la tienes definida afuera, la definimos aquí o úsala desde afuera)
+    // Capitalización (Lógica de negocio en Backend = Bien)
     const capitalizar = (txt) => txt ? txt.toLowerCase().split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ') : "";
     const nombreFormateado = capitalizar(nombre);
-
-    // Limpiamos la fecha (si viene vacía, enviamos null)
     const fechaFinal = fecha_nacimiento || null;
 
+    let result;
+
     if (nuevaFotoUrl) {
-      // CASO A: CON FOTO NUEVA (10 Parámetros)
+      // CASO A: CON FOTO NUEVA
       const queryConFoto = `
         UPDATE usuarios SET 
           nombre_completo = $1, 
@@ -3496,23 +3497,17 @@ app.put('/api/users/update', upload.single('foto'), async (req, res) => {
           pais = $8,
           foto_url = $9 
         WHERE usuario_id = $10
+        RETURNING nombre_completo, foto_url, telefono, direccion, barrio -- 👈 RETORNAMOS TODO LO VISIBLE
       `;
       
-      await pool.query(queryConFoto, [
-        nombreFormateado, 
-        telefono, 
-        fechaFinal, 
-        direccion, 
-        barrio, 
-        ciudad, 
-        provincia, 
-        pais, 
+      result = await pool.query(queryConFoto, [
+        nombreFormateado, telefono, fechaFinal, direccion, barrio, ciudad, provincia, pais, 
         nuevaFotoUrl, // $9
         usuario.id    // $10
       ]);
 
     } else {
-      // CASO B: SIN FOTO (9 Parámetros - No tocamos foto_url)
+      // CASO B: SIN FOTO (Mantenemos foto_url existente)
       const querySinFoto = `
         UPDATE usuarios SET 
           nombre_completo = $1, 
@@ -3524,25 +3519,23 @@ app.put('/api/users/update', upload.single('foto'), async (req, res) => {
           provincia = $7, 
           pais = $8
         WHERE usuario_id = $9
+        RETURNING nombre_completo, foto_url, telefono, direccion, barrio -- 👈 RETORNAMOS TAMBIÉN
       `;
 
-      await pool.query(querySinFoto, [
-        nombreFormateado, 
-        telefono, 
-        fechaFinal, 
-        direccion, 
-        barrio, 
-        ciudad, 
-        provincia, 
-        pais, 
+      result = await pool.query(querySinFoto, [
+        nombreFormateado, telefono, fechaFinal, direccion, barrio, ciudad, provincia, pais, 
         usuario.id    // $9
       ]);
     }
 
-    res.json({ mensaje: 'Perfil actualizado', nombre: nombreFormateado });
+    // RESPUESTA AL FRONTEND (DATA FRESCA) 🍎
+    res.json({ 
+      mensaje: 'Perfil actualizado', 
+      usuario: result.rows[0] // Ahora el frontend tiene la URL nueva y el nombre formateado
+    });
 
   } catch (error) {
-    console.error("Error ruta 61:", error);
+    console.error("Error ruta 47:", error);
     res.status(500).json({ error: 'Error al actualizar perfil' });
   }
 });
