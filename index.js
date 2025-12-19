@@ -1307,7 +1307,7 @@ app.post('/api/upload', upload.single('imagen'), async (req, res) => {
   }
 });
 
-// RUTA 13: CREAR PRODUCTO (BLINDADA 🛡️)
+// RUTA 13: CREAR PRODUCTO (CORREGIDA v10.2 📸)
 app.post('/api/mi-negocio/crear-item', async (req, res) => {
   const authHeader = req.headers['authorization'];
   if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
@@ -1315,7 +1315,7 @@ app.post('/api/mi-negocio/crear-item', async (req, res) => {
 
   const { 
     nombre, descripcion, precio, foto_url, tipo_item, stock_inicial,
-    codigo_barras // <--- ESTE DATO ES CRÍTICO
+    codigo_barras 
   } = req.body;
 
   const client = await pool.connect();
@@ -1331,15 +1331,12 @@ app.post('/api/mi-negocio/crear-item', async (req, res) => {
 
     let globalId = null;
 
-    // 2. LOGICA GLOBAL (Solo si hay código)
+    // 2. LOGICA GLOBAL
     if (codigo_barras) {
-        // Buscamos si existe en global
         const checkGlobal = await client.query('SELECT global_id FROM catalogo_global WHERE codigo_barras = $1', [codigo_barras]);
-        
         if (checkGlobal.rows.length > 0) {
-            globalId = checkGlobal.rows[0].global_id; // Vinculamos
+            globalId = checkGlobal.rows[0].global_id; 
         } else {
-            // Creamos en global para ayudar a otros
             const insertGlobal = `
               INSERT INTO catalogo_global (nombre_oficial, descripcion, foto_url, categoria, codigo_barras, creado_por_usuario_id)
               VALUES ($1, $2, $3, $4, $5, $6) RETURNING global_id
@@ -1348,22 +1345,22 @@ app.post('/api/mi-negocio/crear-item', async (req, res) => {
             globalId = resG.rows[0].global_id;
         }
     } else {
-        // Producto sin código (Manual)
         const insertGlobal = `INSERT INTO catalogo_global (nombre_oficial, descripcion, foto_url, categoria) VALUES ($1, $2, $3, $4) RETURNING global_id`;
         const resG = await client.query(insertGlobal, [nombre, descripcion, foto_url, categoria]);
         globalId = resG.rows[0].global_id;
     }
 
-    // 3. INSERTAR EN INVENTARIO LOCAL (AQUÍ ESTABA EL POSIBLE ERROR)
+    // 3. INSERTAR EN INVENTARIO LOCAL (AHORA GUARDAMOS LA FOTO TAMBIÉN)
     let stock = tipo_item === 'PRODUCTO_STOCK' ? stock_inicial : 9999;
 
     const insertLocal = `
       INSERT INTO inventario_local 
-      (local_id, global_id, precio, stock, tipo_item, codigo_barras)
-      VALUES ($1, $2, $3, $4, $5, $6) -- <--- Aseguramos que $6 se guarde
+      (local_id, global_id, precio, stock, tipo_item, codigo_barras, foto_url) 
+      VALUES ($1, $2, $3, $4, $5, $6, $7) -- <--- Agregamos $7
     `;
     
-    await client.query(insertLocal, [local_id, globalId, precio, stock, tipo_item, codigo_barras]);
+    // Pasamos foto_url al final
+    await client.query(insertLocal, [local_id, globalId, precio, stock, tipo_item, codigo_barras, foto_url]);
 
     await client.query('COMMIT');
     res.json({ mensaje: 'Producto creado correctamente' });
@@ -1371,6 +1368,7 @@ app.post('/api/mi-negocio/crear-item', async (req, res) => {
   } catch (error) {
     await client.query('ROLLBACK');
     console.error("Error creando item:", error);
+    res.status(500).json({ error: 'Error al crear producto' });
   } finally {
     client.release();
   }
