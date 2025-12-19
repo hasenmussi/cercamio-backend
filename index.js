@@ -161,6 +161,17 @@ app.use(express.json());
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL, // Lee del .env
   ssl: { require: true, rejectUnauthorized: false },
+  
+  // --- OPTIMIZACIÓN DE CONEXIONES ---
+  max: 20, // Máximo de conexiones simultáneas (Ideal para plan Launch)
+  idleTimeoutMillis: 30000, // Cerrar conexión si lleva 30s sin usarse (Ahorra recursos)
+  connectionTimeoutMillis: 10000, // Esperar hasta 10s a que la DB despierte (Antes tiraba error a los 2s)
+});
+
+// Manejador de errores del Pool (Para que no tumbe el servidor si se cae la DB)
+pool.on('error', (err, client) => {
+  console.error('❌ Error inesperado en cliente de base de datos:', err);
+  // No salimos del proceso, dejamos que intente reconectar en la próxima
 });
 
 // Test de conexión
