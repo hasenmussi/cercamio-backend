@@ -2487,10 +2487,10 @@ app.get('/api/locales/:id/historias', async (req, res) => {
 });
 
 // ==========================================
-// RUTA 31: FEED EXPLORAR (ALGORITMO HIPERLOCAL)
+// RUTA 31: FEED EXPLORAR (CORREGIDA v10.4 - Metros Reales + Avatar)
 // ==========================================
 app.get('/api/historias/feed', async (req, res) => {
-  const { lat, lng, radio = 10000 } = req.query; // 10km a la redonda
+  const { lat, lng, radio = 10000 } = req.query; 
 
   if (!lat || !lng) return res.status(400).json({ error: 'Ubicación requerida' });
 
@@ -2502,29 +2502,31 @@ app.get('/api/historias/feed', async (req, res) => {
         H.caption,
         H.tipo_media,
         H.fecha_creacion,
-        -- Datos del Local (Para el Header de la tarjeta)
+        -- Datos del Local
         L.local_id,
         L.nombre as nombre_local,
-        L.foto_url as foto_local,
+        -- 🔥 CORRECCIÓN 1: Traemos foto_perfil (Avatar) en vez de foto_url genérica
+        COALESCE(L.foto_perfil, L.foto_url) as foto_local, 
         L.rubro,
         L.plan_tipo,
-        -- Cálculo de Distancia Real (PostGIS)
+        -- 🔥 CORRECCIÓN 2: Casteo a GEOGRAPHY para obtener METROS reales
         ST_Distance(
-          L.ubicacion::geometry, 
-          ST_SetSRID(ST_MakePoint($1, $2), 4326)::geometry
+          L.ubicacion::geography, 
+          ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography
         ) as distancia_metros
       FROM historias H
       JOIN locales L ON H.local_id = L.local_id
       WHERE 
-        H.fecha_expiracion > NOW() -- Solo historias vivas
+        H.fecha_expiracion > NOW()
+        -- Filtro espacial también en geography para precisión
         AND ST_DWithin(
-          L.ubicacion::geometry, 
-          ST_SetSRID(ST_MakePoint($1, $2), 4326)::geometry, 
+          L.ubicacion::geography, 
+          ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, 
           $3
         )
       ORDER BY 
-        (CASE WHEN L.plan_tipo = 'PREMIUM' THEN 0 ELSE 1 END) ASC, -- Premium primero
-        H.fecha_creacion DESC -- Las más nuevas arriba
+        (CASE WHEN L.plan_tipo = 'PREMIUM' THEN 0 ELSE 1 END) ASC,
+        H.fecha_creacion DESC
       LIMIT 20;
     `;
 
