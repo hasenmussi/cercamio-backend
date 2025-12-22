@@ -45,30 +45,32 @@ const uploadPrivado = multer({ storage: storagePrivado });
 // 3. MERCADO PAGO (Solo importamos clases, instanciamos en las rutas)
 const { MercadoPagoConfig, Preference, Payment } = require('mercadopago');
 
-// 4. CONFIGURACIÓN DE EMAIL (NODEMAILER)
+// 4. CONFIGURACIÓN DE EMAIL (ENVIALOSIMPLE TRANSACCIONAL) 📧
 const transporter = nodemailer.createTransport({
-  host: 'smtp.envialosimple.email',
+  host: 'smtp.envialosimple.email', // Tal cual la foto
   port: 587, 
-  secure: false, 
+  secure: false, // 587 usa STARTTLS, por eso secure va en false
   auth: {
-    user: process.env.EMAIL_USER, 
-    pass: process.env.EMAIL_PASS 
+    user: process.env.EMAIL_USER, // Leerá el usuario largo 'xb69...' de Render
+    pass: process.env.EMAIL_PASS  // Leerá la password larga 'k89P...' de Render
   },
   tls: {
+    // La foto dice "Requiere TLS 1.3 o superior", forzamos eso por seguridad
+    minVersion: 'TLSv1.3',
     rejectUnauthorized: false 
   }
 });
 
-// Función auxiliar de Email (CON HTML PREMIUM) 🎨
+// Función auxiliar
 const enviarEmail = async (destinatario, asunto, texto, html) => {
   console.log(`📨 Enviando email a: ${destinatario}`);
   try {
     await transporter.sendMail({
-      from: '"Equipo CercaMío" <soporte@cercamio.app>', // Debe coincidir con el usuario auth
+      from: '"Equipo CercaMío" <soporte@cercamio.app>', // 👁️ AQUÍ SÍ VA TU EMAIL REAL COMO REMITENTE
       to: destinatario,
       subject: asunto,
-      text: texto, // Fallback para clientes viejos
-      html: html   // Diseño bonito
+      text: texto,
+      html: html
     });
     console.log('✅ Email enviado.');
     return true;
