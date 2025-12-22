@@ -719,8 +719,9 @@ app.post('/api/auth/registro', async (req, res) => {
   }
 });
 
-// RUTA 4: LOGIN (INICIAR SESIÓN)
-// RUTA 4: LOGIN (CORREGIDA - AHORA ENVÍA LA FOTO)
+// ==========================================
+// RUTA 4: LOGIN (OPTIMIZADA v10.4 - CON VERIFICACIÓN OBLIGATORIA 🔒)
+// ==========================================
 app.post('/api/auth/login', async (req, res) => {
   const { email, password } = req.body;
 
@@ -740,21 +741,31 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(400).json({ error: 'Contraseña incorrecta' });
     }
 
-    // 3. Buscar Perfil Profesional
+    // 3. 🛑 CHECKPOINT DE VERIFICACIÓN (NUEVO) 🛑
+    if (!usuario.email_verified) {
+      // Si no verificó, lo bloqueamos y le avisamos al Frontend
+      return res.status(403).json({ 
+        error: 'Tu cuenta no está verificada.',
+        code: 'EMAIL_NOT_VERIFIED', // Código clave para Flutter
+        email: usuario.email 
+      });
+    }
+
+    // 4. Buscar Perfil Profesional
     const localQuery = 'SELECT * FROM locales WHERE usuario_id = $1';
     const localRes = await pool.query(localQuery, [usuario.usuario_id]);
     
     const tienePerfilProfesional = localRes.rows.length > 0;
     const datosLocal = tienePerfilProfesional ? localRes.rows[0] : null;
 
-    // 4. Generar Token
+    // 5. Generar Token
     const token = jwt.sign(
       { id: usuario.usuario_id, tipo: usuario.tipo }, 
-      JWT_SECRET,
+      process.env.JWT_SECRET, // Asegúrate de usar process.env
       { expiresIn: '30d' }
     );
 
-    // 5. Responder (AQUÍ ESTABA EL FALTANTE)
+    // 6. Responder
     res.json({ 
       mensaje: 'Bienvenido',
       token: token,
@@ -763,7 +774,7 @@ app.post('/api/auth/login', async (req, res) => {
         nombre: usuario.nombre_completo,
         email: usuario.email,
         tipo: usuario.tipo,
-        foto_url: usuario.foto_url // <--- ¡ESTA ES LA LÍNEA MÁGICA QUE FALTABA! 📸
+        foto_url: usuario.foto_url 
       },
       perfil_profesional: tienePerfilProfesional ? {
         local_id: datosLocal.local_id,
@@ -774,8 +785,8 @@ app.post('/api/auth/login', async (req, res) => {
     });
 
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: 'Error de login' });
+    console.error("Error Login:", error);
+    res.status(500).json({ error: 'Error interno de login' });
   }
 });
 
@@ -3470,57 +3481,136 @@ app.post('/api/auth/verify-email', async (req, res) => {
 });
 
 // ==========================================
-// RUTA 44: OLVIDÉ MI CONTRASEÑA (Solicitud)
+// RUTA 44: OLVIDÉ MI CONTRASEÑA (DISEÑO SECURITY 🔑)
 // ==========================================
 app.post('/api/auth/forgot-password', async (req, res) => {
   const { email } = req.body;
   const codigo = generarCodigo();
 
   try {
+    // 1. Guardamos el código y recuperamos el nombre
     const result = await pool.query(
-      'UPDATE usuarios SET recovery_code = $1 WHERE email = $2 RETURNING usuario_id',
+      'UPDATE usuarios SET recovery_code = $1 WHERE email = $2 RETURNING nombre_completo',
       [codigo, email]
     );
 
     if (result.rowCount === 0) return res.status(404).json({ error: 'Email no registrado' });
 
-    await enviarEmail(email, 'Recuperar Contraseña - CercaMío', `Usa este código para restablecer tu clave: ${codigo}`);
+    const nombreUsuario = capitalizarNombre(result.rows[0].nombre_completo);
 
-    res.json({ mensaje: 'Si el email existe, se envió el código.' });
+    // 2. Diseño HTML (Enfoque: Seguridad y Claridad)
+    const htmlEmail = `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      </head>
+      <body style="margin: 0; padding: 0; font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; background-color: #f4f4f8;">
+        <table border="0" cellpadding="0" cellspacing="0" width="100%" style="max-width: 600px; margin: 0 auto; background-color: #ffffff; border-radius: 12px; overflow: hidden; margin-top: 20px; box-shadow: 0 4px 10px rgba(0,0,0,0.05);">
+          
+          <!-- HEADER AZUL (MARCA) -->
+          <tr>
+            <td style="background-color: #1976D2; padding: 30px; text-align: center;">
+              <h1 style="color: #ffffff; margin: 0; font-size: 24px; font-weight: bold;">CercaMío</h1>
+              <p style="color: #bbdefb; margin: 5px 0 0 0; font-size: 14px;">Recuperación de cuenta</p>
+            </td>
+          </tr>
+
+          <!-- CUERPO -->
+          <tr>
+            <td style="padding: 40px 30px;">
+              <h2 style="color: #333; margin-top: 0;">Hola, ${nombreUsuario} 🔒</h2>
+              <p style="color: #666; font-size: 16px; line-height: 1.5;">
+                Recibimos una solicitud para restablecer tu contraseña. Si fuiste tú, usa el siguiente código para crear una nueva clave.
+              </p>
+              
+              <!-- CAJA DEL CÓDIGO (GRIS OSCURO - SERIEDAD) -->
+              <div style="background-color: #263238; color: #ffffff; padding: 20px; margin: 30px 0; text-align: center; border-radius: 8px;">
+                <span style="display: block; color: #90a4ae; font-size: 11px; text-transform: uppercase; margin-bottom: 5px; letter-spacing: 2px;">CÓDIGO DE RECUPERACIÓN</span>
+                <span style="font-size: 34px; font-weight: 800; letter-spacing: 8px; color: #fff;">${codigo}</span>
+              </div>
+
+              <p style="color: #d32f2f; font-size: 13px; text-align: center; background-color: #ffebee; padding: 10px; border-radius: 4px;">
+                ⚠️ <strong>Importante:</strong> Si no solicitaste este cambio, ignora este correo. Tu cuenta sigue segura.
+              </p>
+            </td>
+          </tr>
+
+          <!-- FOOTER -->
+          <tr>
+            <td style="background-color: #fafafa; padding: 20px; text-align: center; border-top: 1px solid #eeeeee;">
+              <p style="color: #999; font-size: 12px; margin: 0;">
+                Este enlace expira en 15 minutos.<br>
+                © 2025 CercaMío Seguridad.
+              </p>
+            </td>
+          </tr>
+        </table>
+        <div style="height: 40px;"></div>
+      </body>
+      </html>
+    `;
+
+    // 3. Enviar email
+    await enviarEmail(
+      email, 
+      '🔑 Restablecer contraseña - CercaMío', 
+      `Tu código de recuperación es: ${codigo}`, 
+      htmlEmail
+    );
+
+    res.json({ mensaje: 'Código enviado a tu correo.' });
+
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: 'Error del servidor' });
+    console.error("❌ Error forgot-password:", error);
+    res.status(500).json({ error: 'Error del servidor al procesar la solicitud.' });
   }
 });
 
 // ==========================================
-// RUTA 45: RESTABLECER CONTRASEÑA (Nuevo Password)
+// RUTA 45: RESTABLECER CONTRASEÑA (SECURITY CHECK ✅)
 // ==========================================
 app.post('/api/auth/reset-password', async (req, res) => {
   const { email, codigo, nuevaPassword } = req.body;
 
+  // Validación básica
+  if (!email || !codigo || !nuevaPassword) {
+    return res.status(400).json({ error: 'Faltan datos requeridos.' });
+  }
+
   try {
-    // 1. Validar código
+    // 1. Validar código en DB
     const user = await pool.query('SELECT recovery_code FROM usuarios WHERE email = $1', [email]);
-    if (user.rows.length === 0 || user.rows[0].recovery_code !== codigo) {
-      return res.status(400).json({ error: 'Código inválido o expirado' });
+    
+    if (user.rows.length === 0) return res.status(404).json({ error: 'Usuario no encontrado' });
+    
+    // Comparación estricta
+    const codigoReal = user.rows[0].recovery_code ? user.rows[0].recovery_code.toString() : '';
+    const codigoInput = codigo.toString().trim();
+
+    if (codigoReal !== codigoInput) {
+      return res.status(400).json({ error: 'El código es incorrecto o ha expirado.' });
     }
 
-    // 2. Hashear nueva contraseña (IMPORTANTE: Asegúrate de tener bcrypt importado)
-    const bcrypt = require('bcryptjs'); // O 'bcrypt', según lo que uses arriba
+    // 2. Hashear la nueva contraseña (Seguridad)
+    // Usamos bcryptjs (asegúrate de que esté importado arriba: const bcrypt = require('bcryptjs');)
     const salt = await bcrypt.genSalt(10);
     const hash = await bcrypt.hash(nuevaPassword, salt);
 
-    // 3. Actualizar y borrar código
+    // 3. Actualizar contraseña y destruir el código usado (One-Time Use)
     await pool.query(
       'UPDATE usuarios SET password_hash = $1, recovery_code = NULL WHERE email = $2',
       [hash, email]
     );
 
-    res.json({ mensaje: 'Contraseña actualizada. Ya puedes iniciar sesión.' });
+    // Opcional: Podrías enviar un email de "Tu contraseña ha sido cambiada" aquí.
+    
+    res.json({ mensaje: '¡Contraseña actualizada con éxito! Ya puedes iniciar sesión.' });
+
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: 'Error al cambiar contraseña' });
+    console.error("❌ Error reset-password:", error);
+    res.status(500).json({ error: 'Error interno al cambiar la contraseña.' });
   }
 });
 
