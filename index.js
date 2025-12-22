@@ -47,7 +47,7 @@ const { MercadoPagoConfig, Preference, Payment } = require('mercadopago');
 
 // 4. CONFIGURACIÓN DE EMAIL (NODEMAILER)
 const transporter = nodemailer.createTransport({
-  host: 'smtp.gmail.com',
+  host: 'smtp.envialosimple.email',
   port: 587, 
   secure: false, 
   auth: {
@@ -59,19 +59,22 @@ const transporter = nodemailer.createTransport({
   }
 });
 
-// Función auxiliar de Email
-const enviarEmail = async (destinatario, asunto, texto) => {
+// Función auxiliar de Email (CON HTML PREMIUM) 🎨
+const enviarEmail = async (destinatario, asunto, texto, html) => {
   console.log(`📨 Enviando email a: ${destinatario}`);
   try {
     await transporter.sendMail({
-      from: '"Soporte CercaMío" <soporte@cercamio.app>',
+      from: '"Equipo CercaMío" <soporte@cercamio.app>', // Debe coincidir con el usuario auth
       to: destinatario,
       subject: asunto,
-      text: texto,
+      text: texto, // Fallback para clientes viejos
+      html: html   // Diseño bonito
     });
     console.log('✅ Email enviado.');
+    return true;
   } catch (error) {
     console.error("⚠️ Falló envío de email:", error.message);
+    return false;
   }
 };
 
@@ -3337,28 +3340,92 @@ app.get('/api/mi-negocio/mis-preguntas', async (req, res) => {
 });
 
 // ==========================================
-// RUTA 42: SOLICITAR VERIFICACIÓN DE EMAIL
+// RUTA 42: SOLICITAR VERIFICACIÓN DE EMAIL (CON HTML PREMIUM 🎨)
 // ==========================================
 app.post('/api/auth/send-verification', async (req, res) => {
   const { email } = req.body;
-  const codigo = generarCodigo();
+  const codigo = generarCodigo(); // Usa tu función helper existente
 
   try {
-    // Guardamos el código en la BD
+    // 1. Guardamos el código y recuperamos el nombre para personalizar el mail
     const result = await pool.query(
-      'UPDATE usuarios SET verification_code = $1 WHERE email = $2 RETURNING usuario_id',
+      'UPDATE usuarios SET verification_code = $1 WHERE email = $2 RETURNING nombre_completo',
       [codigo, email]
     );
 
     if (result.rowCount === 0) return res.status(404).json({ error: 'Usuario no encontrado' });
 
-    // Enviamos el email
-    await enviarEmail(email, 'Verifica tu cuenta CercaMío', `Tu código de verificación es: ${codigo}`);
+    const nombreUsuario = capitalizarNombre(result.rows[0].nombre_completo);
 
-    res.json({ mensaje: 'Código enviado' });
+    // 2. Diseño del Email (Responsive & Branding)
+    // Usamos tablas HTML antiguas porque es lo único que soportan todos los clientes de correo
+    const htmlEmail = `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      </head>
+      <body style="margin: 0; padding: 0; font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; background-color: #f4f4f8;">
+        <table border="0" cellpadding="0" cellspacing="0" width="100%" style="max-width: 600px; margin: 0 auto; background-color: #ffffff; border-radius: 12px; overflow: hidden; margin-top: 20px; box-shadow: 0 4px 10px rgba(0,0,0,0.05);">
+          
+          <!-- HEADER AZUL (CONFIANZA) -->
+          <tr>
+            <td style="background-color: #2196F3; padding: 30px; text-align: center;">
+              <h1 style="color: #ffffff; margin: 0; font-size: 24px; font-weight: bold; letter-spacing: 1px;">CercaMío</h1>
+              <p style="color: #e3f2fd; margin: 5px 0 0 0; font-size: 14px;">Tu barrio, conectado.</p>
+            </td>
+          </tr>
+
+          <!-- CUERPO DEL MENSAJE -->
+          <tr>
+            <td style="padding: 40px 30px;">
+              <h2 style="color: #333333; margin-top: 0;">¡Hola, ${nombreUsuario}! 👋</h2>
+              <p style="color: #666666; font-size: 16px; line-height: 1.5;">
+                Estás a un paso de activar tu cuenta. Usa el siguiente código para verificar tu identidad y asegurar tus compras.
+              </p>
+              
+              <!-- CAJA DEL CÓDIGO (NARANJA - ACCIÓN) -->
+              <div style="background-color: #fff3e0; border-left: 4px solid #FF9800; padding: 20px; margin: 30px 0; text-align: center; border-radius: 4px;">
+                <span style="display: block; color: #ef6c00; font-size: 12px; font-weight: bold; text-transform: uppercase; margin-bottom: 5px;">Tu código de seguridad</span>
+                <span style="font-size: 32px; font-weight: 800; letter-spacing: 8px; color: #333;">${codigo}</span>
+              </div>
+
+              <p style="color: #999999; font-size: 14px; text-align: center;">
+                Este código expira en 15 minutos.<br>Si no lo solicitaste, simplemente ignora este correo.
+              </p>
+            </td>
+          </tr>
+
+          <!-- FOOTER -->
+          <tr>
+            <td style="background-color: #f9f9f9; padding: 20px; text-align: center; border-top: 1px solid #eeeeee;">
+              <p style="color: #aaaaaa; font-size: 12px; margin: 0;">
+                © 2025 CercaMío App. Comodoro Rivadavia.<br>
+                ¿Necesitas ayuda? Responde a este correo.
+              </p>
+            </td>
+          </tr>
+        </table>
+        <div style="height: 40px;"></div>
+      </body>
+      </html>
+    `;
+
+    // 3. Enviar usando tu función auxiliar (ahora soporta HTML)
+    // Parametros: destinatario, asunto, texto_plano (fallback), html
+    await enviarEmail(
+      email, 
+      '🔐 Tu código de verificación CercaMío', 
+      `Hola ${nombreUsuario}, tu código es: ${codigo}`, 
+      htmlEmail
+    );
+
+    res.json({ mensaje: 'Código enviado correctamente' });
+
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: 'Error al procesar' });
+    console.error("❌ Error enviando email:", error);
+    res.status(500).json({ error: 'Error al enviar el código. Intenta de nuevo.' });
   }
 });
 
@@ -3368,25 +3435,35 @@ app.post('/api/auth/send-verification', async (req, res) => {
 app.post('/api/auth/verify-email', async (req, res) => {
   const { email, codigo } = req.body;
 
+  // Validación básica
+  if (!email || !codigo) return res.status(400).json({ error: 'Faltan datos' });
+
   try {
+    // 1. Buscamos el código
     const user = await pool.query('SELECT verification_code FROM usuarios WHERE email = $1', [email]);
     
     if (user.rows.length === 0) return res.status(404).json({ error: 'Usuario no encontrado' });
     
-    if (user.rows[0].verification_code !== codigo) {
+    // 2. Comparamos (Trim para evitar errores de espacios vacíos)
+    // Convertimos a string por seguridad
+    const codigoReal = user.rows[0].verification_code ? user.rows[0].verification_code.toString() : '';
+    const codigoInput = codigo.toString().trim();
+
+    if (codigoReal !== codigoInput) {
       return res.status(400).json({ error: 'Código incorrecto' });
     }
 
-    // Código correcto: Marcamos verificado y borramos el código
+    // 3. Código correcto: Verificamos y limpiamos
     await pool.query(
       'UPDATE usuarios SET email_verified = TRUE, verification_code = NULL WHERE email = $1',
       [email]
     );
 
-    res.json({ mensaje: '¡Cuenta verificada exitosamente!' });
+    res.json({ mensaje: '¡Cuenta verificada exitosamente! Bienvenido al barrio.' });
+
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: 'Error al verificar' });
+    console.error("❌ Error verificando:", error);
+    res.status(500).json({ error: 'Error interno al verificar' });
   }
 });
 
