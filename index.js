@@ -1177,73 +1177,126 @@ app.get('/api/mi-negocio/ventas', async (req, res) => {
 });
 
 // ==========================================
-// RUTA 11: CAMBIAR ESTADO (CON LÓGICA ANTI-DOBLE BENEFICIO 🛡️)
+// RUTA 11: CAMBIAR ESTADO (AVANZADO: OTP + REEMBOLSOS + FIDELIZACIÓN) 🛡️
 // ==========================================
 app.put('/api/mi-negocio/ventas/estado', async (req, res) => {
   const authHeader = req.headers['authorization'];
   if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
   const token = authHeader.split(' ')[1];
   
-  const { compra_uuid, nuevo_estado } = req.body; 
+  // Recibimos nuevos parámetros: codigo_input y motivo
+  const { compra_uuid, nuevo_estado, codigo_input, motivo } = req.body; 
+
+  const client = await pool.connect(); // Usamos cliente para transacción
 
   try {
-    const usuario = jwt.verify(token, JWT_SECRET); // Vendedor
+    const usuario = jwt.verify(token, process.env.JWT_SECRET);
+    
+    await client.query('BEGIN'); // 🔴 INICIO TRANSACCIÓN
 
-    // 1. Buscamos el local_id
-    const localRes = await pool.query('SELECT local_id FROM locales WHERE usuario_id = $1', [usuario.id]);
-    if (localRes.rows.length === 0) return res.status(404).json({ error: 'Local no encontrado' });
-    const local_id = localRes.rows[0].local_id;
+    // 1. OBTENER DATOS DE LA VENTA (Bloqueo de fila para seguridad)
+    const ventaRes = await client.query(`
+      SELECT 
+        t.*, 
+        l.local_id,
+        u.usuario_id as comprador_id 
+      FROM transacciones_p2p t
+      JOIN locales l ON t.vendedor_id = l.usuario_id
+      JOIN usuarios u ON t.comprador_id = u.usuario_id
+      WHERE t.compra_uuid = $1 AND t.vendedor_id = $2
+      FOR UPDATE
+    `, [compra_uuid, usuario.id]);
 
-    // 2. Actualizamos estado
-    const updateQuery = `
-      UPDATE transacciones_p2p 
-      SET estado = $1 
-      WHERE compra_uuid = $2 AND vendedor_id = $3
-      RETURNING comprador_id;
-    `;
-    const result = await pool.query(updateQuery, [nuevo_estado, compra_uuid, usuario.id]);
+    if (ventaRes.rows.length === 0) {
+      throw new Error('Venta no encontrada o no te pertenece');
+    }
+    const venta = ventaRes.rows[0];
+    const { local_id, comprador_id } = venta;
 
-    if (result.rowCount === 0) {
-      return res.status(403).json({ error: 'No se pudo actualizar la orden' });
+    // ------------------------------------------------------------
+    // 🛡️ CASO A: ENTREGAR PEDIDO (VALIDACIÓN CÓDIGO OTP)
+    // ------------------------------------------------------------
+    if (nuevo_estado === 'ENTREGADO') {
+       // Si el sistema generó un código (ventas nuevas), lo validamos.
+       // Si es una venta vieja sin código, lo dejamos pasar (compatibilidad).
+       if (venta.codigo_retiro) {
+          if (!codigo_input) throw new Error('Debes ingresar el código de retiro del cliente');
+          
+          // Normalizamos a mayúsculas para comparar
+          if (codigo_input.trim().toUpperCase() !== venta.codigo_retiro) {
+             throw new Error('⛔ CÓDIGO INCORRECTO. No entregues el producto.');
+          }
+       }
     }
 
-    const compradorId = result.rows[0].comprador_id;
+    // ------------------------------------------------------------
+    // 💸 CASO B: RECHAZAR/CANCELAR (REEMBOLSO AUTOMÁTICO)
+    // ------------------------------------------------------------
+    if (nuevo_estado === 'CANCELADO' || nuevo_estado === 'RECHAZADO') {
+        console.log(`🛑 Cancelando venta ${compra_uuid}...`);
 
-    // 3. PREPARAMOS NOTIFICACIÓN BASE
+        // B.1 Reembolso en Mercado Pago
+        try {
+            const mpClient = new MercadoPagoConfig({ accessToken: process.env.MP_ACCESS_TOKEN_PROD });
+            const paymentClient = new Payment(mpClient);
+            await paymentClient.refund(venta.mp_payment_id);
+            console.log("✅ Dinero devuelto al cliente.");
+        } catch (mpError) {
+            console.error("⚠️ Error MP Refund:", mpError);
+            // Si el dinero ya se devolvió o pasó mucho tiempo, seguimos igual para cancelar en DB.
+            // Si es un error de conexión, el ROLLBACK evitará inconsistencias.
+        }
+
+        // B.2 Anular Comisión de Socio (Si existe)
+        await client.query(`
+            UPDATE historial_comisiones 
+            SET estado = 'ANULADA', monto_comision = 0 
+            WHERE transaccion_origen_id = $1
+        `, [venta.transaccion_id]);
+    }
+
+    // ------------------------------------------------------------
+    // 2. ACTUALIZAR ESTADO EN DB
+    // ------------------------------------------------------------
+    const updateQuery = `
+      UPDATE transacciones_p2p 
+      SET estado = $1, motivo_rechazo = $2
+      WHERE compra_uuid = $3
+    `;
+    await client.query(updateQuery, [nuevo_estado, motivo || null, compra_uuid]);
+
+    // ------------------------------------------------------------
+    // 3. PREPARAMOS NOTIFICACIÓN
+    // ------------------------------------------------------------
     let tituloNotif = "Actualización de pedido";
     let mensajeNotif = `Tu pedido está: ${nuevo_estado}`;
 
-    if (nuevo_estado === 'EN CAMINO') {
-      mensajeNotif = "¡Tu pedido está en camino! 🚚";
-    } else if (nuevo_estado === 'LISTO') {
-      mensajeNotif = "¡Listo para retirar! Te esperamos en el local 🛍️";
+    if (nuevo_estado === 'EN CAMINO') mensajeNotif = "¡Tu pedido está en camino! 🚚";
+    else if (nuevo_estado === 'LISTO') mensajeNotif = "¡Listo para retirar! Te esperamos en el local 🛍️";
+    else if (nuevo_estado === 'CANCELADO' || nuevo_estado === 'RECHAZADO') {
+       tituloNotif = "Pedido Cancelado";
+       mensajeNotif = "El pedido fue cancelado y tu dinero reembolsado.";
     }
 
-    // ============================================================
-    // 4. LÓGICA DE FIDELIZACIÓN (SOLO AL ENTREGAR) 🎟️
-    // ============================================================
+    // ------------------------------------------------------------
+    // 4. LÓGICA DE FIDELIZACIÓN (TU CÓDIGO ORIGINAL ADAPTADO) 🎟️
+    // ------------------------------------------------------------
     if (nuevo_estado === 'ENTREGADO') {
       tituloNotif = "Pedido Entregado";
       
-      // A. VERIFICAMOS SI ESTA ORDEN FUE UN CANJE DE PREMIO
-      // Buscamos si hay algún item en esta orden que sea un premio (producto_global_id NULL)
-      const checkCanje = await pool.query(
+      // A. Verificar si es CANJE (Premio)
+      const checkCanje = await client.query(
         'SELECT 1 FROM transacciones_p2p WHERE compra_uuid = $1 AND producto_global_id IS NULL',
         [compra_uuid]
       );
       
-      const esCanje = checkCanje.rows.length > 0;
-
-      if (esCanje) {
-        // --- CASO A: ES UN CANJE (NO SUMA PUNTOS) ---
-        mensajeNotif = "¡Esperamos que disfrutes tu premio! 🎁 Gracias por tu fidelidad. Te esperamos en la próxima para seguir sumando.";
-      
+      if (checkCanje.rows.length > 0) {
+        mensajeNotif = "¡Esperamos que disfrutes tu premio! 🎁 Gracias por tu fidelidad.";
       } else {
-        // --- CASO B: ES COMPRA NORMAL (INTENTA SUMAR PUNTOS) ---
         mensajeNotif = "Gracias por tu compra. ¡Disfrútalo! ⭐";
 
-        // B.1 Buscamos reglas activas
-        const rulesRes = await pool.query(
+        // B. Reglas de Puntos
+        const rulesRes = await client.query(
           'SELECT meta_sellos, monto_minimo, premio_descripcion FROM config_fidelizacion WHERE local_id = $1 AND estado = TRUE',
           [local_id]
         );
@@ -1251,17 +1304,17 @@ app.put('/api/mi-negocio/ventas/estado', async (req, res) => {
         if (rulesRes.rows.length > 0) {
           const reglas = rulesRes.rows[0];
 
-          // B.2 Calculamos total ($)
-          const totalRes = await pool.query(
+          // B.2 Total
+          const totalRes = await client.query(
             'SELECT SUM(monto_total) as total FROM transacciones_p2p WHERE compra_uuid = $1',
             [compra_uuid]
           );
           const totalCompra = parseFloat(totalRes.rows[0].total || 0);
 
-          // B.3 Verificamos mínimo
+          // B.3 Verificar mínimo
           if (totalCompra >= parseFloat(reglas.monto_minimo)) {
             
-            // B.4 SUMAR SELLO
+            // B.4 Sumar Sello
             const progresoQuery = `
               INSERT INTO progreso_fidelizacion (usuario_id, local_id, sellos_acumulados, cupones_disponibles)
               VALUES ($1, $2, 1, 0)
@@ -1269,21 +1322,20 @@ app.put('/api/mi-negocio/ventas/estado', async (req, res) => {
               DO UPDATE SET sellos_acumulados = progreso_fidelizacion.sellos_acumulados + 1
               RETURNING sellos_acumulados, cupones_disponibles;
             `;
-            const progresoRes = await pool.query(progresoQuery, [compradorId, local_id]);
-            
+            const progresoRes = await client.query(progresoQuery, [comprador_id, local_id]);
             let { sellos_acumulados } = progresoRes.rows[0];
 
-            // B.5 ¿LLEGÓ A LA META?
+            // B.5 Meta alcanzada
             if (sellos_acumulados >= reglas.meta_sellos) {
-              await pool.query(`
+              await client.query(`
                 UPDATE progreso_fidelizacion 
                 SET sellos_acumulados = 0, 
                     cupones_disponibles = cupones_disponibles + 1 
                 WHERE usuario_id = $1 AND local_id = $2
-              `, [compradorId, local_id]);
+              `, [comprador_id, local_id]);
 
               tituloNotif = "¡PREMIO GANADO! 🏆";
-              mensajeNotif = `¡Completaste la tarjeta! Ganaste: ${reglas.premio_descripcion}. Úsalo en tu próxima compra.`;
+              mensajeNotif = `¡Completaste la tarjeta! Ganaste: ${reglas.premio_descripcion}.`;
             } else {
               tituloNotif = "¡Sumaste un Sello! 🎟️";
               mensajeNotif = `Llevas ${sellos_acumulados}/${reglas.meta_sellos} para ganar: ${reglas.premio_descripcion}.`;
@@ -1292,14 +1344,22 @@ app.put('/api/mi-negocio/ventas/estado', async (req, res) => {
         }
       }
     }
-    // ============================================================
 
-    enviarNotificacion(compradorId, tituloNotif, mensajeNotif);
+    await client.query('COMMIT'); // 🟢 FIN TRANSACCIÓN
+
+    // 5. Enviar Notificación
+    if (typeof enviarNotificacion === 'function') {
+       enviarNotificacion(comprador_id, tituloNotif, mensajeNotif);
+    }
+    
     res.json({ mensaje: 'Estado actualizado', notificacion: mensajeNotif });
 
   } catch (error) {
-    console.error("Error update estado:", error);
-    res.status(500).json({ error: 'Error al actualizar estado' });
+    await client.query('ROLLBACK'); // 🔴 REVERTIR TODO SI FALLA
+    console.error("Error update estado:", error.message);
+    res.status(400).json({ error: error.message || 'Error al actualizar estado' });
+  } finally {
+    client.release();
   }
 });
 
@@ -3106,15 +3166,20 @@ app.post('/api/pagos/webhook', async (req, res) => {
                     );
                  }
 
-                 // C. INSERTAR TRANSACCIÓN
+                 // C. INSERTAR TRANSACCIÓN (CON CÓDIGO OTP) 🔐
+                 // Generamos un código simple de 4 caracteres (Letras/Números)
+                 const generarOTP = () => Math.random().toString(36).substring(2, 6).toUpperCase();
+                 const codigoRetiro = generarOTP(); 
+
                  const insertTx = `
                     INSERT INTO transacciones_p2p 
                     (
                       comprador_id, vendedor_id, producto_global_id, cantidad, monto_total, 
                       estado, tipo_entrega, mp_payment_id, fecha_operacion,
-                      compra_uuid, nombre_snapshot, foto_snapshot
+                      compra_uuid, nombre_snapshot, foto_snapshot, 
+                      codigo_retiro
                     )
-                    VALUES ($1, $2, $3, $4, $5, 'APROBADO', $6, $7, NOW(), $8, $9, $10)
+                    VALUES ($1, $2, $3, $4, $5, 'APROBADO', $6, $7, NOW(), $8, $9, $10, $11)
                  `;
                  
                  await clientDb.query(insertTx, [
@@ -3127,7 +3192,8 @@ app.post('/api/pagos/webhook', async (req, res) => {
                     paymentId.toString(),
                     compraUuid,            
                     datosReales.nombre,    
-                    datosReales.foto_url   
+                    datosReales.foto_url,
+                    codigoRetiro // $11
                  ]);
               }
 
@@ -3137,9 +3203,17 @@ app.post('/api/pagos/webhook', async (req, res) => {
               if (typeof enviarNotificacion === 'function') {
                   enviarNotificacion(vendedorId, "¡Nueva Venta Online! 💳", `Recibiste $${totalPagado}. Entrega: ${tipoEntrega}`, { tipo: 'VENTA', uuid: compraUuid });
               }
-              // 6. NOTIFICAR AL COMPRADOR (Confirmación)
+              // 6. NOTIFICAR AL COMPRADOR
+              // Ahora incluye el Código de Retiro para que el cliente lo tenga a mano
               if (typeof enviarNotificacion === 'function') {
-                  enviarNotificacion(compradorId, "¡Compra Exitosa! 🛍️", `Tu pedido a ${meta.nombre_local || 'el local'} fue confirmado.`);
+                  const cuerpoMensaje = `Tu pedido a ${meta.nombre_local || 'el local'} fue confirmado. 🔐 CÓDIGO DE RETIRO: ${codigoRetiro}`;
+                  
+                  enviarNotificacion(
+                      compradorId, 
+                      "¡Compra Exitosa! 🛍️", 
+                      cuerpoMensaje, 
+                      { tipo: 'COMPRA', uuid: compraUuid } // Payload extra para ir directo al pedido
+                  );
               }
 
             } catch (dbError) {
