@@ -790,16 +790,15 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
-// RUTA 8: MIS COMPRAS (HISTORIAL)
+// RUTA 8: MIS COMPRAS (HISTORIAL COMPLETO CON OTP)
 app.get('/api/transaccion/mis-compras', async (req, res) => {
   const authHeader = req.headers['authorization'];
   if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
   const token = authHeader.split(' ')[1];
 
   try {
-    const usuario = jwt.verify(token, JWT_SECRET);
+    const usuario = jwt.verify(token, process.env.JWT_SECRET); // Asegúrate de usar process.env.JWT_SECRET
 
-    // Traemos: Qué compró, A quién, Cuánto pagó, Cuándo y el Estado.
     const consulta = `
       SELECT 
         T.transaccion_id,
@@ -809,16 +808,21 @@ app.get('/api/transaccion/mis-compras', async (req, res) => {
         T.monto_total,
         T.tipo_entrega,
         T.aviso_llegada,
+        
+        -- 🔥 DATOS NUEVOS PARA V11.0
+        T.codigo_retiro,   -- Para mostrar el OTP al cliente
+        T.motivo_rechazo,  -- Para explicar por qué se canceló
+        
         C.nombre_oficial as producto,
         C.foto_url,
         L.nombre as tienda,
         L.whatsapp,
-        L.local_id, -- Necesario para ir al perfil
+        L.local_id, 
         CASE WHEN CAL.transaccion_id IS NOT NULL THEN true ELSE false END as ya_califico
       FROM transacciones_p2p T
       JOIN locales L ON T.vendedor_id = L.usuario_id
       JOIN catalogo_global C ON T.producto_global_id = C.global_id
-      LEFT JOIN calificaciones CAL ON T.transaccion_id = CAL.transaccion_id -- <--- EL TRUCO
+      LEFT JOIN calificaciones CAL ON T.transaccion_id = CAL.transaccion_id 
       WHERE T.comprador_id = $1
       ORDER BY T.fecha_operacion DESC
     `;
