@@ -1128,7 +1128,7 @@ app.post('/api/auth/convertir-vendedor', async (req, res) => {
 });
 
 // ==========================================
-// RUTA 10: VER VENTAS ENTRANTES (CON AVISO DE LLEGADA 🚗)
+// RUTA 10: VER VENTAS (CON FECHA ISO Y DATA PARA PARCIALES) 📅
 // ==========================================
 app.get('/api/mi-negocio/ventas', async (req, res) => {
   const authHeader = req.headers['authorization'];
@@ -1136,30 +1136,30 @@ app.get('/api/mi-negocio/ventas', async (req, res) => {
   const token = authHeader.split(' ')[1];
 
   try {
-    const usuario = jwt.verify(token, JWT_SECRET);
+    const usuario = jwt.verify(token, process.env.JWT_SECRET);
 
     const consulta = `
       SELECT 
         T.compra_uuid,
-        MAX(T.fecha_operacion) as fecha,
+        -- 🔥 CORRECCIÓN FECHA: Convertimos a String ISO exacto para evitar crasheos en Flutter
+        TO_CHAR(MAX(T.fecha_operacion), 'YYYY-MM-DD"T"HH24:MI:SS"Z"') as fecha,
+        
         MAX(T.estado) as estado_global,
         MAX(T.tipo_entrega) as tipo_entrega,
-        
-        -- NUEVO: Detecta si el cliente avisó que está viniendo
-        -- Si al menos un ítem de la orden tiene el aviso, devuelve true
         BOOL_OR(T.aviso_llegada) as aviso_llegada,
-
         SUM(T.monto_total) as total_orden,
         SUM(T.cantidad) as total_items,
         U.nombre_completo as comprador,
         U.usuario_id as comprador_id,
         
+        -- Agregamos datos vitales para el Rechazo Parcial dentro del JSON
         json_agg(json_build_object(
             'nombre', COALESCE(T.nombre_snapshot, C.nombre_oficial, 'Producto Manual'),
             'cantidad', T.cantidad,
             'foto', COALESCE(T.foto_snapshot, C.foto_url),
-            'transaccion_id', T.transaccion_id,
-            'precio_unitario', (T.monto_total / NULLIF(T.cantidad, 0)) 
+            'transaccion_id', T.transaccion_id, -- <--- ESTO ES VITAL PARA RECHAZO PARCIAL
+            'monto_total', T.monto_total,       -- <--- Necesario para saber cuánto reembolsar
+            'estado', T.estado                  -- <--- Para saber si este ítem específico ya fue cancelado
         )) as productos
 
       FROM transacciones_p2p T
@@ -1181,24 +1181,77 @@ app.get('/api/mi-negocio/ventas', async (req, res) => {
 });
 
 // ==========================================
-// RUTA 11: CAMBIAR ESTADO (AVANZADO: OTP + REEMBOLSOS + FIDELIZACIÓN) 🛡️
+// RUTA 11: CAMBIAR ESTADO (MASTER: PARCIAL + TOTAL + FIDELIZACIÓN) 🛡️
 // ==========================================
 app.put('/api/mi-negocio/ventas/estado', async (req, res) => {
   const authHeader = req.headers['authorization'];
   if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
   const token = authHeader.split(' ')[1];
   
-  // Recibimos nuevos parámetros: codigo_input y motivo
-  const { compra_uuid, nuevo_estado, codigo_input, motivo } = req.body; 
+  // Recibimos parámetros:
+  // - transaccion_id: Si es para rechazar UN producto específico.
+  // - compra_uuid: Si es para gestionar TODA la orden.
+  const { compra_uuid, transaccion_id, nuevo_estado, codigo_input, motivo } = req.body; 
 
-  const client = await pool.connect(); // Usamos cliente para transacción
+  const client = await pool.connect(); 
 
   try {
     const usuario = jwt.verify(token, process.env.JWT_SECRET);
     
     await client.query('BEGIN'); // 🔴 INICIO TRANSACCIÓN
 
-    // 1. OBTENER DATOS DE LA VENTA (Bloqueo de fila para seguridad)
+    // ==================================================================================
+    // ✂️ CASO 1: RECHAZO PARCIAL (Un solo producto) - NUEVA LÓGICA
+    // ==================================================================================
+    if (transaccion_id && (nuevo_estado === 'CANCELADO' || nuevo_estado === 'RECHAZADO')) {
+        
+        // A. Buscar el item específico y verificar que pertenece al vendedor
+        const itemRes = await client.query(`
+            SELECT t.*, u.fcm_token as token_comprador
+            FROM transacciones_p2p t
+            JOIN usuarios u ON t.comprador_id = u.usuario_id
+            WHERE t.transaccion_id = $1 AND t.vendedor_id = $2
+            FOR UPDATE
+        `, [transaccion_id, usuario.id]);
+
+        if (itemRes.rows.length === 0) throw new Error('Producto no encontrado o no tienes permiso');
+        const item = itemRes.rows[0];
+
+        // B. Reembolso Parcial en Mercado Pago
+        if (item.mp_payment_id) {
+            try {
+                console.log(`💸 Reembolsando parcialmente $${item.monto_total}...`);
+                const mpClient = new MercadoPagoConfig({ accessToken: process.env.MP_ACCESS_TOKEN_PROD });
+                const paymentClient = new Payment(mpClient);
+                
+                // Refund parcial por el monto exacto del item
+                await paymentClient.refund(item.mp_payment_id, { amount: parseFloat(item.monto_total) });
+                console.log("✅ Reembolso parcial exitoso.");
+            } catch (mpError) {
+                console.error("⚠️ Error MP Partial Refund:", mpError);
+                throw new Error("No se pudo procesar el reembolso en Mercado Pago.");
+            }
+        }
+
+        // C. Actualizar DB (Solo esa fila)
+        await client.query(
+            'UPDATE transacciones_p2p SET estado = $1, motivo_rechazo = $2 WHERE transaccion_id = $3',
+            [nuevo_estado, motivo || 'Sin Stock', transaccion_id]
+        );
+
+        // D. Notificar (Mensaje específico)
+        const msgParcial = `El producto "${item.nombre_snapshot || 'Item'}" fue cancelado por falta de stock. Te hemos reembolsado $${item.monto_total}.`;
+        enviarNotificacion(item.comprador_id, "Reembolso Parcial 💰", msgParcial);
+
+        await client.query('COMMIT');
+        return res.json({ mensaje: 'Producto cancelado y reembolsado correctamente' });
+    }
+
+    // ==================================================================================
+    // 📦 CASO 2: GESTIÓN TOTAL DE LA ORDEN (TU LÓGICA ORIGINAL)
+    // ==================================================================================
+
+    // 1. OBTENER DATOS DE LA VENTA (Bloqueo de fila)
     const ventaRes = await client.query(`
       SELECT 
         t.*, 
@@ -1214,19 +1267,15 @@ app.put('/api/mi-negocio/ventas/estado', async (req, res) => {
     if (ventaRes.rows.length === 0) {
       throw new Error('Venta no encontrada o no te pertenece');
     }
-    const venta = ventaRes.rows[0];
+    const venta = ventaRes.rows[0]; // Usamos la primera fila como referencia del grupo
     const { local_id, comprador_id } = venta;
 
     // ------------------------------------------------------------
     // 🛡️ CASO A: ENTREGAR PEDIDO (VALIDACIÓN CÓDIGO OTP)
     // ------------------------------------------------------------
     if (nuevo_estado === 'ENTREGADO') {
-       // Si el sistema generó un código (ventas nuevas), lo validamos.
-       // Si es una venta vieja sin código, lo dejamos pasar (compatibilidad).
        if (venta.codigo_retiro) {
           if (!codigo_input) throw new Error('Debes ingresar el código de retiro del cliente');
-          
-          // Normalizamos a mayúsculas para comparar
           if (codigo_input.trim().toUpperCase() !== venta.codigo_retiro) {
              throw new Error('⛔ CÓDIGO INCORRECTO. No entregues el producto.');
           }
@@ -1234,24 +1283,24 @@ app.put('/api/mi-negocio/ventas/estado', async (req, res) => {
     }
 
     // ------------------------------------------------------------
-    // 💸 CASO B: RECHAZAR/CANCELAR (REEMBOLSO AUTOMÁTICO)
+    // 💸 CASO B: RECHAZAR TOTALMENTE (FULL REFUND)
     // ------------------------------------------------------------
     if (nuevo_estado === 'CANCELADO' || nuevo_estado === 'RECHAZADO') {
-        console.log(`🛑 Cancelando venta ${compra_uuid}...`);
-
-        // B.1 Reembolso en Mercado Pago
-        try {
-            const mpClient = new MercadoPagoConfig({ accessToken: process.env.MP_ACCESS_TOKEN_PROD });
-            const paymentClient = new Payment(mpClient);
-            await paymentClient.refund(venta.mp_payment_id);
-            console.log("✅ Dinero devuelto al cliente.");
-        } catch (mpError) {
-            console.error("⚠️ Error MP Refund:", mpError);
-            // Si el dinero ya se devolvió o pasó mucho tiempo, seguimos igual para cancelar en DB.
-            // Si es un error de conexión, el ROLLBACK evitará inconsistencias.
+        console.log(`🛑 Cancelando venta total ${compra_uuid}...`);
+        
+        // B.1 Reembolso Total MP
+        if (venta.mp_payment_id) {
+            try {
+                const mpClient = new MercadoPagoConfig({ accessToken: process.env.MP_ACCESS_TOKEN_PROD });
+                const paymentClient = new Payment(mpClient);
+                await paymentClient.refund(venta.mp_payment_id);
+                console.log("✅ Dinero devuelto al cliente (Total).");
+            } catch (mpError) {
+                console.error("⚠️ Error MP Refund Total:", mpError);
+            }
         }
 
-        // B.2 Anular Comisión de Socio (Si existe)
+        // B.2 Anular Comisión de Socio
         await client.query(`
             UPDATE historial_comisiones 
             SET estado = 'ANULADA', monto_comision = 0 
@@ -1260,12 +1309,13 @@ app.put('/api/mi-negocio/ventas/estado', async (req, res) => {
     }
 
     // ------------------------------------------------------------
-    // 2. ACTUALIZAR ESTADO EN DB
+    // 2. ACTUALIZAR ESTADO EN DB (Afecta a todas las filas del UUID)
     // ------------------------------------------------------------
+    // Nota: Solo actualizamos las que NO fueron canceladas parcialmente antes
     const updateQuery = `
       UPDATE transacciones_p2p 
       SET estado = $1, motivo_rechazo = $2
-      WHERE compra_uuid = $3
+      WHERE compra_uuid = $3 AND estado != 'CANCELADO'
     `;
     await client.query(updateQuery, [nuevo_estado, motivo || null, compra_uuid]);
 
@@ -1283,12 +1333,11 @@ app.put('/api/mi-negocio/ventas/estado', async (req, res) => {
     }
 
     // ------------------------------------------------------------
-    // 4. LÓGICA DE FIDELIZACIÓN (TU CÓDIGO ORIGINAL ADAPTADO) 🎟️
+    // 4. LÓGICA DE FIDELIZACIÓN (TU CÓDIGO ORIGINAL) 🎟️
     // ------------------------------------------------------------
     if (nuevo_estado === 'ENTREGADO') {
       tituloNotif = "Pedido Entregado";
       
-      // A. Verificar si es CANJE (Premio)
       const checkCanje = await client.query(
         'SELECT 1 FROM transacciones_p2p WHERE compra_uuid = $1 AND producto_global_id IS NULL',
         [compra_uuid]
@@ -1299,7 +1348,6 @@ app.put('/api/mi-negocio/ventas/estado', async (req, res) => {
       } else {
         mensajeNotif = "Gracias por tu compra. ¡Disfrútalo! ⭐";
 
-        // B. Reglas de Puntos
         const rulesRes = await client.query(
           'SELECT meta_sellos, monto_minimo, premio_descripcion FROM config_fidelizacion WHERE local_id = $1 AND estado = TRUE',
           [local_id]
@@ -1308,17 +1356,14 @@ app.put('/api/mi-negocio/ventas/estado', async (req, res) => {
         if (rulesRes.rows.length > 0) {
           const reglas = rulesRes.rows[0];
 
-          // B.2 Total
+          // B.2 Total (Excluyendo cancelados parciales)
           const totalRes = await client.query(
-            'SELECT SUM(monto_total) as total FROM transacciones_p2p WHERE compra_uuid = $1',
+            "SELECT SUM(monto_total) as total FROM transacciones_p2p WHERE compra_uuid = $1 AND estado != 'CANCELADO'",
             [compra_uuid]
           );
           const totalCompra = parseFloat(totalRes.rows[0].total || 0);
 
-          // B.3 Verificar mínimo
           if (totalCompra >= parseFloat(reglas.monto_minimo)) {
-            
-            // B.4 Sumar Sello
             const progresoQuery = `
               INSERT INTO progreso_fidelizacion (usuario_id, local_id, sellos_acumulados, cupones_disponibles)
               VALUES ($1, $2, 1, 0)
@@ -1329,7 +1374,6 @@ app.put('/api/mi-negocio/ventas/estado', async (req, res) => {
             const progresoRes = await client.query(progresoQuery, [comprador_id, local_id]);
             let { sellos_acumulados } = progresoRes.rows[0];
 
-            // B.5 Meta alcanzada
             if (sellos_acumulados >= reglas.meta_sellos) {
               await client.query(`
                 UPDATE progreso_fidelizacion 
@@ -1351,7 +1395,6 @@ app.put('/api/mi-negocio/ventas/estado', async (req, res) => {
 
     await client.query('COMMIT'); // 🟢 FIN TRANSACCIÓN
 
-    // 5. Enviar Notificación
     if (typeof enviarNotificacion === 'function') {
        enviarNotificacion(comprador_id, tituloNotif, mensajeNotif);
     }
@@ -1359,7 +1402,7 @@ app.put('/api/mi-negocio/ventas/estado', async (req, res) => {
     res.json({ mensaje: 'Estado actualizado', notificacion: mensajeNotif });
 
   } catch (error) {
-    await client.query('ROLLBACK'); // 🔴 REVERTIR TODO SI FALLA
+    await client.query('ROLLBACK');
     console.error("Error update estado:", error.message);
     res.status(400).json({ error: error.message || 'Error al actualizar estado' });
   } finally {
