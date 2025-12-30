@@ -837,7 +837,7 @@ app.get('/api/transaccion/mis-compras', async (req, res) => {
 });
 
 // ==========================================
-// RUTA 5: COMPRA MÚLTIPLE (CARRITO) - CON SNAPSHOT, CUPONES Y SOCIOS 🤝
+// RUTA 5: COMPRA MANUAL (EFECTIVO) - SIN COMISIONES 🛡️
 // ==========================================
 app.post('/api/transaccion/comprar', async (req, res) => {
   const authHeader = req.headers['authorization'];
@@ -849,41 +849,26 @@ app.post('/api/transaccion/comprar', async (req, res) => {
   const client = await pool.connect();
 
   try {
-    const usuario = jwt.verify(token, JWT_SECRET);
+    const usuario = jwt.verify(token, process.env.JWT_SECRET);
     const comprador_id = usuario.id;
     const nombreComprador = usuario.nombre || "Un cliente"; 
 
-    // 1. Generamos UUID para agrupar la orden
-    const compraUuid = crypto.randomUUID(); 
+    // 1. Generamos UUID y OTP
+    const compraUuid = crypto.randomUUID();
+    const generarOTP = () => Math.random().toString(36).substring(2, 6).toUpperCase();
+    const codigoRetiro = generarOTP(); 
 
     await client.query('BEGIN');
 
-    // 2. Buscamos al vendedor Y DATOS DEL SOCIO (PADRINO)
-    // --- ACTUALIZACIÓN: Traemos referido_por_socio_id y porcentaje_ganancia ---
-    const localRes = await client.query(`
-      SELECT 
-        L.usuario_id, 
-        L.referido_por_socio_id,
-        S.porcentaje_ganancia -- El nivel del socio (5%, 7.5%, etc)
-      FROM locales L
-      LEFT JOIN socios S ON L.referido_por_socio_id = S.socio_id
-      WHERE L.local_id = $1
-    `, [local_id]);
+    // 2. Buscamos al vendedor (Solo para validar, no calculamos socio aquí)
+    const localRes = await client.query('SELECT usuario_id FROM locales WHERE local_id = $1', [local_id]);
 
     if (localRes.rows.length === 0) throw new Error('Local no encontrado');
-    
     const vendedor_id = localRes.rows[0].usuario_id;
-    const socioId = localRes.rows[0].referido_por_socio_id; // ID del Socio
-    // Si tiene socio, usamos su porcentaje de la BD, si no, 0. (Default 5.00 si es null)
-    const porcentajeSocio = socioId ? parseFloat(localRes.rows[0].porcentaje_ganancia || 5.00) : 0;
 
-    if (comprador_id === vendedor_id) {
-      throw new Error('No puedes realizar compras en tu propio negocio.');
-    }
+    if (comprador_id === vendedor_id) throw new Error('No puedes comprarte a ti mismo.');
 
-    // ============================================================
-    // 3. LÓGICA DE CANJE DE CUPÓN 🎟️ (Sin cambios, se mantiene tu lógica)
-    // ============================================================
+    // 3. LÓGICA DE CANJE DE CUPÓN (Se mantiene igual)
     let infoPremio = ""; 
     let tituloNotif = "¡Nueva Orden Entrante! 📦";
 
@@ -905,33 +890,22 @@ app.post('/api/transaccion/comprar', async (req, res) => {
         infoPremio = `\n🎁 DEBES ENTREGAR PREMIO: ${nombrePremio}`;
         tituloNotif = "¡Venta con PREMIO CANJEADO! 🎁";
 
-        // Insertamos el premio ($0 costo, $0 comisión)
-        const insertPremio = `
+        await client.query(`
             INSERT INTO transacciones_p2p 
-            (comprador_id, vendedor_id, producto_global_id, cantidad, monto_total, estado, tipo_entrega, compra_uuid, nombre_snapshot, foto_snapshot, comision_plataforma)
-            VALUES ($1, $2, NULL, 1, 0, 'APROBADO', $3, $4, $5, $6, 0)
-        `;
-        const fotoRegalo = "https://cdn-icons-png.flaticon.com/512/4213/4213958.png"; 
-
-        await client.query(insertPremio, [
-            comprador_id, vendedor_id, tipo_entrega, compraUuid,
-            `🎁 PREMIO: ${nombrePremio}`, fotoRegalo
-        ]);
+            (comprador_id, vendedor_id, producto_global_id, cantidad, monto_total, estado, tipo_entrega, compra_uuid, nombre_snapshot, foto_snapshot, comision_plataforma, codigo_retiro)
+            VALUES ($1, $2, NULL, 1, 0, 'APROBADO', $3, $4, $5, $6, 0, $7)
+        `, [comprador_id, vendedor_id, tipo_entrega, compraUuid, `🎁 PREMIO: ${nombrePremio}`, "https://cdn-icons-png.flaticon.com/512/4213/4213958.png", codigoRetiro]);
         
       } else {
         throw new Error("Error: No tienes cupones disponibles.");
       }
     }
 
-    // ============================================================
-    // 4. ITEMS PAGADOS (Con cálculo de comisión individual) 💰
-    // ============================================================
+    // 4. ITEMS PAGADOS (EFECTIVO)
     let montoTotalPedido = 0; 
-    let comisionTotalPlataforma = 0; // Acumulador para saber cuánto ganamos nosotros
-    let ultimoTransaccionId = null;  // Para vincular el historial
-
+    
     for (const item of items) {
-        // A. Validar Stock
+        // A. Validar y Descontar Stock
         const stockQuery = `SELECT stock, global_id, tipo_item, nombre, foto_url FROM inventario_local WHERE inventario_id = $1 FOR UPDATE`;
         const stockRes = await client.query(stockQuery, [item.inventario_id]);
         
@@ -943,23 +917,22 @@ app.post('/api/transaccion/comprar', async (req, res) => {
             await client.query('UPDATE inventario_local SET stock = stock - $1 WHERE inventario_id = $2', [item.cantidad, item.inventario_id]);
         }
 
-        // B. Cálculos Monetarios
+        // B. Cálculos (SIN COMISIÓN)
         const totalItem = item.precio * item.cantidad;
         montoTotalPedido += totalItem;
 
-        // Calculamos el 1% de CercaMío para este item específico
-        const comisionItem = Math.round((totalItem * 0.01) * 100) / 100;
-        comisionTotalPlataforma += comisionItem;
+        // 🔥 CAMBIO CRÍTICO: La comisión es 0 porque es efectivo.
+        // CercaMío no cobra, Socio no cobra.
+        const comisionItem = 0; 
 
-        // C. Insertar Transacción (Agregamos comision_plataforma)
+        // C. Insertar Transacción
         const insertTx = `
             INSERT INTO transacciones_p2p 
-            (comprador_id, vendedor_id, producto_global_id, cantidad, monto_total, estado, tipo_entrega, compra_uuid, nombre_snapshot, foto_snapshot, comision_plataforma)
-            VALUES ($1, $2, $3, $4, $5, 'APROBADO', $6, $7, $8, $9, $10)
-            RETURNING transaccion_id
+            (comprador_id, vendedor_id, producto_global_id, cantidad, monto_total, estado, tipo_entrega, compra_uuid, nombre_snapshot, foto_snapshot, comision_plataforma, codigo_retiro)
+            VALUES ($1, $2, $3, $4, $5, 'PENDIENTE_PAGO', $6, $7, $8, $9, $10, $11)
         `;
         
-        const txRes = await client.query(insertTx, [
+        await client.query(insertTx, [
             comprador_id, 
             vendedor_id, 
             datosReales.global_id, 
@@ -969,49 +942,22 @@ app.post('/api/transaccion/comprar', async (req, res) => {
             compraUuid,
             datosReales.nombre,   
             datosReales.foto_url,
-            comisionItem // <--- Guardamos cuánto ganamos en este item
+            comisionItem, // ES CERO
+            codigoRetiro
         ]);
-
-        ultimoTransaccionId = txRes.rows[0].transaccion_id;
     }
 
-    // ============================================================
-    // 5. REPARTO DE GANANCIAS AL SOCIO (REVENUE SHARE) 🤝
-    // ============================================================
-    if (socioId && comisionTotalPlataforma > 0) {
-       
-       // Ganancia Socio = Nuestra Ganancia * (Su Porcentaje / 100)
-       // Ejemplo: Ganamos $100 * (5% del socio) = $5 para él.
-       const gananciaSocio = Math.round((comisionTotalPlataforma * (porcentajeSocio / 100)) * 100) / 100;
-
-       if (gananciaSocio > 0) {
-         // A. Acreditar en Billetera
-         await client.query(`UPDATE socios SET saldo_acumulado = saldo_acumulado + $1 WHERE socio_id = $2`, [gananciaSocio, socioId]);
-
-         // B. Auditoría
-         await client.query(`
-            INSERT INTO historial_comisiones 
-            (socio_id, transaccion_origen_id, local_origen_id, monto_comision, porcentaje_aplicado, base_calculo_plataforma)
-            VALUES ($1, $2, $3, $4, $5, $6)
-         `, [socioId, ultimoTransaccionId, local_id, gananciaSocio, porcentajeSocio, comisionTotalPlataforma]);
-         
-         console.log(`✅ Socio #${socioId} ganó $${gananciaSocio} (Base CercaMío: $${comisionTotalPlataforma})`);
-       }
-    }
+    // 5. REPARTO SOCIO: ELIMINADO 🗑️
+    // En esta ruta (Efectivo) no ejecutamos lógica de socios.
+    // El socio solo gana si entra por Webhook (Mercado Pago).
 
     await client.query('COMMIT');
 
     // 6. Notificar
-    const mensajeVendedor = `${nombreComprador} realizó un pedido de ${items.length} items pagados. Total: $${montoTotalPedido}.${infoPremio}`;
+    const mensajeVendedor = `${nombreComprador} hizo un pedido por $${montoTotalPedido}. Estado: PENDIENTE DE COBRO.${infoPremio}`;
     enviarNotificacion(vendedor_id, tituloNotif, mensajeVendedor);
 
-    // Opcional: Notificar al Socio si ganó algo
-    if (socioId) {
-        const sUser = await pool.query('SELECT usuario_id FROM socios WHERE socio_id = $1', [socioId]);
-        if (sUser.rows.length > 0) {
-           // enviarNotificacion(sUser.rows[0].usuario_id, "¡Kaching! 🤑", "Sumaste saldo por ventas de tus referidos.");
-        }
-    }
+    enviarNotificacion(comprador_id, "Pedido Realizado ⏳", `Tu pedido está pendiente de pago. Código: ${codigoRetiro}`);
 
     res.json({ mensaje: 'Compra realizada con éxito', orden_id: compraUuid });
 
@@ -1025,14 +971,14 @@ app.post('/api/transaccion/comprar', async (req, res) => {
 });
 
 // ==========================================
-// RUTA 9: CONVERTIRSE EN VENDEDOR (VERSIÓN LIMPIA 🛡️)
+// RUTA 9: CONVERTIRSE EN VENDEDOR (V12.0 - NIVEL AUTOMÁTICO) 🛡️
 // ==========================================
 app.post('/api/auth/convertir-vendedor', async (req, res) => {
   const authHeader = req.headers['authorization'];
   if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
   const token = authHeader.split(' ')[1];
 
-  // Recibimos los datos del formulario
+  // Recibimos los datos
   const { nombre_tienda, categoria, whatsapp, direccion, tipo_actividad, rubro, lat, long, codigo_socio } = req.body;
 
   const client = await pool.connect();
@@ -1040,14 +986,13 @@ app.post('/api/auth/convertir-vendedor', async (req, res) => {
   try {
     const usuario = jwt.verify(token, process.env.JWT_SECRET);
     
-    await client.query('BEGIN'); // Iniciamos la transacción
+    await client.query('BEGIN'); // Iniciamos transacción
 
     let socioIdEncontrado = null;
 
-    // 1. VALIDAR CÓDIGO DE SOCIO (Si existe)
+    // 1. VALIDAR CÓDIGO DE SOCIO
     if (codigo_socio) {
-      // Solo pedimos IDs, no nombres, para evitar errores de SQL
-      const socioRes = await client.query('SELECT socio_id, usuario_id FROM socios WHERE codigo_referido = $1', [codigo_socio]);
+      const socioRes = await client.query('SELECT socio_id, usuario_id FROM socios WHERE codigo_referido = $1', [codigo_socio.trim().toUpperCase()]);
       
       if (socioRes.rows.length > 0) {
         const datosSocio = socioRes.rows[0];
@@ -1060,27 +1005,27 @@ app.post('/api/auth/convertir-vendedor', async (req, res) => {
       }
     }
 
-    // 2. ACTUALIZAR EL TIPO DE USUARIO
+    // 2. ACTUALIZAR TIPO DE USUARIO
     const nuevoTipoUsuario = (tipo_actividad === 'SERVICIO') ? 'Profesional' : categoria;
     await client.query(
       'UPDATE usuarios SET tipo = $1 WHERE usuario_id = $2',
       [nuevoTipoUsuario, usuario.id]
     );
 
-    // 3. PREPARAR DATOS GEOGRÁFICOS Y FOTO
+    // 3. PREPARAR DATOS
     const latitudFinal = lat || -45.86;
     const longitudFinal = long || -67.48;
     
-    let fotoDefecto = 'https://cdn-icons-png.flaticon.com/512/3081/3081559.png';
+    let fotoDefecto = 'https://cdn-icons-png.flaticon.com/512/3081/3081559.png'; // Tienda
     if (tipo_actividad === 'SERVICIO') {
-        fotoDefecto = 'https://cdn-icons-png.flaticon.com/512/1063/1063376.png';
+        fotoDefecto = 'https://cdn-icons-png.flaticon.com/512/1063/1063376.png'; // Profesional
     }
 
-    // 4. INSERTAR EL LOCAL (LA TIENDA)
+    // 4. INSERTAR LOCAL (Con casting Geography explícito por seguridad)
     const localQuery = `
       INSERT INTO locales 
       (usuario_id, nombre, categoria, ubicacion, whatsapp, permite_retiro, permite_delivery, direccion_fisica, tipo_actividad, rubro, foto_url, referido_por_socio_id)
-      VALUES ($1, $2, $3, ST_SetSRID(ST_MakePoint($4, $5), 4326), $6, TRUE, FALSE, $7, $8, $9, $10, $11)
+      VALUES ($1, $2, $3, ST_SetSRID(ST_MakePoint($4, $5), 4326)::geography, $6, TRUE, FALSE, $7, $8, $9, $10, $11)
     `;
     
     await client.query(localQuery, [
@@ -1097,28 +1042,32 @@ app.post('/api/auth/convertir-vendedor', async (req, res) => {
       socioIdEncontrado
     ]);
 
-    await client.query('COMMIT'); // 🔒 GUARDAMOS CAMBIOS
+    await client.query('COMMIT'); // 🔒 TIENDA CREADA
 
-    // 5. RESPONDER AL FRONTEND INMEDIATAMENTE
+    // 5. ACTUALIZAR NIVEL DEL PADRINO (CRÍTICO: HACERLO ANTES DE RESPONDER) 📈
+    if (socioIdEncontrado) {
+       try {
+           // Esperamos a que se actualice el nivel para asegurar consistencia
+           await actualizarNivelSocio(socioIdEncontrado); 
+           console.log(`✅ Nivel de socio ${socioIdEncontrado} recalculado.`);
+       } catch (lvlError) {
+           console.error("⚠️ Error menor actualizando nivel socio:", lvlError.message);
+           // No fallamos la request principal, solo logueamos el error
+       }
+    }
+
+    // 6. RESPONDER
     console.log(`✅ Tienda creada para usuario ID: ${usuario.id}`);
     res.json({ mensaje: '¡Perfil profesional creado exitosamente!' });
 
-    // 6. TAREAS SECUNDARIAS (Nivel Socio)
-    // Lo hacemos fuera del flujo principal para que si falla, no rompa la tienda creada.
-    if (socioIdEncontrado) {
-       // Llamamos a la función auxiliar sin await bloqueante o con catch propio
-       actualizarNivelSocio(socioIdEncontrado).catch(err => console.error("Error actualizando nivel (ignorable):", err.message));
-    }
-
   } catch (error) {
-    await client.query('ROLLBACK'); // Si algo falló antes del commit, deshacemos
+    await client.query('ROLLBACK');
     console.error("❌ Error creando tienda:", error);
     
     if (error.message && (error.message.includes("código") || error.message.includes("propio"))) {
        return res.status(400).json({ error: error.message });
     }
     
-    // Solo respondemos si no se respondió antes
     if (!res.headersSent) {
         res.status(500).json({ error: 'Error al crear la tienda.' });
     }
@@ -3065,21 +3014,15 @@ app.get('/api/pagos/callback', async (req, res) => {
 });
 
 // ==========================================
-// RUTA 37: WEBHOOK MAESTRO (VENTAS + SUSCRIPCIONES) 🤖 [AUDITADO & BLINDADO]
+// RUTA 37: WEBHOOK MAESTRO (VENTAS + SUSCRIPCIONES + SOCIOS) 💎
 // ==========================================
 app.post('/api/pagos/webhook', async (req, res) => {
   const { type, data } = req.body;
-
-  // Respondemos rápido a MP para que no reintente mientras procesamos
-  // (Técnica: Responder 200 al final, pero procesar asíncrono. 
-  // Node permite esto, pero cuidado con timeouts en serverless. 
-  // Mantenemos tu flujo actual de responder al final, es seguro para Render).
 
   if (type === 'payment') {
     try {
       const paymentId = data.id;
       
-      // 1. CONSULTAR ESTADO REAL A MERCADO PAGO 🔒
       const client = new MercadoPagoConfig({ accessToken: process.env.MP_ACCESS_TOKEN_PROD });
       const paymentClient = new Payment(client); 
       const paymentData = await paymentClient.get({ id: paymentId });
@@ -3093,180 +3036,155 @@ app.post('/api/pagos/webhook', async (req, res) => {
         // CASO A: SUSCRIPCIÓN PREMIUM (SaaS) 💎
         // ====================================================
         if (externalRef && externalRef.startsWith('SUB-')) {
-            
-            // 🚨 IDEMPOTENCIA CRÍTICA: Verificar si ya procesamos este pago
-            const checkSusc = await pool.query(
-              'SELECT 1 FROM pagos_suscripciones WHERE mp_payment_id = $1', 
-              [paymentId.toString()]
-            );
+            const checkSusc = await pool.query('SELECT 1 FROM pagos_suscripciones WHERE mp_payment_id = $1', [paymentId.toString()]);
 
-            if (checkSusc.rows.length > 0) {
-              console.log("⚠️ Suscripción duplicada recibida. Ignorando.");
-              return res.status(200).send("OK");
-            }
+            if (checkSusc.rows.length > 0) return res.status(200).send("OK");
 
-            // Datos de la metadata
             const { local_id, dias_duracion } = paymentData.metadata;
             const diasAgregar = Number(dias_duracion) || 30; 
             const monto = paymentData.transaction_amount;
 
-            console.log(`💎 ACTIVANDO PLAN PREMIUM: Local ${local_id} (+${diasAgregar} días)`);
-
             const clientDb = await pool.connect();
             try {
                 await clientDb.query('BEGIN');
-
-                // A. Actualizar Local (Sumar días)
-                const updateQuery = `
-                  UPDATE locales 
-                  SET 
-                    plan_tipo = 'PREMIUM',
-                    plan_vencimiento = CASE 
-                       WHEN plan_vencimiento > NOW() THEN plan_vencimiento + make_interval(days => $2)
-                       ELSE NOW() + make_interval(days => $2)
-                    END
+                
+                // Actualizar Vencimiento
+                await clientDb.query(`
+                  UPDATE locales SET plan_tipo = 'PREMIUM',
+                  plan_vencimiento = CASE WHEN plan_vencimiento > NOW() THEN plan_vencimiento + make_interval(days => $2) ELSE NOW() + make_interval(days => $2) END
                   WHERE local_id = $1
-                `;
-                await clientDb.query(updateQuery, [local_id, diasAgregar]);
+                `, [local_id, diasAgregar]);
 
-                // B. Registrar Pago (Para Idempotencia y Contabilidad)
-                const insertPago = `
-                  INSERT INTO pagos_suscripciones (mp_payment_id, local_id, monto_pagado, dias_agregados)
-                  VALUES ($1, $2, $3, $4)
-                `;
-                await clientDb.query(insertPago, [paymentId.toString(), local_id, monto, diasAgregar]);
+                // Registrar Pago
+                await clientDb.query(`
+                  INSERT INTO pagos_suscripciones (mp_payment_id, local_id, monto_pagado, dias_agregados) VALUES ($1, $2, $3, $4)
+                `, [paymentId.toString(), local_id, monto, diasAgregar]);
 
                 await clientDb.query('COMMIT');
-                console.log("✅ Suscripción activada y registrada.");
-
-                // C. Notificar al dueño (Opcional)
                 enviarNotificacion(paymentData.metadata.user_id_dueno, "¡Plan Activado! 🚀", "Tu suscripción Premium ya está vigente.");
 
             } catch (errSusc) {
                 await clientDb.query('ROLLBACK');
                 console.error("❌ Error DB Suscripción:", errSusc);
-                // No retornamos 500 aquí para no bloquear la cola de MP, solo logueamos.
             } finally {
                 clientDb.release();
             }
         } 
 
         // ====================================================
-        // CASO B: VENTA MARKETPLACE (E-COMMERCE) 🛒
+        // CASO B: VENTA MARKETPLACE (E-COMMERCE + SOCIOS) 🛒
         // ====================================================
         else if (externalRef && externalRef.startsWith('CM-')) {
             
-            // 1. IDEMPOTENCIA
             const checkDuplicado = await pool.query('SELECT 1 FROM transacciones_p2p WHERE mp_payment_id = $1', [paymentId.toString()]);
-            
-            if (checkDuplicado.rows.length > 0) {
-                console.log("⚠️ Venta ya registrada anteriormente. Ignorando.");
-                return res.status(200).send("OK");
-            }
+            if (checkDuplicado.rows.length > 0) return res.status(200).send("OK");
 
-            // 2. PROCESAMIENTO
+            // Datos
             const meta = paymentData.metadata;
             const compradorId = meta.comprador_id;
             const vendedorId = meta.vendedor_id;
-            // Parseo seguro de items
-            let itemsComprados = [];
-            try {
-               itemsComprados = typeof meta.items_json === 'string' ? JSON.parse(meta.items_json) : meta.items_json;
-            } catch (e) {
-               console.error("Error parseando items_json", e);
-               // Si falla el parseo, no podemos procesar el stock, pero no crasheamos.
-            }
-            
+            let itemsComprados = typeof meta.items_json === 'string' ? JSON.parse(meta.items_json) : meta.items_json;
             const tipoEntrega = meta.tipo_entrega;
             const totalPagado = paymentData.transaction_amount;
             const compraUuid = crypto.randomUUID();
-
-            console.log(`🛒 Procesando Venta para vendedor ${vendedorId}...`);
+            
+            // Generar OTP Seguro
+            const generarOTP = () => Math.random().toString(36).substring(2, 6).toUpperCase();
+            const codigoRetiro = generarOTP(); 
 
             const clientDb = await pool.connect(); 
             
             try {
               await clientDb.query('BEGIN');
 
+              // 1. BUSCAR DATOS DEL SOCIO (PADRINO) 🤝
+              // Necesitamos saber si este vendedor fue invitado por alguien para pagarle comisión
+              const socioRes = await clientDb.query(`
+                  SELECT L.local_id, L.referido_por_socio_id, S.porcentaje_ganancia
+                  FROM locales L
+                  LEFT JOIN socios S ON L.referido_por_socio_id = S.socio_id
+                  WHERE L.usuario_id = $1
+              `, [vendedorId]);
+              
+              const localInfo = socioRes.rows[0];
+              const socioId = localInfo?.referido_por_socio_id;
+              const porcentajeSocio = socioId ? parseFloat(localInfo.porcentaje_ganancia || 5.00) : 0;
+              const localId = localInfo?.local_id;
+
+              // Variables para acumular la ganancia total de la orden
+              let comisionTotalOrden = 0;
+              let ultimoTransaccionId = null;
+
+              // 2. PROCESAR CADA PRODUCTO
               for (const item of itemsComprados) {
-                 // A. BUSCAR DATOS REALES & BLOQUEO (FOR UPDATE)
-                 const queryProducto = `
-                    SELECT global_id, nombre, foto_url, tipo_item, stock 
-                    FROM inventario_local 
-                    WHERE inventario_id = $1 FOR UPDATE
-                 `;
+                 // A. Validar Stock y Datos Reales
+                 const queryProducto = `SELECT global_id, nombre, foto_url, tipo_item, stock FROM inventario_local WHERE inventario_id = $1 FOR UPDATE`;
                  const prodRes = await clientDb.query(queryProducto, [item.id]);
                  
-                 const datosReales = prodRes.rows.length > 0 ? prodRes.rows[0] : {
-                    global_id: null,
-                    nombre: item.title,
-                    foto_url: null,
-                    tipo_item: 'PRODUCTO_STOCK',
-                    stock: 0
-                 };
+                 // Fallback seguro si borraron el producto mientras se pagaba
+                 const datosReales = prodRes.rows.length > 0 ? prodRes.rows[0] : { global_id: null, nombre: item.title, foto_url: null, tipo_item: 'PRODUCTO_STOCK', stock: 0 };
 
-                 // B. DESCONTAR STOCK (Solo si es item físico)
                  if (datosReales.tipo_item === 'PRODUCTO_STOCK') {
-                    await clientDb.query(
-                      'UPDATE inventario_local SET stock = stock - $1 WHERE inventario_id = $2', 
-                      [item.cant, item.id]
-                    );
+                    await clientDb.query('UPDATE inventario_local SET stock = stock - $1 WHERE inventario_id = $2', [item.cant, item.id]);
                  }
 
-                 // C. INSERTAR TRANSACCIÓN (CON CÓDIGO OTP) 🔐
-                 // Generamos un código simple de 4 caracteres (Letras/Números)
-                 const generarOTP = () => Math.random().toString(36).substring(2, 6).toUpperCase();
-                 const codigoRetiro = generarOTP(); 
+                 // B. Calcular Comisión CercaMío (ej: 1% del item)
+                 const totalItem = item.precio * item.cant;
+                 const comisionItem = Math.round((totalItem * 0.01) * 100) / 100; // 1%
+                 comisionTotalOrden += comisionItem;
 
+                 // C. Insertar Transacción
                  const insertTx = `
                     INSERT INTO transacciones_p2p 
                     (
                       comprador_id, vendedor_id, producto_global_id, cantidad, monto_total, 
                       estado, tipo_entrega, mp_payment_id, fecha_operacion,
-                      compra_uuid, nombre_snapshot, foto_snapshot, 
-                      codigo_retiro
+                      compra_uuid, nombre_snapshot, foto_snapshot, codigo_retiro,
+                      comision_plataforma
                     )
-                    VALUES ($1, $2, $3, $4, $5, 'APROBADO', $6, $7, NOW(), $8, $9, $10, $11)
+                    VALUES ($1, $2, $3, $4, $5, 'APROBADO', $6, $7, NOW(), $8, $9, $10, $11, $12)
+                    RETURNING transaccion_id
                  `;
                  
-                 await clientDb.query(insertTx, [
-                    compradorId, 
-                    vendedorId, 
-                    datosReales.global_id, 
-                    item.cant, 
-                    item.precio * item.cant, 
-                    tipoEntrega,
-                    paymentId.toString(),
-                    compraUuid,            
-                    datosReales.nombre,    
-                    datosReales.foto_url,
-                    codigoRetiro // $11
+                 const txRes = await clientDb.query(insertTx, [
+                    compradorId, vendedorId, datosReales.global_id, item.cant, totalItem, 
+                    tipoEntrega, paymentId.toString(), compraUuid, datosReales.nombre, datosReales.foto_url,
+                    codigoRetiro, comisionItem
                  ]);
+                 
+                 ultimoTransaccionId = txRes.rows[0].transaccion_id;
+              }
+
+              // 3. PAGAR AL SOCIO (SI CORRESPONDE) 💰
+              if (socioId && comisionTotalOrden > 0) {
+                 // El socio gana un % de lo que ganó CercaMío (Revenue Share)
+                 const gananciaSocio = Math.round((comisionTotalOrden * (porcentajeSocio / 100)) * 100) / 100;
+                 
+                 if (gananciaSocio > 0) {
+                    // Acreditar saldo
+                    await clientDb.query('UPDATE socios SET saldo_acumulado = saldo_acumulado + $1 WHERE socio_id = $2', [gananciaSocio, socioId]);
+                    
+                    // Guardar historial para auditoría
+                    await clientDb.query(`
+                        INSERT INTO historial_comisiones (socio_id, transaccion_origen_id, local_origen_id, monto_comision, porcentaje_aplicado, base_calculo_plataforma)
+                        VALUES ($1, $2, $3, $4, $5, $6)
+                    `, [socioId, ultimoTransaccionId, localId, gananciaSocio, porcentajeSocio, comisionTotalOrden]);
+                 }
               }
 
               await clientDb.query('COMMIT');
               
-              // 5. NOTIFICAR AL VENDEDOR
-              if (typeof enviarNotificacion === 'function') {
-                  enviarNotificacion(vendedorId, "¡Nueva Venta Online! 💳", `Recibiste $${totalPagado}. Entrega: ${tipoEntrega}`, { tipo: 'VENTA', uuid: compraUuid });
-              }
-              // 6. NOTIFICAR AL COMPRADOR
-              // Ahora incluye el Código de Retiro para que el cliente lo tenga a mano
-              if (typeof enviarNotificacion === 'function') {
-                  const cuerpoMensaje = `Tu pedido a ${meta.nombre_local || 'el local'} fue confirmado. 🔐 CÓDIGO DE RETIRO: ${codigoRetiro}`;
-                  
-                  enviarNotificacion(
-                      compradorId, 
-                      "¡Compra Exitosa! 🛍️", 
-                      cuerpoMensaje, 
-                      { tipo: 'COMPRA', uuid: compraUuid } // Payload extra para ir directo al pedido
-                  );
-              }
+              // 4. NOTIFICACIONES
+              // Al Vendedor
+              enviarNotificacion(vendedorId, "¡Nueva Venta Online! 💳", `Recibiste $${totalPagado}. Entrega: ${tipoEntrega}`, { tipo: 'VENTA', uuid: compraUuid });
+              
+              // Al Comprador (Con Código OTP)
+              const msgCliente = `Tu pedido fue confirmado. 🔐 CÓDIGO DE RETIRO: ${codigoRetiro}`;
+              enviarNotificacion(compradorId, "¡Compra Exitosa! 🛍️", msgCliente, { tipo: 'COMPRA', uuid: compraUuid });
 
             } catch (dbError) {
               await clientDb.query('ROLLBACK');
-              console.error("❌ Error guardando Venta en BD:", dbError);
-              // Aquí sí es grave, podríamos devolver 500 para que MP reintente si fue error de DB temporal
+              console.error("❌ Error Webhook DB:", dbError);
               return res.status(500).send("DB Error");
             } finally {
               clientDb.release();
@@ -3274,13 +3192,11 @@ app.post('/api/pagos/webhook', async (req, res) => {
         }
       }
     } catch (error) {
-      console.error("❌ Error general en Webhook:", error);
-      // Devolvemos 500 para que MP sepa que algo explotó en nuestro servidor
+      console.error("❌ Error Webhook:", error);
       return res.status(500).send("Error interno");
     }
   }
 
-  // Siempre responder OK si no es Payment o si ya procesamos
   res.status(200).send("OK");
 });
 
