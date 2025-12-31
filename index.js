@@ -1100,6 +1100,7 @@ app.get('/api/mi-negocio/ventas', async (req, res) => {
         SUM(T.cantidad) as total_items,
         U.nombre_completo as comprador,
         U.usuario_id as comprador_id,
+        U.telefono as telefono_comprador,
         
         -- Agregamos datos vitales para el Rechazo Parcial dentro del JSON
         json_agg(json_build_object(
@@ -1116,7 +1117,7 @@ app.get('/api/mi-negocio/ventas', async (req, res) => {
       LEFT JOIN catalogo_global C ON T.producto_global_id = C.global_id
       
       WHERE T.vendedor_id = $1
-      GROUP BY T.compra_uuid, U.usuario_id, U.nombre_completo
+      GROUP BY T.compra_uuid, U.usuario_id, U.nombre_completo, U.telefono
       ORDER BY MAX(T.fecha_operacion) DESC
     `;
     
