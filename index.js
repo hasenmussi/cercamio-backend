@@ -270,6 +270,25 @@ app.put('/api/notificaciones/leer', async (req, res) => {
   }
 });
 
+// C. ELIMINAR NOTIFICACIÓN (MANUAL) 🗑️
+app.delete('/api/notificaciones/:id', async (req, res) => {
+  const authHeader = req.headers['authorization'];
+  if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
+  const token = authHeader.split(' ')[1];
+  const { id } = req.params;
+
+  try {
+    const usuario = jwt.verify(token, process.env.JWT_SECRET);
+    
+    // Solo borra si pertenece al usuario
+    await pool.query('DELETE FROM notificaciones WHERE notificacion_id = $1 AND usuario_id = $2', [id, usuario.id]);
+    
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Error al eliminar' });
+  }
+});
+
 // TAREA PROGRAMADA: LIMPIEZA DE NOTIFICACIONES VIEJAS (> 30 DÍAS)
 // Se ejecuta todos los días a las 04:00 AM
 cron.schedule('0 4 * * *', async () => {
