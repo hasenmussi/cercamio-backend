@@ -88,37 +88,54 @@ const capitalizarNombre = (texto) => {
 };
 
 // ==========================================
-// FUNCIÓN AUXILIAR: ENVIAR NOTIFICACIONES PUSH (FCM) 📲
+// FUNCIÓN AUXILIAR: NOTIFICACIONES HÍBRIDAS (DB + FCM) 🔔
 // ==========================================
 const enviarNotificacion = async (usuarioIdDestino, titulo, mensaje, dataPayload = {}) => {
   try {
-    // 1. Buscamos el token del usuario en la BD
+    // 1. GUARDAR EN BASE DE DATOS (HISTORIAL PERMANENTE) 💾
+    // Hacemos esto primero para que quede registro aunque falle el envío Push
+    const payloadJson = dataPayload || {};
+    const tipo = payloadJson.tipo || 'SISTEMA'; // Si no viene tipo, es aviso de sistema
+
+    // Insertamos en la tabla 'notificaciones'
+    await pool.query(
+      `INSERT INTO notificaciones (usuario_id, titulo, mensaje, tipo, data_payload) 
+       VALUES ($1, $2, $3, $4, $5)`,
+      [usuarioIdDestino, titulo, mensaje, tipo, payloadJson]
+    );
+
+    // 2. BUSCAR TOKEN DEL USUARIO (Tu lógica original)
     const query = 'SELECT fcm_token FROM usuarios WHERE usuario_id = $1';
     const res = await pool.query(query, [usuarioIdDestino]);
 
-    // Si no existe el usuario o no tiene token, salimos
+    // Si no existe el usuario o no tiene token, terminamos aquí (pero ya guardamos en DB)
     if (res.rows.length === 0 || !res.rows[0].fcm_token) {
       return; 
     }
 
     const fcmToken = res.rows[0].fcm_token;
 
-    // 2. Preparamos el mensaje para Firebase
+    // 3. PREPARAR MENSAJE PARA FIREBASE
+    // Firebase requiere que los valores de 'data' sean Strings obligatoriamente
+    const payloadString = {};
+    for (let key in payloadJson) {
+        payloadString[key] = String(payloadJson[key]);
+    }
+
     const message = {
       notification: { title: titulo, body: mensaje },
       token: fcmToken,
-      data: dataPayload // Datos extra (ej: ID de pedido)
+      data: payloadString // Datos convertidos para FCM
     };
 
-    // 3. Enviamos
+    // 4. ENVIAR PUSH
     await admin.messaging().send(message);
     // console.log(`📲 Notificación enviada a usuario ${usuarioIdDestino}`);
 
   } catch (error) {
-    // console.error('Error enviando notificación:', error.message);
+    console.error('⚠️ Error sistema notificaciones:', error.message);
 
-    // --- AUTO-LIMPIEZA DE TOKENS MUERTOS ---
-    // Si Firebase nos dice que el token ya no sirve (App desinstalada), lo borramos de la BD
+    // --- AUTO-LIMPIEZA DE TOKENS MUERTOS (Tu lógica original conservada) ---
     if (error.code === 'messaging/registration-token-not-registered' || 
         error.code === 'messaging/invalid-argument') {
        
@@ -191,6 +208,81 @@ app.get('/', (req, res) => {
   res.send('¡Hola! El servidor de CercaMío está funcionando 🚀');
 });
 
+
+
+// ==========================================
+// RUTAS DE NOTIFICACIONES (HISTORIAL) 🔔
+// ==========================================
+
+// A. OBTENER MIS NOTIFICACIONES (Paginadas o últimas 50)
+app.get('/api/notificaciones', async (req, res) => {
+  const authHeader = req.headers['authorization'];
+  if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
+  const token = authHeader.split(' ')[1];
+
+  try {
+    const usuario = jwt.verify(token, process.env.JWT_SECRET);
+
+    const query = `
+      SELECT * FROM notificaciones 
+      WHERE usuario_id = $1 
+      ORDER BY fecha_creacion DESC 
+      LIMIT 50
+    `;
+    const result = await pool.query(query, [usuario.id]);
+
+    // Contamos cuántas sin leer hay para el badge
+    const countRes = await pool.query(
+      'SELECT COUNT(*) FROM notificaciones WHERE usuario_id = $1 AND leida = FALSE', 
+      [usuario.id]
+    );
+    
+    res.json({
+        lista: result.rows,
+        sin_leer: parseInt(countRes.rows[0].count)
+    });
+
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Error al obtener notificaciones' });
+  }
+});
+
+// B. MARCAR COMO LEÍDA (Una o Todas)
+app.put('/api/notificaciones/leer', async (req, res) => {
+  const authHeader = req.headers['authorization'];
+  if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
+  const token = authHeader.split(' ')[1];
+  const { notificacion_id, leer_todas } = req.body;
+
+  try {
+    const usuario = jwt.verify(token, process.env.JWT_SECRET);
+
+    if (leer_todas) {
+        await pool.query('UPDATE notificaciones SET leida = TRUE WHERE usuario_id = $1', [usuario.id]);
+    } else if (notificacion_id) {
+        await pool.query('UPDATE notificaciones SET leida = TRUE WHERE notificacion_id = $1 AND usuario_id = $2', [notificacion_id, usuario.id]);
+    }
+
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Error al actualizar estado' });
+  }
+});
+
+// TAREA PROGRAMADA: LIMPIEZA DE NOTIFICACIONES VIEJAS (> 30 DÍAS)
+// Se ejecuta todos los días a las 04:00 AM
+cron.schedule('0 4 * * *', async () => {
+  console.log('🧹 Iniciando limpieza de notificaciones antiguas...');
+  try {
+    const res = await pool.query(
+      "DELETE FROM notificaciones WHERE fecha_creacion < NOW() - INTERVAL '30 days'"
+    );
+    console.log(`✅ Se eliminaron ${res.rowCount} notificaciones viejas.`);
+  } catch (error) {
+    console.error('❌ Error en limpieza de notificaciones:', error);
+  }
+});
 
 // ==========================================
 // RUTA 1: OBTENER LOCALES (GPS REAL + BÚSQUEDA VISUAL) 📍
