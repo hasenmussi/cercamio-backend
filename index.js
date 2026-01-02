@@ -948,7 +948,7 @@ app.get('/api/transaccion/mis-compras', async (req, res) => {
 });
 
 // ==========================================
-// RUTA 5: COMPRA MANUAL (EFECTIVO) - SIN COMISIONES 🛡️
+// RUTA 5: COMPRA HÍBRIDA MAESTRA (STOCK + AGENDA + NOTIFICACIONES INTELIGENTES) 🛡️
 // ==========================================
 app.post('/api/transaccion/comprar', async (req, res) => {
   const authHeader = req.headers['authorization'];
@@ -971,15 +971,16 @@ app.post('/api/transaccion/comprar', async (req, res) => {
 
     await client.query('BEGIN');
 
-    // 2. Buscamos al vendedor (Solo para validar, no calculamos socio aquí)
-    const localRes = await client.query('SELECT usuario_id FROM locales WHERE local_id = $1', [local_id]);
-
+    // 2. Buscamos al vendedor
+    const localRes = await client.query('SELECT usuario_id, nombre FROM locales WHERE local_id = $1', [local_id]);
     if (localRes.rows.length === 0) throw new Error('Local no encontrado');
+    
     const vendedor_id = localRes.rows[0].usuario_id;
+    const nombreLocal = localRes.rows[0].nombre;
 
     if (comprador_id === vendedor_id) throw new Error('No puedes comprarte a ti mismo.');
 
-    // 3. LÓGICA DE CANJE DE CUPÓN (Se mantiene igual)
+    // 3. LÓGICA DE CANJE DE CUPÓN 🎟️
     let infoPremio = ""; 
     let tituloNotif = "¡Nueva Orden Entrante! 📦";
 
@@ -1001,6 +1002,7 @@ app.post('/api/transaccion/comprar', async (req, res) => {
         infoPremio = `\n🎁 DEBES ENTREGAR PREMIO: ${nombrePremio}`;
         tituloNotif = "¡Venta con PREMIO CANJEADO! 🎁";
 
+        // Insertamos el premio
         await client.query(`
             INSERT INTO transacciones_p2p 
             (comprador_id, vendedor_id, producto_global_id, cantidad, monto_total, estado, tipo_entrega, compra_uuid, nombre_snapshot, foto_snapshot, comision_plataforma, codigo_retiro)
@@ -1012,63 +1014,104 @@ app.post('/api/transaccion/comprar', async (req, res) => {
       }
     }
 
-    // 4. ITEMS PAGADOS (EFECTIVO)
+    // 4. PROCESAMIENTO DE ITEMS
     let montoTotalPedido = 0; 
+    let resumenAgenda = ""; // Acumulador de texto para turnos
     
     for (const item of items) {
-        // A. Validar y Descontar Stock
-        const stockQuery = `SELECT stock, global_id, tipo_item, nombre, foto_url FROM inventario_local WHERE inventario_id = $1 FOR UPDATE`;
-        const stockRes = await client.query(stockQuery, [item.inventario_id]);
+        // A. Obtener datos reales
+        const queryProd = `SELECT stock, global_id, tipo_item, nombre, foto_url, requiere_agenda, duracion_minutos FROM inventario_local WHERE inventario_id = $1 FOR UPDATE`;
+        const stockRes = await client.query(queryProd, [item.inventario_id]);
         
         if (stockRes.rows.length === 0) throw new Error(`Producto no disponible`);
         const datosReales = stockRes.rows[0];
 
-        if (datosReales.tipo_item === 'PRODUCTO_STOCK') {
-            if (datosReales.stock < item.cantidad) throw new Error(`Stock insuficiente para ${datosReales.nombre}`);
+        // B. Lógica según Tipo
+        let fechaInicio = null;
+        let fechaFin = null;
+
+        if (datosReales.requiere_agenda) {
+            // --- SERVICIO (AGENDA) ---
+            if (!item.fecha_reserva) throw new Error(`El servicio ${datosReales.nombre} requiere reservar un horario.`);
+            
+            fechaInicio = new Date(item.fecha_reserva); 
+            const duracionMs = (datosReales.duracion_minutos || 30) * 60000;
+            fechaFin = new Date(fechaInicio.getTime() + duracionMs);
+
+            // Validar Colisión
+            const colisionRes = await client.query(`
+                SELECT 1 FROM transacciones_p2p 
+                WHERE vendedor_id = $1 AND estado NOT IN ('CANCELADO', 'RECHAZADO')
+                AND ((fecha_reserva_inicio < $3 AND fecha_reserva_fin > $2))
+            `, [vendedor_id, fechaInicio.toISOString(), fechaFin.toISOString()]);
+
+            if (colisionRes.rows.length > 0) throw new Error(`El turno ${datosReales.nombre} ya fue ocupado.`);
+
+            // 📝 Agregamos al resumen de agenda para el mensaje final
+            // Usamos UTC para asegurar consistencia, o ajustamos timezone si es necesario
+            const dia = fechaInicio.getDate().toString().padStart(2, '0');
+            const mes = (fechaInicio.getMonth() + 1).toString().padStart(2, '0');
+            const hora = fechaInicio.getHours().toString().padStart(2, '0');
+            const min = fechaInicio.getMinutes().toString().padStart(2, '0');
+            
+            resumenAgenda += `\n📅 ${datosReales.nombre}: ${dia}/${mes} a las ${hora}:${min}hs`;
+
+        } else if (datosReales.tipo_item === 'PRODUCTO_STOCK') {
+            // --- PRODUCTO FÍSICO ---
+            if (datosReales.stock < item.cantidad) throw new Error(`Stock insuficiente: ${datosReales.nombre}`);
             await client.query('UPDATE inventario_local SET stock = stock - $1 WHERE inventario_id = $2', [item.cantidad, item.inventario_id]);
         }
 
-        // B. Cálculos (SIN COMISIÓN)
+        // C. Insertar
         const totalItem = item.precio * item.cantidad;
         montoTotalPedido += totalItem;
-
-        // 🔥 CAMBIO CRÍTICO: La comisión es 0 porque es efectivo.
-        // CercaMío no cobra, Socio no cobra.
-        const comisionItem = 0; 
-
-        // C. Insertar Transacción
-        const insertTx = `
-            INSERT INTO transacciones_p2p 
-            (comprador_id, vendedor_id, producto_global_id, cantidad, monto_total, estado, tipo_entrega, compra_uuid, nombre_snapshot, foto_snapshot, comision_plataforma, codigo_retiro)
-            VALUES ($1, $2, $3, $4, $5, 'PENDIENTE_PAGO', $6, $7, $8, $9, $10, $11)
-        `;
         
-        await client.query(insertTx, [
-            comprador_id, 
-            vendedor_id, 
-            datosReales.global_id, 
-            item.cantidad, 
-            totalItem, 
-            tipo_entrega,
-            compraUuid,
-            datosReales.nombre,   
-            datosReales.foto_url,
-            comisionItem, // ES CERO
-            codigoRetiro
+        await client.query(`
+            INSERT INTO transacciones_p2p 
+            (
+                comprador_id, vendedor_id, producto_global_id, cantidad, monto_total, 
+                estado, tipo_entrega, compra_uuid, nombre_snapshot, foto_snapshot, 
+                comision_plataforma, codigo_retiro,
+                fecha_reserva_inicio, fecha_reserva_fin
+            )
+            VALUES ($1, $2, $3, $4, $5, 'PENDIENTE_PAGO', $6, $7, $8, $9, $10, $11, $12, $13)
+        `, [
+            comprador_id, vendedor_id, datosReales.global_id, item.cantidad, totalItem, 
+            tipo_entrega, compraUuid, datosReales.nombre, datosReales.foto_url, 
+            0, // Comisión 0 en efectivo
+            codigoRetiro, fechaInicio, fechaFin
         ]);
     }
 
-    // 5. REPARTO SOCIO: ELIMINADO 🗑️
-    // En esta ruta (Efectivo) no ejecutamos lógica de socios.
-    // El socio solo gana si entra por Webhook (Mercado Pago).
-
     await client.query('COMMIT');
 
-    // 6. Notificar
-    const mensajeVendedor = `${nombreComprador} hizo un pedido por $${montoTotalPedido}. Estado: PENDIENTE DE COBRO.${infoPremio}`;
-    enviarNotificacion(vendedor_id, tituloNotif, mensajeVendedor);
+    // 6. NOTIFICACIONES HÍBRIDAS INTELIGENTES 🔔
+    
+    // A. MENSAJE AL VENDEDOR
+    // Construimos el mensaje base con el monto y estado
+    let cuerpoVendedor = `${nombreComprador} hizo un pedido por $${montoTotalPedido}. Estado: PENDIENTE DE COBRO.${infoPremio}`;
+    
+    // Si hay agenda, la anexamos
+    if (resumenAgenda) {
+        cuerpoVendedor += `\n\nTURNOS SOLICITADOS:${resumenAgenda}`;
+    }
+    
+    enviarNotificacion(vendedor_id, tituloNotif, cuerpoVendedor, { tipo: 'VENTA', uuid: compraUuid });
 
-    enviarNotificacion(comprador_id, "Pedido Realizado ⏳", `Tu pedido está pendiente de pago. Código: ${codigoRetiro}`);
+
+    // B. MENSAJE AL COMPRADOR
+    // Mensaje base confirmando el local
+    let cuerpoComprador = `Tu pedido en ${nombreLocal} está registrado.`;
+    
+    // Si hay agenda, le recordamos sus turnos
+    if (resumenAgenda) {
+        cuerpoComprador += `\n\nGUARDÁ TU TURNO:${resumenAgenda}`;
+    }
+    
+    // El código de retiro SIEMPRE va (para productos o servicios)
+    cuerpoComprador += `\n\nCódigo: ${codigoRetiro}`;
+    
+    enviarNotificacion(comprador_id, "Pedido Realizado ⏳", cuerpoComprador, { tipo: 'COMPRA', uuid: compraUuid });
 
     res.json({ mensaje: 'Compra realizada con éxito', orden_id: compraUuid });
 
@@ -4759,6 +4802,259 @@ app.put('/api/mi-negocio/producto/cambiar-categoria', async (req, res) => {
     res.status(400).json({ error: error.message.replace('Error: ', '') }); 
   } finally {
     client.release();
+  }
+});
+
+// ==========================================
+// RUTA 51: GUARDAR CONFIGURACIÓN DE AGENDA 📅
+// ==========================================
+app.post('/api/mi-negocio/agenda', async (req, res) => {
+  const authHeader = req.headers['authorization'];
+  if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
+  const token = authHeader.split(' ')[1];
+
+  // Recibimos la configuración completa
+  // dias_activos debe ser un array ej: [1, 2, 6, 7] (Lunes, Martes, Sabado, Domingo)
+  const { dias_activos, hora_inicio, hora_fin, intervalo, descanso_inicio, descanso_fin } = req.body;
+
+  try {
+    const usuario = jwt.verify(token, process.env.JWT_SECRET);
+    
+    // 1. Obtener ID del local
+    const localRes = await pool.query('SELECT local_id FROM locales WHERE usuario_id = $1', [usuario.id]);
+    if (localRes.rows.length === 0) return res.status(404).json({ error: 'Local no encontrado' });
+    const localId = localRes.rows[0].local_id;
+
+    // 2. UPSERT (Insertar o Actualizar si ya existe)
+    // Usamos ON CONFLICT para manejar la unicidad
+    const query = `
+      INSERT INTO agenda_config (local_id, dias_activos, hora_inicio, hora_fin, duracion_turno_minutos, hora_descanso_inicio, hora_descanso_fin)
+      VALUES ($1, $2, $3, $4, $5, $6, $7)
+      ON CONFLICT (local_id) 
+      DO UPDATE SET 
+        dias_activos = EXCLUDED.dias_activos,
+        hora_inicio = EXCLUDED.hora_inicio,
+        hora_fin = EXCLUDED.hora_fin,
+        duracion_turno_minutos = EXCLUDED.duracion_turno_minutos,
+        hora_descanso_inicio = EXCLUDED.hora_descanso_inicio,
+        hora_descanso_fin = EXCLUDED.hora_descanso_fin
+    `;
+
+    await pool.query(query, [
+        localId, 
+        JSON.stringify(dias_activos), // Postgres pide JSON stringificado
+        hora_inicio, 
+        hora_fin, 
+        intervalo, 
+        descanso_inicio || null, 
+        descanso_fin || null
+    ]);
+
+    res.json({ mensaje: 'Agenda actualizada correctamente' });
+
+  } catch (error) {
+    console.error("Error guardando agenda:", error);
+    res.status(500).json({ error: 'Error al guardar agenda' });
+  }
+});
+
+// ==========================================
+// RUTA 52: CALCULAR TURNOS DISPONIBLES (ALGORITMO DE TIEMPO) ⏳
+// ==========================================
+app.get('/api/turnos/disponibles', async (req, res) => {
+  const { local_id, fecha, duracion_minutos } = req.query; 
+  // fecha formato: 'YYYY-MM-DD'
+  // duracion_minutos: El tiempo que dura el servicio que el cliente quiere comprar
+
+  if (!local_id || !fecha) return res.status(400).json({ error: 'Faltan datos' });
+
+  try {
+    // 1. Obtener Configuración del Local
+    const configRes = await pool.query('SELECT * FROM agenda_config WHERE local_id = $1', [local_id]);
+    if (configRes.rows.length === 0) return res.json([]); // Local no configuró agenda
+
+    const config = configRes.rows[0];
+    
+    // 2. Verificar si abre ese día de la semana
+    const fechaObj = new Date(fecha + 'T00:00:00'); // Forzamos local time o UTC consistente
+    let diaSemana = fechaObj.getDay(); 
+    if (diaSemana === 0) diaSemana = 7; // Convertir Domingo (0) a 7 para coincidir con tu lógica (1-7)
+    
+    // config.dias_activos es un array [1, 2, ...]. Verificamos si incluye el día.
+    if (!config.dias_activos.includes(diaSemana)) {
+        return res.json([]); // Cerrado ese día
+    }
+
+    // 3. Obtener Reservas YA OOCUPADAS ese día
+    // Buscamos cualquier venta que no esté cancelada/rechazada
+    const reservasRes = await pool.query(`
+        SELECT fecha_reserva_inicio, fecha_reserva_fin 
+        FROM transacciones_p2p 
+        WHERE vendedor_id = (SELECT usuario_id FROM locales WHERE local_id = $1)
+        AND estado NOT IN ('CANCELADO', 'RECHAZADO')
+        AND fecha_reserva_inicio::date = $2::date
+    `, [local_id, fecha]);
+
+    const reservas = reservasRes.rows.map(r => ({
+        inicio: new Date(r.fecha_reserva_inicio).getTime(),
+        fin: new Date(r.fecha_reserva_fin).getTime()
+    }));
+
+    // 4. GENERAR SLOTS (HUECOS)
+    const turnosDisponibles = [];
+    
+    // Convertimos horas string "09:00:00" a minutos del día (0 a 1440)
+    const timeToMins = (t) => {
+        const [h, m] = t.split(':').map(Number);
+        return h * 60 + m;
+    };
+
+    let minutoActual = timeToMins(config.hora_inicio);
+    const minutoFinDia = timeToMins(config.hora_fin);
+    const duracionServicio = parseInt(duracion_minutos) || config.duracion_turno_minutos; // Usamos la duración del servicio o el default
+
+    // Parseamos descanso si existe
+    let descansoInicio = config.hora_descanso_inicio ? timeToMins(config.hora_descanso_inicio) : -1;
+    let descansoFin = config.hora_descanso_fin ? timeToMins(config.hora_descanso_fin) : -1;
+
+    // Bucle para crear slots
+    while (minutoActual + duracionServicio <= minutoFinDia) {
+        
+        // Calcular timestamps exactos para este slot propuesto
+        // Construimos fecha base + minutos
+        const slotInicio = new Date(fechaObj);
+        slotInicio.setHours(Math.floor(minutoActual / 60), minutoActual % 60, 0, 0);
+        
+        const slotFin = new Date(slotInicio.getTime() + duracionServicio * 60000);
+
+        // A. Chequeo de Descanso
+        let caeEnDescanso = false;
+        if (descansoInicio !== -1) {
+            // Si el slot empieza o termina dentro del descanso
+            if ((minutoActual >= descansoInicio && minutoActual < descansoFin) ||
+                (minutoActual + duracionServicio > descansoInicio && minutoActual + duracionServicio <= descansoFin)) {
+                caeEnDescanso = true;
+            }
+        }
+
+        // B. Chequeo de Colisión con Reservas (El "Tetris")
+        let estaOcupado = false;
+        const slotStartMs = slotInicio.getTime();
+        const slotEndMs = slotFin.getTime();
+
+        for (const reserva of reservas) {
+            // Si se solapan: (StartA < EndB) and (EndA > StartB)
+            if (slotStartMs < reserva.fin && slotEndMs > reserva.inicio) {
+                estaOcupado = true;
+                break;
+            }
+        }
+
+        // Si pasa todas las pruebas, lo agregamos
+        if (!caeEnDescanso && !estaOcupado) {
+            // Formato bonito para el Frontend: "09:00"
+            const horaStr = `${slotInicio.getHours().toString().padStart(2, '0')}:${slotInicio.getMinutes().toString().padStart(2, '0')}`;
+            turnosDisponibles.push(horaStr);
+        }
+
+        // Avanzamos al siguiente slot (puedes configurar el "step" aquí, ej: cada 30 min)
+        minutoActual += config.duracion_turno_minutos; // Saltamos según la grilla del local
+    }
+
+    res.json(turnosDisponibles);
+
+  } catch (error) {
+    console.error("Error calculando turnos:", error);
+    res.status(500).json({ error: 'Error al calcular disponibilidad' });
+  }
+});
+
+// ==========================================
+// CRON JOB: AGENDA DIARIA INTELIGENTE (05:00 AM ARG / 08:00 UTC) ⏰
+// ==========================================
+cron.schedule('0 8 * * *', async () => {
+  console.log('⏰ Generando resumen de agenda del día...');
+  
+  try {
+    // 1. OBTENER TODOS LOS TURNOS ACTIVOS DE HOY
+    // Usamos AT TIME ZONE para asegurar que 'CURRENT_DATE' sea la fecha de Argentina, no la del servidor
+    const query = `
+      SELECT 
+        t.fecha_reserva_inicio,
+        t.nombre_snapshot as servicio,
+        l.nombre as local_nombre,
+        u_comprador.usuario_id as comprador_id,
+        u_vendedor.usuario_id as vendedor_id
+      FROM transacciones_p2p t
+      JOIN locales l ON t.vendedor_id = l.usuario_id
+      JOIN usuarios u_comprador ON t.comprador_id = u_comprador.usuario_id
+      JOIN usuarios u_vendedor ON l.usuario_id = u_vendedor.usuario_id
+      WHERE 
+        (t.fecha_reserva_inicio AT TIME ZONE 'UTC' AT TIME ZONE 'America/Argentina/Buenos_Aires')::date = (NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Argentina/Buenos_Aires')::date
+        AND t.estado NOT IN ('CANCELADO', 'RECHAZADO', 'ENTREGADO')
+      ORDER BY t.fecha_reserva_inicio ASC
+    `;
+    
+    const res = await pool.query(query);
+    
+    if (res.rows.length === 0) {
+        console.log("✅ Agenda tranquila: No hay turnos para hoy.");
+        return;
+    }
+
+    // 2. AGRUPAR POR USUARIO (CEREBRO DEL BATCHING 🧠)
+    const agendaCompradores = {};
+    const agendaVendedores = {};
+
+    res.rows.forEach(turno => {
+        // Formato Hora: 09:30
+        const hora = new Date(turno.fecha_reserva_inicio).toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Argentina/Buenos_Aires' });
+        
+        // Agrupar Comprador
+        if (!agendaCompradores[turno.comprador_id]) agendaCompradores[turno.comprador_id] = [];
+        agendaCompradores[turno.comprador_id].push(`▪ ${hora}hs - ${turno.servicio} en ${turno.local_nombre}`);
+
+        // Agrupar Vendedor
+        if (!agendaVendedores[turno.vendedor_id]) agendaVendedores[turno.vendedor_id] = [];
+        agendaVendedores[turno.vendedor_id].push(`▪ ${hora}hs - ${turno.servicio}`);
+    });
+
+    // 3. ENVIAR RESÚMENES A COMPRADORES 👤
+    for (const [id, lista] of Object.entries(agendaCompradores)) {
+        let titulo = "¡Tienes turno hoy! 📅";
+        let cuerpo = "";
+
+        if (lista.length === 1) {
+            // Mensaje Simple
+            cuerpo = lista[0].replace('▪ ', 'Recuerda tu cita: ');
+        } else {
+            // Mensaje Múltiple (Lista)
+            titulo = `📅 Agenda: Tienes ${lista.length} turnos hoy`;
+            cuerpo = "Tu itinerario del día:\n\n" + lista.join("\n");
+        }
+
+        enviarNotificacion(id, titulo, cuerpo, { tipo: 'COMPRA' });
+    }
+
+    // 4. ENVIAR RESÚMENES A VENDEDORES 🏢
+    for (const [id, lista] of Object.entries(agendaVendedores)) {
+        let titulo = "Agenda del Día 📅";
+        let cuerpo = "";
+
+        if (lista.length === 1) {
+            cuerpo = `Tienes 1 cliente agendado:\n${lista[0]}`;
+        } else {
+            titulo = `📅 Hoy: ${lista.length} Clientes`;
+            cuerpo = "Tu agenda para hoy:\n\n" + lista.join("\n") + "\n\n¡Éxitos en las ventas!";
+        }
+
+        enviarNotificacion(id, titulo, cuerpo, { tipo: 'VENTA' });
+    }
+    
+    console.log(`✅ Recordatorios enviados a ${Object.keys(agendaCompradores).length} compradores y ${Object.keys(agendaVendedores).length} vendedores.`);
+
+  } catch (error) {
+    console.error("❌ Error en Cron Recordatorios:", error);
   }
 });
 
