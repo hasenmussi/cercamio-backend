@@ -2774,6 +2774,28 @@ app.get('/api/historias/feed', async (req, res) => {
   }
 });
 
+// RUTA: REPORTAR HISTORIA (MODO SEGURO: SOLO REGISTRA) 🛡️
+app.post('/api/historias/:id/reportar', async (req, res) => {
+  const { id } = req.params;
+  const { motivo } = req.body; // Ej: 'INAPROPIADO', 'OFENSIVO'
+
+  try {
+    // Solo insertamos la denuncia en la "Buzón de Quejas"
+    // No tocamos la historia original. Inocente hasta que se demuestre lo contrario.
+    await pool.query(
+      'INSERT INTO denuncias_historias (historia_id, motivo, fecha_denuncia) VALUES ($1, $2, NOW())',
+      [id, motivo || 'GENERAL']
+    );
+
+    res.json({ success: true, mensaje: 'Reporte enviado a revisión.' });
+
+  } catch (error) {
+    console.error("Error reporte:", error);
+    // Respondemos success aunque falle para no alertar al usuario malintencionado
+    res.json({ success: true }); 
+  }
+});
+
 // ==========================================
 // RUTA 32: GUARDAR CONFIG FIDELIZACIÓN (VENDEDOR)
 // ==========================================
