@@ -1,9 +1,0 @@
-# Dependencias de Node (nunca se suben)
-node_modules/
-
-# Archivos de entorno y secretos
-.env
-serviceAccountKey.json
-
-# Logs
-npm-debug.log
