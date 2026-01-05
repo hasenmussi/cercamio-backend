@@ -1737,13 +1737,19 @@ app.get('/api/perfil-publico/:id', async (req, res) => {
         
         -- Datos de Oferta
         I.categoria_interna,
-        I.precio_regular
+        I.precio_regular,
+
+        -- 🔥 DATOS DE AGENDA (FALTABAN AQUÍ) 🔥
+        I.requiere_agenda,
+        I.duracion_minutos
 
       FROM inventario_local I 
       LEFT JOIN catalogo_global C ON I.global_id = C.global_id 
       WHERE I.local_id = $1
       AND I.stock > 0        -- FILTRO DE SEGURIDAD 1 (Hay mercadería)
-      AND I.precio > 0       -- FILTRO DE SEGURIDAD 2 (Tiene precio real)
+      
+      -- Filtro Stock: Si es agenda (servicio), ignoramos stock. Si es producto, debe ser > 0
+      AND (I.requiere_agenda = TRUE OR I.stock > 0)
       
       -- 🔥 ORDENAMIENTO ESTRATÉGICO 🔥
       -- 1. Ofertas Flash (Urgente)
