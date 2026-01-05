@@ -2532,7 +2532,8 @@ app.post('/api/mi-negocio/responder-solicitud', async (req, res) => {
     enviarNotificacion(
       compradorId,
       `💬 ¡Respuesta de ${local.nombre}!`,
-      `${mensaje}. Toca para ver detalle.`
+      `${mensaje}. Toca para ver detalle.`,
+      { tipo: 'RESPUESTA_SOLICITUD' }
     );
 
     res.json({ mensaje: 'Respuesta enviada' });
@@ -2636,7 +2637,7 @@ app.post('/api/solicitudes/expandir', async (req, res) => {
 
     destinatarios.rows.forEach(vendedor => {
       if (vendedor.fcm_token) {
-        enviarNotificacion(vendedor.usuario_id, `📢 (Radio Ampliado) Alguien busca: ${solicitud.categoria_nombre}`, `Vecino necesita: "${solicitud.mensaje}"`);
+        enviarNotificacion(vendedor.usuario_id, `📢 (Radio Ampliado) Alguien busca: ${solicitud.categoria_nombre}`, `Vecino necesita: "${solicitud.mensaje}"`, { tipo: 'NUEVA_OPORTUNIDAD' });
       }
     });
 
@@ -4990,6 +4991,37 @@ app.get('/api/turnos/disponibles', async (req, res) => {
   } catch (error) {
     console.error("Error calculando turnos:", error);
     res.status(500).json({ error: 'Error al calcular disponibilidad' });
+  }
+});
+
+// ==========================================
+// RUTA 53: OBTENER CONFIGURACIÓN DE AGENDA 📅
+// ==========================================
+app.get('/api/mi-negocio/agenda', async (req, res) => {
+  const authHeader = req.headers['authorization'];
+  if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
+  const token = authHeader.split(' ')[1];
+
+  try {
+    const usuario = jwt.verify(token, process.env.JWT_SECRET);
+    
+    // Obtenemos local
+    const localRes = await pool.query('SELECT local_id FROM locales WHERE usuario_id = $1', [usuario.id]);
+    if (localRes.rows.length === 0) return res.status(404).json({ error: 'Local no encontrado' });
+    const localId = localRes.rows[0].local_id;
+
+    // Buscamos la config
+    const configRes = await pool.query('SELECT * FROM agenda_config WHERE local_id = $1', [localId]);
+
+    if (configRes.rows.length > 0) {
+      res.json(configRes.rows[0]); // Devolvemos la config guardada
+    } else {
+      res.json(null); // No configuró nada aún (el frontend usará defaults)
+    }
+
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Error al obtener agenda' });
   }
 });
 
