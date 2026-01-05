@@ -431,7 +431,7 @@ app.get('/api/locales', async (req, res) => {
 });
 
 // ==========================================
-// RUTA 2: BUSCADOR AVANZADO (TRIGRAMAS + GEO + FILTROS) 🔍
+// RUTA 2: BUSCADOR AVANZADO (HÍBRIDO: PRODUCTOS + SERVICIOS) 🔍
 // ==========================================
 app.get('/api/buscar', async (req, res) => {
   const { q, lat, lng } = req.query; 
@@ -444,7 +444,6 @@ app.get('/api/buscar', async (req, res) => {
   }
 
   try {
-    // Preparamos el término para búsqueda parcial (%texto%)
     const terminoBusqueda = `%${q}%`;
 
     const consulta = `
@@ -452,12 +451,17 @@ app.get('/api/buscar', async (req, res) => {
         L.local_id,
         I.inventario_id,
         
-        -- DATOS INTELIGENTES (COALESCE)
+        -- DATOS INTELIGENTES
         COALESCE(I.nombre, C.nombre_oficial) as nombre_oficial, 
         COALESCE(I.descripcion, C.descripcion) as descripcion,
         COALESCE(I.foto_url, C.foto_url) as foto_producto,
         
         I.precio, 
+        
+        -- 🔥 DATOS DE AGENDA (AGREGADOS)
+        I.requiere_agenda,
+        I.duracion_minutos,
+
         L.nombre as tienda,
         L.categoria,
         L.rubro,
@@ -465,16 +469,16 @@ app.get('/api/buscar', async (req, res) => {
         L.reputacion,
         L.whatsapp,
         
-        -- FOTO DEL LOCAL (Con lógica de perfil nueva)
+        -- FOTO DEL LOCAL
         COALESCE(L.foto_perfil, L.foto_url) as foto_local,
 
         ST_X(L.ubicacion::geometry) as long, 
         ST_Y(L.ubicacion::geometry) as lat,
         
-        -- Distancia Real
+        -- Distancia Real (Metros exactos usando Geography)
         ST_Distance(
-          L.ubicacion::geometry, 
-          ST_SetSRID(ST_MakePoint($2, $3), 4326)::geometry
+          L.ubicacion::geography, 
+          ST_SetSRID(ST_MakePoint($2, $3), 4326)::geography
         ) as distancia_metros
 
       FROM inventario_local I
@@ -482,37 +486,35 @@ app.get('/api/buscar', async (req, res) => {
       JOIN locales L ON I.local_id = L.local_id
       
       WHERE 
-        -- 1. FILTRO GEOESPACIAL (Radio 10km)
+        -- 1. FILTRO GEOESPACIAL (Radio 10km - Usando Geography para precisión)
         ST_DWithin(
-          L.ubicacion::geometry,
-          ST_SetSRID(ST_MakePoint($2, $3), 4326)::geometry,
+          L.ubicacion::geography,
+          ST_SetSRID(ST_MakePoint($2, $3), 4326)::geography,
           10000 
         )
         AND
-        -- 2. FILTRO DE SEGURIDAD (Solo productos vendibles)
-        I.stock > 0 AND I.precio > 0
+        -- 2. FILTRO DE VISIBILIDAD (CORREGIDO)
+        -- Debe tener precio Y (tener stock O ser servicio)
+        I.precio > 0 
+        AND (I.stock > 0 OR I.requiere_agenda = TRUE)
+        
         AND
-        -- 3. BÚSQUEDA INTELIGENTE (Usa los índices GIN creados)
+        -- 3. BÚSQUEDA INTELIGENTE
         (
-          -- Busca en nombre del producto (sin acentos)
           public.immutable_unaccent(COALESCE(I.nombre, C.nombre_oficial)) ILIKE public.immutable_unaccent($1)
           OR 
-          -- Busca en descripción del producto
           public.immutable_unaccent(COALESCE(I.descripcion, C.descripcion)) ILIKE public.immutable_unaccent($1)
           OR
-          -- Busca en nombre de la tienda
           public.immutable_unaccent(L.nombre) ILIKE public.immutable_unaccent($1)
           OR 
-          -- Busca en el rubro (ej: "Ferretería")
           public.immutable_unaccent(L.rubro) ILIKE public.immutable_unaccent($1)
         )
 
-      -- ORDENAMIENTO: Primero lo más cerca
+      -- ORDENAMIENTO
       ORDER BY distancia_metros ASC
-      LIMIT 50 -- Límite para no saturar la red
+      LIMIT 50
     `;
     
-    // Parámetros: [Query con %, Longitud, Latitud]
     const respuesta = await pool.query(consulta, [terminoBusqueda, parseFloat(lng), parseFloat(lat)]);
     
     res.json(respuesta.rows);
