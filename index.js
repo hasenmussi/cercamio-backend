@@ -915,6 +915,33 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
+// ==========================================
+// RUTA 49: LOGOUT (DESVINCULAR DISPOSITIVO) 🔌
+// ==========================================
+app.post('/api/auth/logout', async (req, res) => {
+  const authHeader = req.headers['authorization'];
+  if (!authHeader) return res.status(200).send('OK'); // Si no hay token, no hacemos nada
+
+  try {
+    const token = authHeader.split(' ')[1];
+    // Intentamos verificar. Si el token expiró, no importa, igual intentamos limpiar por ID si pudiéramos
+    // Pero por seguridad JWT, decodificamos:
+    const usuario = jwt.decode(token); // Usamos decode en vez de verify para no fallar si expiró
+    
+    if (usuario && usuario.id) {
+       // BORRAMOS EL TOKEN DE LA BASE DE DATOS
+       await pool.query('UPDATE usuarios SET fcm_token = NULL WHERE usuario_id = $1', [usuario.id]);
+       console.log(`🔌 Token FCM eliminado para usuario ${usuario.id}`);
+    }
+    
+    res.json({ mensaje: 'Sesión cerrada y dispositivo desvinculado' });
+
+  } catch (error) {
+    console.error("Error en logout:", error);
+    res.status(200).send('OK'); // Respondemos OK para no trabar la app
+  }
+});
+
 // RUTA 8: MIS COMPRAS (HISTORIAL COMPLETO CON OTP)
 app.get('/api/transaccion/mis-compras', async (req, res) => {
   const authHeader = req.headers['authorization'];
