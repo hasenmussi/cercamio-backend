@@ -5581,6 +5581,36 @@ app.post('/api/mi-negocio/importar-excel/confirmar', async (req, res) => {
   }
 });
 
+// ==========================================
+// RUTA 56: DESCARGAR PLANTILLA EXCEL (PLAN B) 📉
+// ==========================================
+app.get('/api/mi-negocio/importar-excel/plantilla', (req, res) => {
+  try {
+    // 1. Datos de Ejemplo
+    const datosEjemplo = [
+      { Nombre: "Coca Cola 1.5L", Precio: 1500, Stock: 50, Codigo: "779123456" },
+      { Nombre: "Alfajor Chocolate", Precio: 800, Stock: 100, Codigo: "779987654" },
+      { Nombre: "Galletitas", Precio: 1200, Stock: 20, Codigo: "" }
+    ];
+
+    // 2. Crear Libro de Excel
+    const ws = xlsx.utils.json_to_sheet(datosEjemplo);
+    const wb = xlsx.utils.book_new();
+    xlsx.utils.book_append_sheet(wb, ws, "Plantilla CercaMio");
+
+    // 3. Generar Buffer
+    const buffer = xlsx.write(wb, { type: 'buffer', bookType: 'xlsx' });
+
+    // 4. Enviar como Descarga
+    res.setHeader('Content-Disposition', 'attachment; filename="Plantilla_CercaMio.xlsx"');
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.send(buffer);
+
+  } catch (error) {
+    console.error("Error generando plantilla:", error);
+    res.status(500).send("Error al generar plantilla");
+  }
+});
 
 // ENCENDEMOS EL SERVIDOR
 app.listen(port, () => {
