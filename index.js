@@ -524,7 +524,7 @@ app.get('/api/buscar', async (req, res) => {
 });
 
 // ==========================================
-// RUTA 6: VER MIS PRODUCTOS (CON ORDENAMIENTO DE OFERTAS) 🏆
+// RUTA 6: VER MIS PRODUCTOS (HÍBRIDO + OFERTAS + AGENDA) 🏆
 // ==========================================
 app.get('/api/mi-negocio/productos', async (req, res) => {
   const authHeader = req.headers['authorization'];
@@ -534,7 +534,7 @@ app.get('/api/mi-negocio/productos', async (req, res) => {
   try {
     const usuario = jwt.verify(token, process.env.JWT_SECRET);
 
-    // 1. Obtener datos del Local
+    // 1. Obtener datos del Local (Tu lógica de estado/misiones)
     const localRes = await pool.query(
       'SELECT local_id, misiones_puntos, estado_manual, plan_tipo FROM locales WHERE usuario_id = $1',
       [usuario.id]
@@ -558,7 +558,11 @@ app.get('/api/mi-negocio/productos', async (req, res) => {
         
         -- Datos de Oferta
         I.categoria_interna,
-        I.precio_regular
+        I.precio_regular,
+
+        -- 🔥 DATOS DE AGENDA (AGREGADOS v13.1)
+        I.requiere_agenda,
+        I.duracion_minutos
 
       FROM inventario_local I
       JOIN locales L ON I.local_id = L.local_id
@@ -587,7 +591,7 @@ app.get('/api/mi-negocio/productos', async (req, res) => {
         estado_manual: datosLocal.estado_manual || 'AUTO',
         plan_tipo: datosLocal.plan_tipo
       },
-      items: productosRes.rows
+      items: productosRes.rows // Ahora los items traen la info de agenda
     });
 
   } catch (error) {
