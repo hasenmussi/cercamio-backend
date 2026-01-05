@@ -7,6 +7,7 @@ const cron = require('node-cron');
 const crypto = require('crypto');
 const nodemailer = require('nodemailer');
 const axios = require('axios');
+const xlsx = require('xlsx');
 
 // 2. CONFIGURACIÓN DE IMÁGENES (CLOUDINARY + MULTER)
 const cloudinary = require('cloudinary').v2;
@@ -41,6 +42,11 @@ const storagePrivado = new CloudinaryStorage({
 
 const upload = multer({ storage: storagePublico }); 
 const uploadPrivado = multer({ storage: storagePrivado }); 
+
+// C) Storage en MEMORIA (Para Excel temporal) 🧠
+// No guardamos en disco ni en nube, solo en RAM para procesar rápido
+const storageMemoria = multer.memoryStorage();
+const uploadMemoria = multer({ storage: storageMemoria });
 
 // 3. MERCADO PAGO (Solo importamos clases, instanciamos en las rutas)
 const { MercadoPagoConfig, Preference, Payment } = require('mercadopago');
@@ -5432,6 +5438,146 @@ app.delete('/api/agenda/bloquear/:id', async (req, res) => {
     res.json({ success: true });
   } catch (error) {
     res.status(500).json({ error: 'Error al eliminar bloqueo' });
+  }
+});
+
+// ==========================================
+// RUTA 54: ANALIZAR EXCEL (PREVISUALIZACIÓN) 📊
+// ==========================================
+app.post('/api/mi-negocio/importar-excel/analizar', uploadMemoria.single('archivo'), async (req, res) => {
+  const authHeader = req.headers['authorization'];
+  if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
+
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No se subió ningún archivo' });
+
+    // 1. LEER EL ARCHIVO DESDE LA MEMORIA RAM
+    const workbook = xlsx.read(req.file.buffer, { type: 'buffer' });
+    const sheetName = workbook.SheetNames[0]; // Leemos la primera hoja
+    const sheet = workbook.Sheets[sheetName];
+    
+    // Convertimos a JSON crudo (Array de objetos)
+    const rawData = xlsx.utils.sheet_to_json(sheet);
+
+    if (rawData.length === 0) return res.status(400).json({ error: 'El archivo está vacío' });
+
+    // 2. MAPEO INTELIGENTE (NORMALIZADOR) 🧠
+    // Convertimos las columnas del usuario a nuestras columnas
+    const productosProcesados = [];
+    let errores = 0;
+
+    for (let row of rawData) {
+        // Normalizamos claves a minúsculas para buscar patrones
+        let item = { nombre: '', precio: 0, stock: 0, codigo: '' };
+        let esValido = true;
+
+        Object.keys(row).forEach(key => {
+            const k = key.toLowerCase().trim();
+            const val = row[key];
+
+            // Detección de Nombre
+            if (k.includes('nombre') || k.includes('producto') || k.includes('item') || k.includes('titulo')) {
+                item.nombre = String(val).trim();
+            }
+            // Detección de Precio
+            else if (k.includes('precio') || k.includes('valor') || k.includes('costo') || k.includes('$')) {
+                item.precio = parseFloat(String(val).replace(/[^0-9.]/g, '')) || 0;
+            }
+            // Detección de Stock
+            else if (k.includes('stock') || k.includes('cant') || k.includes('unid')) {
+                item.stock = parseInt(val) || 0;
+            }
+            // Detección de Código
+            else if (k.includes('cod') || k.includes('ean') || k.includes('sku') || k.includes('barra')) {
+                item.codigo = String(val).trim();
+            }
+        });
+
+        // Validaciones mínimas
+        if (!item.nombre || item.precio <= 0) {
+            esValido = false;
+            errores++;
+        }
+
+        if (esValido) {
+            productosProcesados.push(item);
+        }
+    }
+
+    // 3. RESPONDER CON EL RESUMEN
+    res.json({
+        total_encontrados: rawData.length,
+        validos: productosProcesados.length,
+        errores: errores,
+        muestra: productosProcesados.slice(0, 5), // Mandamos los primeros 5 para que el usuario confirme
+        datos_completos: productosProcesados // Mandamos todo para que el frontend lo tenga listo para confirmar
+    });
+
+  } catch (error) {
+    console.error("Error leyendo Excel:", error);
+    res.status(500).json({ error: 'El archivo no es válido o está dañado.' });
+  }
+});
+
+// ==========================================
+// RUTA 55: CONFIRMAR IMPORTACIÓN (BULK INSERT) 🚀
+// ==========================================
+app.post('/api/mi-negocio/importar-excel/confirmar', async (req, res) => {
+  const authHeader = req.headers['authorization'];
+  if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
+  const token = authHeader.split(' ')[1];
+  
+  const { productos } = req.body; // Recibe el array 'datos_completos' del paso anterior
+
+  if (!productos || !Array.isArray(productos) || productos.length === 0) {
+      return res.status(400).json({ error: 'No hay datos para importar' });
+  }
+
+  const client = await pool.connect();
+
+  try {
+    const usuario = jwt.verify(token, process.env.JWT_SECRET);
+    
+    // Obtener Local
+    const localRes = await client.query('SELECT local_id, categoria, rubro FROM locales WHERE usuario_id = $1', [usuario.id]);
+    if (localRes.rows.length === 0) throw new Error('Local no encontrado');
+    const { local_id, categoria, rubro } = localRes.rows[0];
+
+    await client.query('BEGIN');
+
+    // INSERT MASIVO (Optinizado)
+    // Hacemos un loop simple dentro de la transacción. 
+    // Para miles de productos es mejor pg-format, pero para <500 esto es seguro y rápido.
+    
+    for (const p of productos) {
+        // 1. Insertar en Catálogo Global (Privado por defecto para no ensuciar)
+        // Usamos una foto genérica si no tienen
+        const fotoDefecto = 'https://cdn-icons-png.flaticon.com/512/2652/2652218.png'; // Icono de caja
+        
+        const resGlobal = await client.query(`
+            INSERT INTO catalogo_global (nombre_oficial, descripcion, foto_url, categoria, codigo_barras, creado_por_usuario_id)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            RETURNING global_id
+        `, [p.nombre, 'Importado desde Excel', fotoDefecto, categoria, p.codigo || null, usuario.id]);
+        
+        const globalId = resGlobal.rows[0].global_id;
+
+        // 2. Insertar en Inventario Local
+        await client.query(`
+            INSERT INTO inventario_local (local_id, global_id, precio, stock, tipo_item, codigo_barras, foto_url)
+            VALUES ($1, $2, $3, $4, 'PRODUCTO_STOCK', $5, $6)
+        `, [local_id, globalId, p.precio, p.stock, p.codigo || null, fotoDefecto]);
+    }
+
+    await client.query('COMMIT');
+    res.json({ mensaje: `¡Se importaron ${productos.length} productos correctamente!` });
+
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error("Error importando:", error);
+    res.status(500).json({ error: 'Error al guardar los datos en la base de datos.' });
+  } finally {
+    client.release();
   }
 });
 
