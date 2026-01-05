@@ -970,6 +970,10 @@ app.get('/api/transaccion/mis-compras', async (req, res) => {
         -- 🔥 DATOS NUEVOS PARA V11.0
         T.codigo_retiro,   -- Para mostrar el OTP al cliente
         T.motivo_rechazo,  -- Para explicar por qué se canceló
+
+        -- 🔥 DATO CRÍTICO AGREGADO:
+        -- Convertimos a ISO String para que Flutter detecte que es un servicio
+        TO_CHAR(T.fecha_reserva_inicio, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') as fecha_reserva_inicio,
         
         C.nombre_oficial as producto,
         C.foto_url,
@@ -1310,7 +1314,9 @@ app.get('/api/mi-negocio/ventas', async (req, res) => {
             'foto', COALESCE(T.foto_snapshot, C.foto_url),
             'transaccion_id', T.transaccion_id, -- <--- ESTO ES VITAL PARA RECHAZO PARCIAL
             'monto_total', T.monto_total,       -- <--- Necesario para saber cuánto reembolsar
-            'estado', T.estado                  -- <--- Para saber si este ítem específico ya fue cancelado
+            'estado', T.estado,                  -- <--- Para saber si este ítem específico ya fue cancelado
+            -- 🔥 DATO CRÍTICO AGREGADO:
+            'fecha_reserva_inicio', TO_CHAR(T.fecha_reserva_inicio, 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
         )) as productos
 
       FROM transacciones_p2p T
