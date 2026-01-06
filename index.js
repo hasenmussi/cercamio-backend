@@ -979,6 +979,9 @@ app.get('/api/transaccion/mis-compras', async (req, res) => {
         C.foto_url,
         L.nombre as tienda,
         L.whatsapp,
+        L.direccion_fisica, 
+        ST_Y(L.ubicacion::geometry) as lat_local, 
+        ST_X(L.ubicacion::geometry) as lng_local, 
         L.local_id, 
         CASE WHEN CAL.transaccion_id IS NOT NULL THEN true ELSE false END as ya_califico
       FROM transacciones_p2p T
@@ -1071,7 +1074,18 @@ app.post('/api/transaccion/comprar', async (req, res) => {
     
     for (const item of items) {
         // A. Obtener datos reales
-        const queryProd = `SELECT stock, global_id, tipo_item, nombre, foto_url, requiere_agenda, duracion_minutos FROM inventario_local WHERE inventario_id = $1 FOR UPDATE`;
+        const queryProd = `
+            SELECT 
+                I.stock, I.global_id, I.tipo_item, 
+                I.requiere_agenda, I.duracion_minutos,
+                -- Si I.nombre es null, usa C.nombre_oficial. Si ambos fallan, usa 'Producto'.
+                COALESCE(I.nombre, C.nombre_oficial, 'Producto') as nombre, 
+                COALESCE(I.foto_url, C.foto_url) as foto_url
+            FROM inventario_local I
+            LEFT JOIN catalogo_global C ON I.global_id = C.global_id
+            WHERE I.inventario_id = $1 
+            FOR UPDATE
+        `;
         const stockRes = await client.query(queryProd, [item.inventario_id]);
         
         if (stockRes.rows.length === 0) throw new Error(`Producto no disponible`);
@@ -3355,7 +3369,16 @@ app.post('/api/pagos/webhook', async (req, res) => {
               // 2. PROCESAR CADA PRODUCTO
               for (const item of itemsComprados) {
                  // A. Validar Stock y Datos Reales
-                 const queryProducto = `SELECT global_id, nombre, foto_url, tipo_item, stock FROM inventario_local WHERE inventario_id = $1 FOR UPDATE`;
+                 const queryProducto = `
+                    SELECT 
+                        I.stock, I.global_id, I.tipo_item,
+                        COALESCE(I.nombre, C.nombre_oficial, 'Producto') as nombre, -- <--- ARREGLO SNAPSHOT
+                        COALESCE(I.foto_url, C.foto_url) as foto_url
+                    FROM inventario_local I
+                    LEFT JOIN catalogo_global C ON I.global_id = C.global_id
+                    WHERE I.inventario_id = $1 
+                    FOR UPDATE
+                 `;
                  const prodRes = await clientDb.query(queryProducto, [item.id]);
                  
                  // Fallback seguro si borraron el producto mientras se pagaba
@@ -5195,18 +5218,18 @@ app.post('/api/transaccion/cancelar-turno', async (req, res) => {
 });
 
 // ==========================================
-// CRON JOB: AGENDA DIARIA INTELIGENTE (05:00 AM ARG / 08:00 UTC) ⏰
+// CRON JOB: AGENDA DIARIA (05:00 AM ARG / 08:00 UTC) ⏰
 // ==========================================
 cron.schedule('0 8 * * *', async () => {
-  console.log('⏰ Generando resumen de agenda del día...');
+  console.log('⏰ Generando resumen de agenda del día (Hora ARG)...');
   
   try {
-    // 1. OBTENER TODOS LOS TURNOS ACTIVOS DE HOY
-    // Usamos AT TIME ZONE para asegurar que 'CURRENT_DATE' sea la fecha de Argentina, no la del servidor
+    // 1. OBTENER TURNOS DE HOY (Validando fecha en zona horaria ARG)
     const query = `
       SELECT 
         t.fecha_reserva_inicio,
-        t.nombre_snapshot as servicio,
+        -- 🔥 CORRECCIÓN NULL: Si el snapshot falla, ponemos texto genérico
+        COALESCE(t.nombre_snapshot, 'Servicio Reservado') as servicio,
         l.nombre as local_nombre,
         u_comprador.usuario_id as comprador_id,
         u_vendedor.usuario_id as vendedor_id
@@ -5215,53 +5238,58 @@ cron.schedule('0 8 * * *', async () => {
       JOIN usuarios u_comprador ON t.comprador_id = u_comprador.usuario_id
       JOIN usuarios u_vendedor ON l.usuario_id = u_vendedor.usuario_id
       WHERE 
-        (t.fecha_reserva_inicio AT TIME ZONE 'UTC' AT TIME ZONE 'America/Argentina/Buenos_Aires')::date = (NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Argentina/Buenos_Aires')::date
+        -- Comparamos fechas convirtiendo la hora UTC del servidor a Hora ARG
+        (t.fecha_reserva_inicio AT TIME ZONE 'UTC' AT TIME ZONE 'America/Argentina/Buenos_Aires')::date = 
+        (NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Argentina/Buenos_Aires')::date
         AND t.estado NOT IN ('CANCELADO', 'RECHAZADO', 'ENTREGADO')
       ORDER BY t.fecha_reserva_inicio ASC
     `;
     
     const res = await pool.query(query);
     
-    if (res.rows.length === 0) {
-        console.log("✅ Agenda tranquila: No hay turnos para hoy.");
-        return;
-    }
+    if (res.rows.length === 0) return;
 
-    // 2. AGRUPAR POR USUARIO (CEREBRO DEL BATCHING 🧠)
+    // 2. AGRUPAR
     const agendaCompradores = {};
     const agendaVendedores = {};
 
+    // Helper para formato hora ARG (Ej: "09:00 AM")
+    const formatearHoraArg = (fechaISO) => {
+        return new Date(fechaISO).toLocaleTimeString('en-US', { 
+            timeZone: 'America/Argentina/Buenos_Aires',
+            hour: '2-digit', 
+            minute: '2-digit',
+            hour12: true 
+        });
+    };
+
     res.rows.forEach(turno => {
-        // Formato Hora: 09:30
-        const hora = new Date(turno.fecha_reserva_inicio).toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Argentina/Buenos_Aires' });
+        const hora = formatearHoraArg(turno.fecha_reserva_inicio);
         
         // Agrupar Comprador
         if (!agendaCompradores[turno.comprador_id]) agendaCompradores[turno.comprador_id] = [];
-        agendaCompradores[turno.comprador_id].push(`▪ ${hora}hs - ${turno.servicio} en ${turno.local_nombre}`);
+        agendaCompradores[turno.comprador_id].push(`▪ ${hora} - ${turno.servicio} en ${turno.local_nombre}`);
 
         // Agrupar Vendedor
         if (!agendaVendedores[turno.vendedor_id]) agendaVendedores[turno.vendedor_id] = [];
-        agendaVendedores[turno.vendedor_id].push(`▪ ${hora}hs - ${turno.servicio}`);
+        agendaVendedores[turno.vendedor_id].push(`▪ ${hora} - ${turno.servicio}`);
     });
 
-    // 3. ENVIAR RESÚMENES A COMPRADORES 👤
+    // 3. ENVIAR A COMPRADORES
     for (const [id, lista] of Object.entries(agendaCompradores)) {
         let titulo = "¡Tienes turno hoy! 📅";
         let cuerpo = "";
 
         if (lista.length === 1) {
-            // Mensaje Simple
             cuerpo = lista[0].replace('▪ ', 'Recuerda tu cita: ');
         } else {
-            // Mensaje Múltiple (Lista)
-            titulo = `📅 Agenda: Tienes ${lista.length} turnos hoy`;
-            cuerpo = "Tu itinerario del día:\n\n" + lista.join("\n");
+            titulo = `📅 Hoy tienes ${lista.length} turnos`;
+            cuerpo = "Tu itinerario:\n\n" + lista.join("\n");
         }
-
         enviarNotificacion(id, titulo, cuerpo, { tipo: 'COMPRA' });
     }
 
-    // 4. ENVIAR RESÚMENES A VENDEDORES 🏢
+    // 4. ENVIAR A VENDEDORES
     for (const [id, lista] of Object.entries(agendaVendedores)) {
         let titulo = "Agenda del Día 📅";
         let cuerpo = "";
@@ -5270,36 +5298,28 @@ cron.schedule('0 8 * * *', async () => {
             cuerpo = `Tienes 1 cliente agendado:\n${lista[0]}`;
         } else {
             titulo = `📅 Hoy: ${lista.length} Clientes`;
-            cuerpo = "Tu agenda para hoy:\n\n" + lista.join("\n") + "\n\n¡Éxitos en las ventas!";
+            cuerpo = "Tu agenda:\n\n" + lista.join("\n");
         }
-
         enviarNotificacion(id, titulo, cuerpo, { tipo: 'VENTA' });
     }
-    
-    console.log(`✅ Recordatorios enviados a ${Object.keys(agendaCompradores).length} compradores y ${Object.keys(agendaVendedores).length} vendedores.`);
 
   } catch (error) {
-    console.error("❌ Error en Cron Recordatorios:", error);
+    console.error("❌ Error Cron Diario:", error);
   }
 });
 
 // ==========================================
-// CRON JOB: RECORDATORIO "1 HORA ANTES" (CLIENTE) ⏳
-// Se ejecuta cada 15 minutos (para no perder ningún turno)
+// CRON JOB: RECORDATORIO "1 HORA ANTES" (CADA 15 MIN) ⏳
 // ==========================================
 cron.schedule('*/15 * * * *', async () => {
-  // console.log('⏰ Buscando turnos inminentes...');
-
   try {
-    // Buscamos turnos que arranquen entre 55 y 70 minutos desde AHORA.
-    // Esto crea una "ventana" para atrapar el turno justo 1 hora antes.
+    // Buscamos turnos en la ventana de [55 min a 70 min] desde AHORA
     const query = `
       SELECT 
         t.fecha_reserva_inicio,
-        t.nombre_snapshot as servicio,
+        COALESCE(t.nombre_snapshot, 'Servicio') as servicio, -- 🔥 Anti-Null
         l.nombre as local_nombre,
-        u.usuario_id as comprador_id,
-        u.nombre_completo as nombre_cliente
+        u.usuario_id as comprador_id
       FROM transacciones_p2p t
       JOIN locales l ON t.vendedor_id = l.usuario_id
       JOIN usuarios u ON t.comprador_id = u.usuario_id
@@ -5312,24 +5332,26 @@ cron.schedule('*/15 * * * *', async () => {
     const res = await pool.query(query);
 
     if (res.rows.length > 0) {
-      console.log(`🔔 Enviando recordatorios a ${res.rows.length} clientes.`);
+      console.log(`🔔 Enviando recordatorios inminentes a ${res.rows.length} usuarios.`);
       
       for (const turno of res.rows) {
-        // Formatear hora (Ej: 16:30)
-        const hora = new Date(turno.fecha_reserva_inicio).toLocaleTimeString('es-AR', { 
-            hour: '2-digit', minute: '2-digit', timeZone: 'America/Argentina/Buenos_Aires' 
+        // 🔥 CORRECCIÓN HORA ARGENTINA
+        const horaArg = new Date(turno.fecha_reserva_inicio).toLocaleTimeString('en-US', { 
+            timeZone: 'America/Argentina/Buenos_Aires',
+            hour: '2-digit', 
+            minute: '2-digit',
+            hour12: true // Para que salga AM/PM
         });
 
         // ENVIAR SOLO AL CLIENTE
         enviarNotificacion(
             turno.comprador_id, 
             "⏰ ¡Tu turno es en 1 hora!", 
-            `No olvides tu cita para ${turno.servicio} en ${turno.local_nombre} a las ${hora} hs.`,
+            `No olvides tu cita: ${turno.servicio} en ${turno.local_nombre} a las ${horaArg}.`,
             { tipo: 'COMPRA' }
         );
       }
     }
-
   } catch (error) {
     console.error("❌ Error Cron 1h:", error);
   }
