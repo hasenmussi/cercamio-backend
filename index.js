@@ -1073,18 +1073,17 @@ app.post('/api/transaccion/comprar', async (req, res) => {
     let resumenAgenda = ""; // Acumulador de texto para turnos
     
     for (const item of items) {
-        // A. Obtener datos reales
+        // A. Obtener datos reales y BLOQUEAR FILA (CORREGIDO: BLOQUEO ESPECÍFICO) 🛡️
         const queryProd = `
             SELECT 
                 I.stock, I.global_id, I.tipo_item, 
                 I.requiere_agenda, I.duracion_minutos,
-                -- Si I.nombre es null, usa C.nombre_oficial. Si ambos fallan, usa 'Producto'.
                 COALESCE(I.nombre, C.nombre_oficial, 'Producto') as nombre, 
                 COALESCE(I.foto_url, C.foto_url) as foto_url
             FROM inventario_local I
             LEFT JOIN catalogo_global C ON I.global_id = C.global_id
             WHERE I.inventario_id = $1 
-            FOR UPDATE
+            FOR UPDATE OF I  -- <--- 🔥 AQUÍ ESTÁ EL CAMBIO (Solo bloqueamos la tabla 'I')
         `;
         const stockRes = await client.query(queryProd, [item.inventario_id]);
         
@@ -1802,6 +1801,7 @@ app.get('/api/perfil-publico/:id', async (req, res) => {
       LEFT JOIN catalogo_global C ON I.global_id = C.global_id 
       WHERE I.local_id = $1
       AND I.stock > 0        -- FILTRO DE SEGURIDAD 1 (Hay mercadería)
+      AND I.precio > 0
       
       -- Filtro Stock: Si es agenda (servicio), ignoramos stock. Si es producto, debe ser > 0
       AND (I.requiere_agenda = TRUE OR I.stock > 0)
