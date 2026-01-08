@@ -2863,6 +2863,130 @@ app.post('/api/historias/:id/reportar', async (req, res) => {
 });
 
 // ==========================================
+// MÓDULO AUDIENCIAS Y MARKETING (V14.0) 👁️
+// ==========================================
+
+// RUTA 60: REGISTRAR VISTA DE HISTORIA (SILENCIOSA)
+app.post('/api/historias/:id/visto', async (req, res) => {
+  const authHeader = req.headers['authorization'];
+  if (!authHeader) return res.status(200).send('OK'); // Si no hay token (invitado), ignoramos
+  const { id } = req.params; // ID Historia
+
+  try {
+    const token = authHeader.split(' ')[1];
+    const usuario = jwt.verify(token, process.env.JWT_SECRET);
+
+    // Insertamos ignorando duplicados (ON CONFLICT) para velocidad
+    await pool.query(
+      `INSERT INTO historias_vistas (historia_id, usuario_id) VALUES ($1, $2) 
+       ON CONFLICT (historia_id, usuario_id) DO NOTHING`,
+      [id, usuario.id]
+    );
+
+    res.status(200).send('OK'); // Respuesta ultrarrápida
+  } catch (error) {
+    // No logueamos error para no ensuciar la consola con tokens vencidos, etc.
+    res.status(200).send('OK');
+  }
+});
+
+// RUTA 61: OBTENER AUDIENCIA DEL DÍA (PARA EL VENDEDOR) 📊
+app.get('/api/mi-negocio/estadisticas/audiencia', async (req, res) => {
+  const authHeader = req.headers['authorization'];
+  if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
+  const token = authHeader.split(' ')[1];
+
+  try {
+    const usuario = jwt.verify(token, process.env.JWT_SECRET);
+    
+    // 1. Obtener local
+    const localRes = await pool.query('SELECT local_id FROM locales WHERE usuario_id = $1', [usuario.id]);
+    if (localRes.rows.length === 0) return res.status(404).json({ error: 'No tienes local' });
+    const localId = localRes.rows[0].local_id;
+
+    // 2. Consulta Maestra de Audiencia
+    // Busca usuarios que vieron historias ACTIVAS (no vencidas) de este local
+    const query = `
+      SELECT DISTINCT ON (U.usuario_id)
+        U.usuario_id,
+        U.nombre_completo,
+        U.foto_url,
+        MAX(HV.fecha_vista) as ultima_vista,
+        -- Verificamos si ya es seguidor (favorito)
+        (SELECT COUNT(*) FROM favoritos F WHERE F.usuario_id = U.usuario_id AND F.local_id = $1) > 0 as es_seguidor,
+        -- Verificamos si ya le mandamos algo hoy (para no spammear)
+        (SELECT COUNT(*) FROM marketing_acciones MA WHERE MA.local_id = $1 AND MA.usuario_destino_id = U.usuario_id AND MA.fecha_accion > NOW() - INTERVAL '24 hours') > 0 as ya_contactado
+      FROM historias_vistas HV
+      JOIN historias H ON HV.historia_id = H.historia_id
+      JOIN usuarios U ON HV.usuario_id = U.usuario_id
+      WHERE H.local_id = $1
+      AND H.fecha_expiracion > NOW() -- Solo historias vivas
+      GROUP BY U.usuario_id, U.nombre_completo, U.foto_url
+      ORDER BY U.usuario_id, ultima_vista DESC
+    `;
+
+    const result = await pool.query(query, [localId]);
+    res.json(result.rows);
+
+  } catch (error) {
+    console.error("Error audiencia:", error);
+    res.status(500).json({ error: 'Error al cargar estadísticas' });
+  }
+});
+
+// RUTA 62: EJECUTAR ACCIÓN DE MARKETING (MIMO O INVITACIÓN) 🎁
+app.post('/api/mi-negocio/marketing/accion', async (req, res) => {
+  const authHeader = req.headers['authorization'];
+  if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
+  const token = authHeader.split(' ')[1];
+  
+  const { usuario_destino_id, tipo_accion } = req.body; // 'MIMO' o 'INVITAR'
+
+  try {
+    const usuario = jwt.verify(token, process.env.JWT_SECRET);
+    
+    // 1. Obtener datos del local (Nombre para la notificación)
+    const localRes = await pool.query('SELECT local_id, nombre, plan_tipo FROM locales WHERE usuario_id = $1', [usuario.id]);
+    const local = localRes.rows[0];
+
+    // 🛑 VALIDACIÓN PREMIUM: Solo locales PRO pueden hacer esto
+    if (local.plan_tipo !== 'PREMIUM') {
+        return res.status(403).json({ error: 'Esta función es exclusiva para Socios Premium 💎' });
+    }
+
+    // 2. Registrar Acción (Anti-Spam)
+    await pool.query(
+        'INSERT INTO marketing_acciones (local_id, usuario_destino_id, tipo_accion) VALUES ($1, $2, $3)',
+        [local.local_id, usuario_destino_id, tipo_accion]
+    );
+
+    // 3. Enviar Notificación al Cliente
+    if (tipo_accion === 'INVITAR') {
+        enviarNotificacion(
+            usuario_destino_id,
+            `👋 ¡${local.nombre} te invita!`,
+            "Les encantó que visitaras sus historias. Sigue al local para no perderte nada.",
+            { tipo: 'PERFIL_LOCAL', id: local.local_id.toString() } // Redirige al perfil para que le de Like
+        );
+    } 
+    else if (tipo_accion === 'MIMO') {
+        enviarNotificacion(
+            usuario_destino_id,
+            `🎁 ¡Regalo de ${local.nombre}!`,
+            "Te enviaron un descuento especial. ¡Pasa por el local a usarlo!",
+            { tipo: 'PERFIL_LOCAL', id: local.local_id.toString() } // Por ahora al perfil, luego al cupón
+        );
+    }
+
+    res.json({ success: true, mensaje: 'Acción enviada con éxito' });
+
+  } catch (error) {
+    console.error("Error marketing:", error);
+    res.status(500).json({ error: 'Error al procesar acción' });
+  }
+});
+
+// ==========================================
 // RUTA 32: GUARDAR CONFIG FIDELIZACIÓN (VENDEDOR)
 // ==========================================
 app.post('/api/mi-negocio/fidelizacion', async (req, res) => {
@@ -5221,14 +5345,18 @@ app.post('/api/transaccion/cancelar-turno', async (req, res) => {
 // CRON JOB: AGENDA DIARIA (05:00 AM ARG / 08:00 UTC) ⏰
 // ==========================================
 cron.schedule('0 8 * * *', async () => {
-  console.log('⏰ Generando resumen de agenda del día (Hora ARG)...');
+  console.log('⏰ Generando resumen de agenda del día...');
   
   try {
-    // 1. OBTENER TURNOS DE HOY (Validando fecha en zona horaria ARG)
     const query = `
       SELECT 
         t.fecha_reserva_inicio,
-        -- 🔥 CORRECCIÓN NULL: Si el snapshot falla, ponemos texto genérico
+        -- 🔥 CAMBIO A FORMATO 24HS (Ej: 17:30)
+        TO_CHAR(
+            t.fecha_reserva_inicio AT TIME ZONE 'UTC' AT TIME ZONE 'America/Argentina/Buenos_Aires', 
+            'HH24:MI'
+        ) as hora_argentina,
+        
         COALESCE(t.nombre_snapshot, 'Servicio Reservado') as servicio,
         l.nombre as local_nombre,
         u_comprador.usuario_id as comprador_id,
@@ -5238,7 +5366,6 @@ cron.schedule('0 8 * * *', async () => {
       JOIN usuarios u_comprador ON t.comprador_id = u_comprador.usuario_id
       JOIN usuarios u_vendedor ON l.usuario_id = u_vendedor.usuario_id
       WHERE 
-        -- Comparamos fechas convirtiendo la hora UTC del servidor a Hora ARG
         (t.fecha_reserva_inicio AT TIME ZONE 'UTC' AT TIME ZONE 'America/Argentina/Buenos_Aires')::date = 
         (NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Argentina/Buenos_Aires')::date
         AND t.estado NOT IN ('CANCELADO', 'RECHAZADO', 'ENTREGADO')
@@ -5249,59 +5376,42 @@ cron.schedule('0 8 * * *', async () => {
     
     if (res.rows.length === 0) return;
 
-    // 2. AGRUPAR
     const agendaCompradores = {};
     const agendaVendedores = {};
 
-    // Helper para formato hora ARG (Ej: "09:00 AM")
-    const formatearHoraArg = (fechaISO) => {
-        return new Date(fechaISO).toLocaleTimeString('en-US', { 
-            timeZone: 'America/Argentina/Buenos_Aires',
-            hour: '2-digit', 
-            minute: '2-digit',
-            hour12: true 
-        });
-    };
-
     res.rows.forEach(turno => {
-        const hora = formatearHoraArg(turno.fecha_reserva_inicio);
+        const hora = turno.hora_argentina;
         
-        // Agrupar Comprador
+        // Agregamos "hs" para que quede "17:30hs"
         if (!agendaCompradores[turno.comprador_id]) agendaCompradores[turno.comprador_id] = [];
-        agendaCompradores[turno.comprador_id].push(`▪ ${hora} - ${turno.servicio} en ${turno.local_nombre}`);
+        agendaCompradores[turno.comprador_id].push(`▪ ${hora}hs - ${turno.servicio} en ${turno.local_nombre}`);
 
-        // Agrupar Vendedor
         if (!agendaVendedores[turno.vendedor_id]) agendaVendedores[turno.vendedor_id] = [];
-        agendaVendedores[turno.vendedor_id].push(`▪ ${hora} - ${turno.servicio}`);
+        agendaVendedores[turno.vendedor_id].push(`▪ ${hora}hs - ${turno.servicio}`);
     });
 
-    // 3. ENVIAR A COMPRADORES
+    const promesasEnvio = [];
+
+    // Compradores
     for (const [id, lista] of Object.entries(agendaCompradores)) {
         let titulo = "¡Tienes turno hoy! 📅";
-        let cuerpo = "";
-
-        if (lista.length === 1) {
-            cuerpo = lista[0].replace('▪ ', 'Recuerda tu cita: ');
-        } else {
-            titulo = `📅 Hoy tienes ${lista.length} turnos`;
-            cuerpo = "Tu itinerario:\n\n" + lista.join("\n");
-        }
-        enviarNotificacion(id, titulo, cuerpo, { tipo: 'COMPRA' });
+        let cuerpo = lista.length === 1 
+            ? lista[0].replace('▪ ', 'Recuerda tu cita: ')
+            : `Tu itinerario:\n\n` + lista.join("\n");
+        promesasEnvio.push(enviarNotificacion(id, titulo, cuerpo, { tipo: 'COMPRA' }));
     }
 
-    // 4. ENVIAR A VENDEDORES
+    // Vendedores
     for (const [id, lista] of Object.entries(agendaVendedores)) {
         let titulo = "Agenda del Día 📅";
-        let cuerpo = "";
-
-        if (lista.length === 1) {
-            cuerpo = `Tienes 1 cliente agendado:\n${lista[0]}`;
-        } else {
-            titulo = `📅 Hoy: ${lista.length} Clientes`;
-            cuerpo = "Tu agenda:\n\n" + lista.join("\n");
-        }
-        enviarNotificacion(id, titulo, cuerpo, { tipo: 'VENTA' });
+        let cuerpo = lista.length === 1
+            ? `Tienes 1 cliente agendado:\n${lista[0]}`
+            : `Tu agenda:\n\n` + lista.join("\n");
+        promesasEnvio.push(enviarNotificacion(id, titulo, cuerpo, { tipo: 'VENTA' }));
     }
+
+    await Promise.all(promesasEnvio);
+    console.log(`✅ Enviados ${promesasEnvio.length} recordatorios diarios.`);
 
   } catch (error) {
     console.error("❌ Error Cron Diario:", error);
@@ -5313,11 +5423,16 @@ cron.schedule('0 8 * * *', async () => {
 // ==========================================
 cron.schedule('*/15 * * * *', async () => {
   try {
-    // Buscamos turnos en la ventana de [55 min a 70 min] desde AHORA
     const query = `
       SELECT 
         t.fecha_reserva_inicio,
-        COALESCE(t.nombre_snapshot, 'Servicio') as servicio, -- 🔥 Anti-Null
+        -- 🔥 CAMBIO A FORMATO 24HS
+        TO_CHAR(
+            t.fecha_reserva_inicio AT TIME ZONE 'UTC' AT TIME ZONE 'America/Argentina/Buenos_Aires', 
+            'HH24:MI'
+        ) as hora_argentina,
+        
+        COALESCE(t.nombre_snapshot, 'Servicio') as servicio,
         l.nombre as local_nombre,
         u.usuario_id as comprador_id
       FROM transacciones_p2p t
@@ -5334,23 +5449,16 @@ cron.schedule('*/15 * * * *', async () => {
     if (res.rows.length > 0) {
       console.log(`🔔 Enviando recordatorios inminentes a ${res.rows.length} usuarios.`);
       
-      for (const turno of res.rows) {
-        // 🔥 CORRECCIÓN HORA ARGENTINA
-        const horaArg = new Date(turno.fecha_reserva_inicio).toLocaleTimeString('en-US', { 
-            timeZone: 'America/Argentina/Buenos_Aires',
-            hour: '2-digit', 
-            minute: '2-digit',
-            hour12: true // Para que salga AM/PM
-        });
+      const promesas = res.rows.map(turno => {
+          return enviarNotificacion(
+              turno.comprador_id, 
+              "⏰ ¡Tu turno es en 1 hora!", 
+              `No olvides tu cita: ${turno.servicio} en ${turno.local_nombre} a las ${turno.hora_argentina}hs.`, // Agregamos 'hs'
+              { tipo: 'COMPRA' }
+          );
+      });
 
-        // ENVIAR SOLO AL CLIENTE
-        enviarNotificacion(
-            turno.comprador_id, 
-            "⏰ ¡Tu turno es en 1 hora!", 
-            `No olvides tu cita: ${turno.servicio} en ${turno.local_nombre} a las ${horaArg}.`,
-            { tipo: 'COMPRA' }
-        );
-      }
+      await Promise.all(promesas);
     }
   } catch (error) {
     console.error("❌ Error Cron 1h:", error);
