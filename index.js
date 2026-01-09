@@ -2866,26 +2866,31 @@ app.post('/api/historias/:id/reportar', async (req, res) => {
 // MÓDULO AUDIENCIAS Y MARKETING (V14.0) 👁️
 // ==========================================
 
-// RUTA 60: REGISTRAR VISTA DE HISTORIA (SILENCIOSA)
+// RUTA 60: REGISTRAR VISTA DE HISTORIA
 app.post('/api/historias/:id/visto', async (req, res) => {
   const authHeader = req.headers['authorization'];
-  if (!authHeader) return res.status(200).send('OK'); // Si no hay token (invitado), ignoramos
-  const { id } = req.params; // ID Historia
+  
+  // LOG DE DEBUG
+  console.log("👀 Petición de vista recibida. Header:", authHeader ? "SI" : "NO");
+
+  if (!authHeader) return res.status(200).send('OK'); 
+  const { id } = req.params; 
 
   try {
     const token = authHeader.split(' ')[1];
     const usuario = jwt.verify(token, process.env.JWT_SECRET);
 
-    // Insertamos ignorando duplicados (ON CONFLICT) para velocidad
+    console.log(`👤 Usuario ${usuario.id} vio historia ${id}`);
+
     await pool.query(
       `INSERT INTO historias_vistas (historia_id, usuario_id) VALUES ($1, $2) 
        ON CONFLICT (historia_id, usuario_id) DO NOTHING`,
       [id, usuario.id]
     );
 
-    res.status(200).send('OK'); // Respuesta ultrarrápida
+    res.status(200).send('OK');
   } catch (error) {
-    // No logueamos error para no ensuciar la consola con tokens vencidos, etc.
+    console.error("❌ Error guardando vista:", error.message); // <--- ESTO ES IMPORTANTE
     res.status(200).send('OK');
   }
 });
