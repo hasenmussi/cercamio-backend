@@ -2772,17 +2772,32 @@ app.post('/api/mi-negocio/historia', upload.single('imagen'), async (req, res) =
   }
 });
 
-// RUTA 30: OBTENER HISTORIAS ACTIVAS DE UN LOCAL
+// ==========================================
+// RUTA 30: OBTENER HISTORIAS DE UN LOCAL (SOLO LISTA + ID) 📸
+// ==========================================
 app.get('/api/locales/:id/historias', async (req, res) => {
+  const local_id = req.params.id;
+
   try {
+    // Solo buscamos las historias activas
     const result = await pool.query(`
-      SELECT media_url, tipo_media, caption, fecha_creacion 
+      SELECT 
+        historia_id, -- 🔥 ESTO ES LO QUE FALTABA PARA EL CONTADOR
+        media_url, 
+        tipo_media, 
+        caption, 
+        fecha_creacion 
       FROM historias 
-      WHERE local_id = $1 AND fecha_expiracion > NOW()
+      WHERE local_id = $1 
+      AND fecha_expiracion > NOW()
       ORDER BY fecha_creacion ASC
-    `, [req.params.id]);
+    `, [local_id]);
+
+    // Devolvemos directamente el array, compatible con tu Frontend actual
     res.json(result.rows);
+
   } catch (e) {
+    console.error("Error historias:", e);
     res.status(500).json({ error: 'Error al cargar historias' });
   }
 });
