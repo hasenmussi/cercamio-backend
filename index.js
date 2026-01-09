@@ -2884,11 +2884,11 @@ app.post('/api/historias/:id/reportar', async (req, res) => {
 // RUTA 60: REGISTRAR VISTA DE HISTORIA
 app.post('/api/historias/:id/visto', async (req, res) => {
   const authHeader = req.headers['authorization'];
+  // Si es invitado, o si el ID es "null" o inválido, salimos silenciosamente
+  if (!authHeader || !req.params.id || req.params.id === 'null' || isNaN(req.params.id)) {
+      return res.status(200).send('OK'); 
+  }
   
-  // LOG DE DEBUG
-  console.log("👀 Petición de vista recibida. Header:", authHeader ? "SI" : "NO");
-
-  if (!authHeader) return res.status(200).send('OK'); 
   const { id } = req.params; 
 
   try {
@@ -2905,12 +2905,14 @@ app.post('/api/historias/:id/visto', async (req, res) => {
 
     res.status(200).send('OK');
   } catch (error) {
-    console.error("❌ Error guardando vista:", error.message); // <--- ESTO ES IMPORTANTE
+    console.error("❌ Error guardando vista:", error.message);
     res.status(200).send('OK');
   }
 });
 
-// RUTA 61: OBTENER AUDIENCIA DEL DÍA (PARA EL VENDEDOR) 📊
+// ==========================================
+// RUTA 61: OBTENER AUDIENCIA (CORREGIDA v14.1 - VISTAS RECIENTES) 📊
+// ==========================================
 app.get('/api/mi-negocio/estadisticas/audiencia', async (req, res) => {
   const authHeader = req.headers['authorization'];
   if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
@@ -2920,36 +2922,45 @@ app.get('/api/mi-negocio/estadisticas/audiencia', async (req, res) => {
     const usuario = jwt.verify(token, process.env.JWT_SECRET);
     
     // 1. Obtener local
-    const localRes = await pool.query('SELECT local_id FROM locales WHERE usuario_id = $1', [usuario.id]);
+    const localRes = await pool.query('SELECT local_id, plan_tipo FROM locales WHERE usuario_id = $1', [usuario.id]);
     if (localRes.rows.length === 0) return res.status(404).json({ error: 'No tienes local' });
-    const localId = localRes.rows[0].local_id;
+    
+    const { local_id, plan_tipo } = localRes.rows[0];
+    console.log(`📊 Buscando audiencia para Local ID: ${local_id}`);
 
     // 2. Consulta Maestra de Audiencia
-    // Busca usuarios que vieron historias ACTIVAS (no vencidas) de este local
+    // LÓGICA NUEVA: Trae a cualquiera que haya visto CUALQUIER historia de este local en las últimas 48 horas.
+    // (Independientemente de si la historia ya expiró o no)
     const query = `
       SELECT DISTINCT ON (U.usuario_id)
         U.usuario_id,
         U.nombre_completo,
         U.foto_url,
-        MAX(HV.fecha_vista) as ultima_vista,
-        -- Verificamos si ya es seguidor (favorito)
+        HV.fecha_vista,
+        -- Check si ya es seguidor
         (SELECT COUNT(*) FROM favoritos F WHERE F.usuario_id = U.usuario_id AND F.local_id = $1) > 0 as es_seguidor,
-        -- Verificamos si ya le mandamos algo hoy (para no spammear)
+        -- Check si ya contactado hoy
         (SELECT COUNT(*) FROM marketing_acciones MA WHERE MA.local_id = $1 AND MA.usuario_destino_id = U.usuario_id AND MA.fecha_accion > NOW() - INTERVAL '24 hours') > 0 as ya_contactado
       FROM historias_vistas HV
       JOIN historias H ON HV.historia_id = H.historia_id
       JOIN usuarios U ON HV.usuario_id = U.usuario_id
       WHERE H.local_id = $1
-      AND H.fecha_expiracion > NOW() -- Solo historias vivas
-      GROUP BY U.usuario_id, U.nombre_completo, U.foto_url
-      ORDER BY U.usuario_id, ultima_vista DESC
+      AND HV.fecha_vista > NOW() - INTERVAL '48 hours' -- 🔥 Muestra vistas de los últimos 2 días
+      ORDER BY U.usuario_id, HV.fecha_vista DESC
     `;
 
-    const result = await pool.query(query, [localId]);
-    res.json(result.rows);
+    const result = await pool.query(query, [local_id]);
+
+    console.log(`✅ Se encontraron ${result.rowCount} espectadores.`);
+
+    res.json({
+        es_premium: plan_tipo === 'PREMIUM',
+        total_vistas: result.rowCount,
+        espectadores: result.rows
+    });
 
   } catch (error) {
-    console.error("Error audiencia:", error);
+    console.error("❌ Error audiencia:", error);
     res.status(500).json({ error: 'Error al cargar estadísticas' });
   }
 });
