@@ -2881,13 +2881,12 @@ app.post('/api/historias/:id/reportar', async (req, res) => {
 // MÓDULO AUDIENCIAS Y MARKETING (V14.0) 👁️
 // ==========================================
 
-// RUTA 60: REGISTRAR VISTA DE HISTORIA
+// ==========================================
+// RUTA 60: REGISTRAR VISTA (ANTI-EGO + SILENCIOSA) 👁️
+// ==========================================
 app.post('/api/historias/:id/visto', async (req, res) => {
   const authHeader = req.headers['authorization'];
-  // Si es invitado, o si el ID es "null" o inválido, salimos silenciosamente
-  if (!authHeader || !req.params.id || req.params.id === 'null' || isNaN(req.params.id)) {
-      return res.status(200).send('OK'); 
-  }
+  if (!authHeader || !req.params.id) return res.status(200).send('OK');
   
   const { id } = req.params; 
 
@@ -2895,23 +2894,32 @@ app.post('/api/historias/:id/visto', async (req, res) => {
     const token = authHeader.split(' ')[1];
     const usuario = jwt.verify(token, process.env.JWT_SECRET);
 
-    console.log(`👤 Usuario ${usuario.id} vio historia ${id}`);
+    // 🔥 LOGICA ANTI-EGO (SQL AVANZADO):
+    // Solo insertamos si el usuario que mira NO es el dueño del local de esa historia.
+    const query = `
+      INSERT INTO historias_vistas (historia_id, usuario_id)
+      SELECT $1, $2
+      WHERE NOT EXISTS (
+        SELECT 1 
+        FROM historias h 
+        JOIN locales l ON h.local_id = l.local_id 
+        WHERE h.historia_id = $1 
+        AND l.usuario_id = $2 -- Si el usuario es el dueño, esto da true y el NOT EXISTS bloquea
+      )
+      ON CONFLICT (historia_id, usuario_id) DO NOTHING
+    `;
 
-    await pool.query(
-      `INSERT INTO historias_vistas (historia_id, usuario_id) VALUES ($1, $2) 
-       ON CONFLICT (historia_id, usuario_id) DO NOTHING`,
-      [id, usuario.id]
-    );
+    await pool.query(query, [id, usuario.id]);
 
     res.status(200).send('OK');
   } catch (error) {
-    console.error("❌ Error guardando vista:", error.message);
+    // Silencioso
     res.status(200).send('OK');
   }
 });
 
 // ==========================================
-// RUTA 61: OBTENER AUDIENCIA (CORREGIDA v14.1 - VISTAS RECIENTES) 📊
+// RUTA 61: OBTENER AUDIENCIA (ESTRICTA: SOLO HISTORIAS ACTIVAS) 📊
 // ==========================================
 app.get('/api/mi-negocio/estadisticas/audiencia', async (req, res) => {
   const authHeader = req.headers['authorization'];
@@ -2921,22 +2929,21 @@ app.get('/api/mi-negocio/estadisticas/audiencia', async (req, res) => {
   try {
     const usuario = jwt.verify(token, process.env.JWT_SECRET);
     
-    // 1. Obtener local
+    // 1. Obtener local y PLAN
     const localRes = await pool.query('SELECT local_id, plan_tipo FROM locales WHERE usuario_id = $1', [usuario.id]);
     if (localRes.rows.length === 0) return res.status(404).json({ error: 'No tienes local' });
     
     const { local_id, plan_tipo } = localRes.rows[0];
-    console.log(`📊 Buscando audiencia para Local ID: ${local_id}`);
 
     // 2. Consulta Maestra de Audiencia
-    // LÓGICA NUEVA: Trae a cualquiera que haya visto CUALQUIER historia de este local en las últimas 48 horas.
-    // (Independientemente de si la historia ya expiró o no)
+    // 🔥 CAMBIO CLAVE: Filtramos por fecha_expiracion > NOW()
+    // Solo contamos vistas de historias que AÚN son visibles en la app.
     const query = `
       SELECT DISTINCT ON (U.usuario_id)
         U.usuario_id,
         U.nombre_completo,
         U.foto_url,
-        HV.fecha_vista,
+        MAX(HV.fecha_vista) as fecha_vista,
         -- Check si ya es seguidor
         (SELECT COUNT(*) FROM favoritos F WHERE F.usuario_id = U.usuario_id AND F.local_id = $1) > 0 as es_seguidor,
         -- Check si ya contactado hoy
@@ -2945,13 +2952,12 @@ app.get('/api/mi-negocio/estadisticas/audiencia', async (req, res) => {
       JOIN historias H ON HV.historia_id = H.historia_id
       JOIN usuarios U ON HV.usuario_id = U.usuario_id
       WHERE H.local_id = $1
-      AND HV.fecha_vista > NOW() - INTERVAL '48 hours' -- 🔥 Muestra vistas de los últimos 2 días
-      ORDER BY U.usuario_id, HV.fecha_vista DESC
+      AND H.fecha_expiracion > NOW() -- ⏳ SOLO HISTORIAS VIVAS (No vencidas)
+      GROUP BY U.usuario_id, U.nombre_completo, U.foto_url
+      ORDER BY U.usuario_id, fecha_vista DESC
     `;
 
     const result = await pool.query(query, [local_id]);
-
-    console.log(`✅ Se encontraron ${result.rowCount} espectadores.`);
 
     res.json({
         es_premium: plan_tipo === 'PREMIUM',
