@@ -1009,7 +1009,7 @@ app.post('/api/transaccion/comprar', async (req, res) => {
   if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
   const token = authHeader.split(' ')[1];
   
-  const { local_id, items, tipo_entrega, usar_cupon } = req.body;
+  const { local_id, items, tipo_entrega, usar_cupon, cupon_id, monto_descuento } = req.body;
   
   const client = await pool.connect();
 
@@ -1126,25 +1126,43 @@ app.post('/api/transaccion/comprar', async (req, res) => {
             await client.query('UPDATE inventario_local SET stock = stock - $1 WHERE inventario_id = $2', [item.cantidad, item.inventario_id]);
         }
 
-        // C. Insertar
-        const totalItem = item.precio * item.cantidad;
-        montoTotalPedido += totalItem;
-        
-        await client.query(`
+        // C. Insertar Transacción
+        const insertTx = `
             INSERT INTO transacciones_p2p 
             (
                 comprador_id, vendedor_id, producto_global_id, cantidad, monto_total, 
                 estado, tipo_entrega, compra_uuid, nombre_snapshot, foto_snapshot, 
                 comision_plataforma, codigo_retiro,
-                fecha_reserva_inicio, fecha_reserva_fin
+                fecha_reserva_inicio, fecha_reserva_fin,
+                cupon_id, monto_descuento -- <--- 2 NUEVAS COLUMNAS
             )
-            VALUES ($1, $2, $3, $4, $5, 'PENDIENTE_PAGO', $6, $7, $8, $9, $10, $11, $12, $13)
-        `, [
-            comprador_id, vendedor_id, datosReales.global_id, item.cantidad, totalItem, 
-            tipo_entrega, compraUuid, datosReales.nombre, datosReales.foto_url, 
-            0, // Comisión 0 en efectivo
-            codigoRetiro, fechaInicio, fechaFin
+            -- 🔥 CORRECCIÓN AQUÍ: Agregamos $15 y $16
+            VALUES ($1, $2, $3, $4, $5, 'PENDIENTE_PAGO', $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+        `;
+        
+        await client.query(insertTx, [
+            comprador_id, 
+            vendedor_id, 
+            datosReales.global_id, 
+            item.cantidad, 
+            totalItem, 
+            tipo_entrega,
+            compraUuid,
+            datosReales.nombre,   
+            datosReales.foto_url,
+            0, // Comisión 0
+            codigoRetiro,
+            fechaInicio, // $12
+            fechaFin,    // $13
+            cupon_id || null, // $15 (Si es undefined, pasa null)
+            0 // $16 (Monto descuento: Ponemos 0 en el item individual, ya que el descuento es al total)
         ]);
+    }
+
+    // 5. QUEMAR CUPÓN (UNA SOLA VEZ POR PEDIDO) 🔥
+    if (cupon_id) {
+        await client.query('UPDATE cupones SET stock_usado = stock_usado + 1 WHERE cupon_id = $1', [cupon_id]);
+        await client.query(`UPDATE cupones_wallet SET estado = 'USADO', fecha_uso = NOW() WHERE cupon_id = $1 AND usuario_id = $2`, [cupon_id, comprador_id]);
     }
 
     await client.query('COMMIT');
@@ -2971,47 +2989,75 @@ app.get('/api/mi-negocio/estadisticas/audiencia', async (req, res) => {
   }
 });
 
-// RUTA 62: EJECUTAR ACCIÓN DE MARKETING (MIMO O INVITACIÓN) 🎁
+// ==========================================
+// RUTA 62: MARKETING & REGALO DE CUPONES (V15.0) 🎁
+// ==========================================
 app.post('/api/mi-negocio/marketing/accion', async (req, res) => {
   const authHeader = req.headers['authorization'];
   if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
   const token = authHeader.split(' ')[1];
   
-  const { usuario_destino_id, tipo_accion } = req.body; // 'MIMO' o 'INVITAR'
+  // Recibimos cupon_id (opcional, solo para MIMO)
+  const { usuario_destino_id, tipo_accion, cupon_id } = req.body; 
 
   try {
     const usuario = jwt.verify(token, process.env.JWT_SECRET);
     
-    // 1. Obtener datos del local (Nombre para la notificación)
+    // 1. Obtener datos del local
     const localRes = await pool.query('SELECT local_id, nombre, plan_tipo FROM locales WHERE usuario_id = $1', [usuario.id]);
+    if (localRes.rows.length === 0) return res.status(404).json({ error: 'Local no encontrado' });
     const local = localRes.rows[0];
 
-    // 🛑 VALIDACIÓN PREMIUM: Solo locales PRO pueden hacer esto
+    // 🛑 VALIDACIÓN PREMIUM
     if (local.plan_tipo !== 'PREMIUM') {
-        return res.status(403).json({ error: 'Esta función es exclusiva para Socios Premium 💎' });
+        return res.status(403).json({ error: 'Función exclusiva para Socios Premium 💎' });
     }
 
     // 2. Registrar Acción (Anti-Spam)
+    // Nota: Podrías querer validar aquí si ya se mandó hoy para no gastar saldo o molestar
     await pool.query(
         'INSERT INTO marketing_acciones (local_id, usuario_destino_id, tipo_accion) VALUES ($1, $2, $3)',
         [local.local_id, usuario_destino_id, tipo_accion]
     );
 
-    // 3. Enviar Notificación al Cliente
+    // --- LÓGICA POR TIPO ---
+
     if (tipo_accion === 'INVITAR') {
+        // Invitación simple a seguir el perfil
         enviarNotificacion(
             usuario_destino_id,
             `👋 ¡${local.nombre} te invita!`,
             "Les encantó que visitaras sus historias. Sigue al local para no perderte nada.",
-            { tipo: 'PERFIL_LOCAL', id: local.local_id.toString() } // Redirige al perfil para que le de Like
+            { tipo: 'PERFIL_LOCAL', id: local.local_id.toString() }
         );
     } 
+    
     else if (tipo_accion === 'MIMO') {
+        // Regalo de Cupón Real
+        if (!cupon_id) return res.status(400).json({ error: 'Debes seleccionar un cupón para regalar.' });
+
+        // A. Verificar que el cupón existe y es del local
+        const cuponRes = await pool.query('SELECT * FROM cupones WHERE cupon_id = $1 AND local_id = $2', [cupon_id, local.local_id]);
+        if (cuponRes.rows.length === 0) return res.status(404).json({ error: 'Cupón inválido' });
+        const cupon = cuponRes.rows[0];
+
+        // B. Insertar en la Billetera del Usuario (Wallet)
+        // Usamos ON CONFLICT para no fallar si ya se lo regalamos antes (simplemente no hace nada o actualiza fecha)
+        await pool.query(`
+            INSERT INTO cupones_wallet (usuario_id, cupon_id, estado) 
+            VALUES ($1, $2, 'DISPONIBLE')
+            ON CONFLICT (usuario_id, cupon_id) 
+            DO UPDATE SET fecha_asignacion = NOW(), estado = 'DISPONIBLE'
+        `, [usuario_destino_id, cupon_id]);
+
+        // C. Notificar con Payload Especial
+        let textoDescuento = cupon.tipo_descuento === 'PORCENTAJE' ? `${cupon.valor_descuento}% OFF` : `$${cupon.valor_descuento} OFF`;
+        
         enviarNotificacion(
             usuario_destino_id,
             `🎁 ¡Regalo de ${local.nombre}!`,
-            "Te enviaron un descuento especial. ¡Pasa por el local a usarlo!",
-            { tipo: 'PERFIL_LOCAL', id: local.local_id.toString() } // Por ahora al perfil, luego al cupón
+            `Te enviaron un cupón de ${textoDescuento}. Toca para guardarlo en tu billetera.`,
+            { tipo: 'NUEVO_CUPON' } // Esto abrirá MisCuponesScreen
         );
     }
 
@@ -3175,52 +3221,70 @@ app.post('/api/transaccion/avisar-llegada', async (req, res) => {
 
 
 // ==========================================
-// RUTA DE PAGOS: CHECKOUT MARKETPLACE (OPTIMIZADO v3 - MP 100%) 🌟
+// RUTA DE PAGOS: CHECKOUT MP (HÍBRIDO + VALIDACIÓN AGENDA) 🛡️
 // ==========================================
 app.post('/api/pagos/crear-preferencia', async (req, res) => {
   const authHeader = req.headers['authorization'];
   if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
   
-  // Frontend nos manda items y el ID del local
-  const { items, local_id, tipo_entrega } = req.body; 
+  // items trae: { inventario_id, cantidad, precio, nombre, fecha_reserva? }
+  const { items, local_id, tipo_entrega, cupon_id, monto_descuento } = req.body; 
 
   if (!local_id) return res.status(400).json({ error: 'Falta el ID del local' });
 
   try {
-    // 0. Identificar al COMPRADOR
     const token = authHeader.split(' ')[1];
-    const usuarioComprador = jwt.verify(token, JWT_SECRET);
+    const usuarioComprador = jwt.verify(token, process.env.JWT_SECRET);
 
-    // 1. BUSCAR CREDENCIALES DEL VENDEDOR
+    // 1. BUSCAR VENDEDOR
     const queryLocal = 'SELECT mp_access_token, nombre, usuario_id FROM locales WHERE local_id = $1';
     const localRes = await pool.query(queryLocal, [local_id]);
 
-    if (localRes.rows.length === 0) {
-      return res.status(404).json({ error: 'Local no encontrado' });
-    }
-
+    if (localRes.rows.length === 0) return res.status(404).json({ error: 'Local no encontrado' });
     const sellerData = localRes.rows[0];
     const sellerToken = sellerData.mp_access_token;
 
-    if (!sellerToken) {
-      return res.status(400).json({ 
-        error: `El local "${sellerData.nombre}" no tiene pagos activos.` 
-      });
+    if (!sellerToken) return res.status(400).json({ error: `El local "${sellerData.nombre}" no tiene pagos activos.` });
+
+    // 2. VALIDACIÓN DE AGENDA (DOUBLE CHECK) 🔥
+    // Antes de generar el link, verificamos si los turnos siguen libres
+    for (const item of items) {
+        if (item.fecha_reserva) {
+            // Buscamos duración en DB
+            const prodRes = await pool.query('SELECT duracion_minutos, nombre FROM inventario_local WHERE inventario_id = $1', [item.inventario_id]);
+            if (prodRes.rows.length > 0) {
+                const prodDB = prodRes.rows[0];
+                const fechaInicio = new Date(item.fecha_reserva);
+                const duracion = (prodDB.duracion_minutos || 30) * 60000;
+                const fechaFin = new Date(fechaInicio.getTime() + duracion);
+
+                // Chequeo de colisión
+                const colisionRes = await pool.query(`
+                    SELECT 1 FROM transacciones_p2p 
+                    WHERE vendedor_id = $1 AND estado NOT IN ('CANCELADO', 'RECHAZADO')
+                    AND ((fecha_reserva_inicio < $3 AND fecha_reserva_fin > $2))
+                `, [sellerData.usuario_id, fechaInicio.toISOString(), fechaFin.toISOString()]);
+
+                if (colisionRes.rows.length > 0) {
+                    return res.status(409).json({ error: `El turno ${prodDB.nombre} ya fue ocupado.` });
+                }
+            }
+        }
     }
 
-    // 2. GENERAR REFERENCIA EXTERNA ÚNICA (Acción Obligatoria MP)
-    // Formato: CM (CercaMio) - Timestamp - ID Usuario
+    // 3. GENERAR REFERENCIA
     const externalRef = `CM-${Date.now()}-${usuarioComprador.id}`;
 
-    // 3. PREPARAR ITEMS
+    // 4. PREPARAR ITEMS
     let totalVenta = 0;
     
-    // Metadata ligera
+    // Metadata enriquecida (Incluye fecha_reserva para que el Webhook sepa bloquear)
     const itemsParaMetadata = items.map(i => ({
       id: i.inventario_id,
       cant: Number(i.cantidad),
       precio: Number(i.precio),
-      title: i.nombre
+      title: i.nombre,
+      fecha_reserva: i.fecha_reserva // <--- ESTO ES VITAL PARA EL WEBHOOK
     }));
 
     const itemsMP = items.map(item => {
@@ -3228,65 +3292,66 @@ app.post('/api/pagos/crear-preferencia', async (req, res) => {
       const cantidad = Number(item.cantidad);
       totalVenta += precio * cantidad;
       
-      // LÓGICA DE DESCRIPCIÓN Y CATEGORÍA (Acciones Recomendadas MP)
-      // Si tiene descripción, la usamos (recortada a 200 chars por seguridad)
-      // Si no tiene, repetimos el nombre.
-      const descripcionItem = item.descripcion 
-          ? item.descripcion.substring(0, 250) 
-          : item.nombre;
+      const descripcionItem = item.descripcion ? item.descripcion.substring(0, 250) : item.nombre;
 
       return {
         id: item.inventario_id.toString(),
         title: item.nombre,
-        description: descripcionItem, // <--- RECOMENDADO AGREGADO
-        category_id: 'others',        // <--- RECOMENDADO AGREGADO (Comodín)
+        description: descripcionItem,
+        category_id: 'others',
         quantity: cantidad,
         unit_price: precio,
         currency_id: 'ARS',
       };
     });
-    // COMISIÓN CERCAMÍO CONFIGURABLE - ACTUAL 1%
-    const comisionCercaMio = Math.round((totalVenta * 0.01) * 100) / 100;
 
-    // 4. CONFIGURAR CLIENTE
+    // 🔥 APLICAR DESCUENTO EN MERCADO PAGO
+    if (monto_descuento && monto_descuento > 0) {
+        itemsMP.push({
+            id: 'CUPON',
+            title: 'Descuento Aplicado',
+            description: 'Cupón de descuento CercaMío',
+            category_id: 'coupon',
+            quantity: 1,
+            unit_price: -parseFloat(monto_descuento), // PRECIO NEGATIVO (Resta al total)
+            currency_id: 'ARS'
+        });
+    }
+
+    // Calcular comisión sobre el total REAL (post-descuento)
+    // Recalculamos totalVenta restando el descuento para que la comisión sea justa
+    const totalConDescuento = totalVenta - (parseFloat(monto_descuento) || 0);
+    const comisionCercaMio = Math.round((totalConDescuento * 0.01) * 100) / 100;
+
+    // 5. CONFIGURAR CLIENTE
     const sellerClient = new MercadoPagoConfig({ accessToken: sellerToken });
     const preference = new Preference(sellerClient);
 
-    // 5. CREAR PREFERENCIA
     const body = {
       items: itemsMP,
       marketplace_fee: comisionCercaMio,
-      
-      // --- OBLIGATORIO PARA CONCILIACIÓN ---
       external_reference: externalRef, 
-
       metadata: {
         comprador_id: usuarioComprador.id,
         vendedor_id: sellerData.usuario_id,
         local_id: local_id,
         tipo_entrega: tipo_entrega || 'RETIRO',
-        items_json: JSON.stringify(itemsParaMetadata)
+        nombre_local: sellerData.nombre, // Para notificación
+        items_json: JSON.stringify(itemsParaMetadata) // Aquí viaja la fecha
       },
-
       back_urls: {
         success: "cercamio://payment-result", 
         failure: "cercamio://payment-result",
         pending: "cercamio://payment-result"
       },
       auto_return: "approved",
-      
-      // La URL del Webhook
       notification_url: "https://cercamio-backend.onrender.com/api/pagos/webhook",
-      
       statement_descriptor: "CERCAMIO APP"
     };
 
     const result = await preference.create({ body });
 
-    res.json({ 
-      id: result.id, 
-      link_pago: result.init_point 
-    });
+    res.json({ id: result.id, link_pago: result.init_point });
 
   } catch (error) {
     console.error("Error Split Payment:", error);
@@ -3484,7 +3549,7 @@ app.post('/api/pagos/webhook', async (req, res) => {
         } 
 
         // ====================================================
-        // CASO B: VENTA MARKETPLACE (E-COMMERCE + SOCIOS) 🛒
+        // CASO B: VENTA MARKETPLACE (E-COMMERCE + SOCIOS + AGENDA + CUPONES) 🛒
         // ====================================================
         else if (externalRef && externalRef.startsWith('CM-')) {
             
@@ -3500,6 +3565,10 @@ app.post('/api/pagos/webhook', async (req, res) => {
             const totalPagado = paymentData.transaction_amount;
             const compraUuid = crypto.randomUUID();
             
+            // 🔥 DATOS DE CUPÓN (NUEVO)
+            const cuponId = meta.cupon_id || null;
+            const montoDescuento = meta.monto_descuento || 0;
+
             // Generar OTP Seguro
             const generarOTP = () => Math.random().toString(36).substring(2, 6).toUpperCase();
             const codigoRetiro = generarOTP(); 
@@ -3509,8 +3578,7 @@ app.post('/api/pagos/webhook', async (req, res) => {
             try {
               await clientDb.query('BEGIN');
 
-              // 1. BUSCAR DATOS DEL SOCIO (PADRINO) 🤝
-              // Necesitamos saber si este vendedor fue invitado por alguien para pagarle comisión
+              // 1. BUSCAR DATOS DEL SOCIO
               const socioRes = await clientDb.query(`
                   SELECT L.local_id, L.referido_por_socio_id, S.porcentaje_ganancia
                   FROM locales L
@@ -3523,17 +3591,17 @@ app.post('/api/pagos/webhook', async (req, res) => {
               const porcentajeSocio = socioId ? parseFloat(localInfo.porcentaje_ganancia || 5.00) : 0;
               const localId = localInfo?.local_id;
 
-              // Variables para acumular la ganancia total de la orden
               let comisionTotalOrden = 0;
               let ultimoTransaccionId = null;
+              let resumenAgenda = ""; 
 
               // 2. PROCESAR CADA PRODUCTO
               for (const item of itemsComprados) {
                  // A. Validar Stock y Datos Reales
                  const queryProducto = `
                     SELECT 
-                        I.stock, I.global_id, I.tipo_item,
-                        COALESCE(I.nombre, C.nombre_oficial, 'Producto') as nombre, -- <--- ARREGLO SNAPSHOT
+                        I.stock, I.global_id, I.tipo_item, I.duracion_minutos,
+                        COALESCE(I.nombre, C.nombre_oficial, 'Producto') as nombre,
                         COALESCE(I.foto_url, C.foto_url) as foto_url
                     FROM inventario_local I
                     LEFT JOIN catalogo_global C ON I.global_id = C.global_id
@@ -3542,50 +3610,63 @@ app.post('/api/pagos/webhook', async (req, res) => {
                  `;
                  const prodRes = await clientDb.query(queryProducto, [item.id]);
                  
-                 // Fallback seguro si borraron el producto mientras se pagaba
-                 const datosReales = prodRes.rows.length > 0 ? prodRes.rows[0] : { global_id: null, nombre: item.title, foto_url: null, tipo_item: 'PRODUCTO_STOCK', stock: 0 };
+                 const datosReales = prodRes.rows.length > 0 ? prodRes.rows[0] : { global_id: null, nombre: item.title, foto_url: null, tipo_item: 'PRODUCTO_STOCK', stock: 0, duracion_minutos: 30 };
 
                  if (datosReales.tipo_item === 'PRODUCTO_STOCK') {
                     await clientDb.query('UPDATE inventario_local SET stock = stock - $1 WHERE inventario_id = $2', [item.cant, item.id]);
                  }
 
-                 // B. Calcular Comisión CercaMío (ej: 1% del item)
+                 // B. Agenda
+                 let fechaInicio = null;
+                 let fechaFin = null;
+                 if (item.fecha_reserva) {
+                     fechaInicio = new Date(item.fecha_reserva);
+                     const duracion = (datosReales.duracion_minutos || 30) * 60000;
+                     fechaFin = new Date(fechaInicio.getTime() + duracion);
+                     const dia = fechaInicio.getDate().toString().padStart(2, '0');
+                     const mes = (fechaInicio.getMonth() + 1).toString().padStart(2, '0');
+                     const hora = fechaInicio.getHours().toString().padStart(2, '0');
+                     const min = fechaInicio.getMinutes().toString().padStart(2, '0');
+                     resumenAgenda += `\n📅 ${datosReales.nombre}: ${dia}/${mes} ${hora}:${min}hs`;
+                 }
+
+                 // C. Calcular Comisión (Base: Precio Real del producto)
+                 // Nota: CercaMío cobra comisión sobre el precio de lista, aunque haya descuento.
                  const totalItem = item.precio * item.cant;
-                 const comisionItem = Math.round((totalItem * 0.01) * 100) / 100; // 1%
+                 const comisionItem = Math.round((totalItem * 0.01) * 100) / 100;
                  comisionTotalOrden += comisionItem;
 
-                 // C. Insertar Transacción
+                 // D. Insertar Transacción (CON CUPÓN) 🔥
                  const insertTx = `
                     INSERT INTO transacciones_p2p 
                     (
                       comprador_id, vendedor_id, producto_global_id, cantidad, monto_total, 
                       estado, tipo_entrega, mp_payment_id, fecha_operacion,
                       compra_uuid, nombre_snapshot, foto_snapshot, codigo_retiro,
-                      comision_plataforma
+                      comision_plataforma, fecha_reserva_inicio, fecha_reserva_fin,
+                      cupon_id, monto_descuento -- <--- NUEVOS
                     )
-                    VALUES ($1, $2, $3, $4, $5, 'APROBADO', $6, $7, NOW(), $8, $9, $10, $11, $12)
+                    VALUES ($1, $2, $3, $4, $5, 'APROBADO', $6, $7, NOW(), $8, $9, $10, $11, $12, $13, $14, $15, $16)
                     RETURNING transaccion_id
                  `;
                  
                  const txRes = await clientDb.query(insertTx, [
                     compradorId, vendedorId, datosReales.global_id, item.cant, totalItem, 
                     tipoEntrega, paymentId.toString(), compraUuid, datosReales.nombre, datosReales.foto_url,
-                    codigoRetiro, comisionItem
+                    codigoRetiro, comisionItem,
+                    fechaInicio, fechaFin,
+                    cuponId, 0 // Guardamos ID de cupón en todas las filas, pero monto 0 individual (descuento global)
                  ]);
                  
                  ultimoTransaccionId = txRes.rows[0].transaccion_id;
               }
 
-              // 3. PAGAR AL SOCIO (SI CORRESPONDE) 💰
+              // 3. PAGAR AL SOCIO
               if (socioId && comisionTotalOrden > 0) {
-                 // El socio gana un % de lo que ganó CercaMío (Revenue Share)
                  const gananciaSocio = Math.round((comisionTotalOrden * (porcentajeSocio / 100)) * 100) / 100;
-                 
                  if (gananciaSocio > 0) {
-                    // Acreditar saldo
                     await clientDb.query('UPDATE socios SET saldo_acumulado = saldo_acumulado + $1 WHERE socio_id = $2', [gananciaSocio, socioId]);
                     
-                    // Guardar historial para auditoría
                     await clientDb.query(`
                         INSERT INTO historial_comisiones (socio_id, transaccion_origen_id, local_origen_id, monto_comision, porcentaje_aplicado, base_calculo_plataforma)
                         VALUES ($1, $2, $3, $4, $5, $6)
@@ -3593,15 +3674,26 @@ app.post('/api/pagos/webhook', async (req, res) => {
                  }
               }
 
+              // 5. QUEMAR CUPÓN (UNA VEZ) 🔥
+              if (cuponId) {
+                  await clientDb.query('UPDATE cupones SET stock_usado = stock_usado + 1 WHERE cupon_id = $1', [cuponId]);
+                  await clientDb.query(`UPDATE cupones_wallet SET estado = 'USADO', fecha_uso = NOW() WHERE cupon_id = $1 AND usuario_id = $2`, [cuponId, compradorId]);
+              }
+
               await clientDb.query('COMMIT');
               
               // 4. NOTIFICACIONES
-              // Al Vendedor
-              enviarNotificacion(vendedorId, "¡Nueva Venta Online! 💳", `Recibiste $${totalPagado}. Entrega: ${tipoEntrega}`, { tipo: 'VENTA', uuid: compraUuid });
+              let msgVendedor = `Recibiste $${totalPagado}. Entrega: ${tipoEntrega}`;
+              if (resumenAgenda) msgVendedor += `\n\nTURNOS:${resumenAgenda}`;
+              if (cuponId) msgVendedor += `\n\n🎟️ Cupón aplicado.`; // Aviso al vendedor
               
-              // Al Comprador (Con Código OTP)
-              const msgCliente = `Tu pedido fue confirmado. 🔐 CÓDIGO DE RETIRO: ${codigoRetiro}`;
-              enviarNotificacion(compradorId, "¡Compra Exitosa! 🛍️", msgCliente, { tipo: 'COMPRA', uuid: compraUuid });
+              enviarNotificacion(vendedorId, "¡Nueva Venta Online! 💳", msgVendedor, { tipo: 'VENTA', uuid: compraUuid });
+              
+              let msgComprador = `Tu pedido fue confirmado.`;
+              if (resumenAgenda) msgComprador += `\n\nGUARDÁ TU TURNO:${resumenAgenda}`;
+              msgComprador += `\n\n🔐 CÓDIGO: ${codigoRetiro}`;
+
+              enviarNotificacion(compradorId, "¡Compra Exitosa! 🛍️", msgComprador, { tipo: 'COMPRA', uuid: compraUuid });
 
             } catch (dbError) {
               await clientDb.query('ROLLBACK');
@@ -3609,6 +3701,87 @@ app.post('/api/pagos/webhook', async (req, res) => {
               return res.status(500).send("DB Error");
             } finally {
               clientDb.release();
+            }
+        }
+
+        // ====================================================
+        // CASO C: VENTA FLEX (POS VIRTUAL) ⚡
+        // ====================================================
+        else if (externalRef && externalRef.startsWith('FLEX-')) {
+            const checkDuplicado = await pool.query('SELECT 1 FROM historial_comisiones WHERE transaccion_origen_id = $1 AND estado = \'FLEX_PAGADO\'', [paymentId.toString()]);
+            // Usamos paymentId como ID unico temporal ya que no guardamos transacción completa
+            
+            if (checkDuplicado.rows.length > 0) return res.status(200).send("OK");
+
+            const meta = paymentData.metadata;
+            const vendedorId = meta.vendedor_id;
+            const monto = Number(meta.monto_original);
+            const comisionPlataforma = Math.round((monto * 0.01) * 100) / 100;
+
+            const clientDb = await pool.connect();
+            try {
+                await clientDb.query('BEGIN');
+
+                // 1. REPARTO A SOCIO (Si corresponde)
+                const socioRes = await clientDb.query(`
+                    SELECT L.local_id, L.referido_por_socio_id, S.porcentaje_ganancia
+                    FROM locales L
+                    LEFT JOIN socios S ON L.referido_por_socio_id = S.socio_id
+                    WHERE L.usuario_id = $1
+                `, [vendedorId]);
+
+                const localInfo = socioRes.rows[0];
+                const socioId = localInfo?.referido_por_socio_id;
+                const porcentajeSocio = socioId ? parseFloat(localInfo.porcentaje_ganancia || 5.00) : 0;
+
+                if (socioId && comisionPlataforma > 0) {
+                    const gananciaSocio = Math.round((comisionPlataforma * (porcentajeSocio / 100)) * 100) / 100;
+                    
+                    if (gananciaSocio > 0) {
+                        await clientDb.query('UPDATE socios SET saldo_acumulado = saldo_acumulado + $1 WHERE socio_id = $2', [gananciaSocio, socioId]);
+                        
+                        // Guardamos rastro en historial (Usamos paymentId negativo o string para diferenciar si tu columna es INT, 
+                        // pero mejor insertar con transaccion_id NULL si tu schema lo permite. 
+                        // ASUMO QUE transaccion_origen_id ES INT. TRUCO: Insertamos 0 o NULL)
+                        
+                        /* NOTA: Si tu tabla 'historial_comisiones' requiere FK válida a transacciones_p2p, 
+                           este insert fallará. Si es nullable, pasamos NULL. 
+                           Si es estricto, debemos crear una transacción dummy en p2p.
+                           VAMOS A CREAR UNA TRANSACCIÓN DUMMY PARA MANTENER INTEGRIDAD */
+                           
+                        const txDummy = await clientDb.query(`
+                            INSERT INTO transacciones_p2p 
+                            (comprador_id, vendedor_id, monto_total, estado, tipo_entrega, mp_payment_id, compra_uuid, nombre_snapshot, fecha_operacion, comision_plataforma)
+                            VALUES ($1, $2, $3, 'APROBADO', 'FLEX', $4, $5, 'COBRO RÁPIDO POS', NOW(), $6)
+                            RETURNING transaccion_id
+                        `, [meta.comprador_id, vendedorId, monto, paymentId.toString(), externalRef, comisionPlataforma]);
+
+                        const txId = txDummy.rows[0].transaccion_id;
+
+                        await clientDb.query(`
+                            INSERT INTO historial_comisiones (socio_id, transaccion_origen_id, local_origen_id, monto_comision, porcentaje_aplicado, base_calculo_plataforma, estado)
+                            VALUES ($1, $2, $3, $4, $5, $6, 'FLEX_PAGADO')
+                        `, [socioId, txId, localInfo.local_id, gananciaSocio, porcentajeSocio, comisionPlataforma]);
+                    }
+                } else {
+                    // Si no hay socio, igual registramos la venta para estadísticas (opcional, pero recomendado)
+                     await clientDb.query(`
+                        INSERT INTO transacciones_p2p 
+                        (comprador_id, vendedor_id, monto_total, estado, tipo_entrega, mp_payment_id, compra_uuid, nombre_snapshot, fecha_operacion, comision_plataforma)
+                        VALUES ($1, $2, $3, 'APROBADO', 'FLEX', $4, $5, 'COBRO RÁPIDO POS', NOW(), $6)
+                    `, [meta.comprador_id, vendedorId, monto, paymentId.toString(), externalRef, comisionPlataforma]);
+                }
+
+                await clientDb.query('COMMIT');
+                
+                // 2. NOTIFICACIÓN
+                enviarNotificacion(vendedorId, "Pago Recibido ⚡", `Cobraste $${monto} con éxito.`, { tipo: 'VENTA_FLEX', monto: monto });
+
+            } catch (errFlex) {
+                await clientDb.query('ROLLBACK');
+                console.error("❌ Error Webhook Flex:", errFlex);
+            } finally {
+                clientDb.release();
             }
         }
       }
@@ -3619,6 +3792,78 @@ app.post('/api/pagos/webhook', async (req, res) => {
   }
 
   res.status(200).send("OK");
+});
+
+// ==========================================
+// RUTA 5.B: PREFERENCIA FLEX (COBRO RÁPIDO POS) ⚡
+// ==========================================
+app.post('/api/pagos/crear-preferencia-flex', verificarToken, async (req, res) => {
+  const { monto, concepto, local_id } = req.body;
+
+  if (!local_id || !monto || monto <= 0) return res.status(400).json({ error: 'Datos inválidos' });
+
+  try {
+    // 1. OBTENER CREDENCIALES DEL VENDEDOR
+    const queryLocal = 'SELECT mp_access_token, nombre, usuario_id FROM locales WHERE local_id = $1';
+    const localRes = await pool.query(queryLocal, [local_id]);
+
+    if (localRes.rows.length === 0) return res.status(404).json({ error: 'Local no encontrado' });
+    const sellerData = localRes.rows[0];
+    
+    if (!sellerData.mp_access_token) return res.status(400).json({ error: 'Debes vincular Mercado Pago primero.' });
+
+    const vendedorId = sellerData.usuario_id;
+    const externalRef = `FLEX-${Date.now()}-${req.usuario.id}`; // Prefijo FLEX clave para el webhook
+
+    // 2. CALCULAR COMISIÓN (1%)
+    const comisionCercaMio = Math.round((monto * 0.01) * 100) / 100;
+
+    // 3. CREAR PREFERENCIA
+    const sellerClient = new MercadoPagoConfig({ accessToken: sellerData.mp_access_token });
+    const preference = new Preference(sellerClient);
+
+    const body = {
+      items: [
+        {
+          id: 'FLEX', // ID Genérico
+          title: concepto || "Compra en Local",
+          description: "Pago presencial rápido",
+          quantity: 1,
+          unit_price: Number(monto),
+          currency_id: 'ARS',
+        }
+      ],
+      marketplace_fee: comisionCercaMio,
+      external_reference: externalRef,
+      metadata: {
+        tipo: 'FLEX', // Bandera para el Webhook
+        comprador_id: req.usuario.id, // Puede ser el mismo vendedor si usa su cel para cobrar a un NN
+        vendedor_id: vendedorId,
+        local_id: local_id,
+        monto_original: monto
+      },
+      back_urls: {
+        success: "cercamio://payment-result",
+        failure: "cercamio://payment-result",
+      },
+      auto_return: "approved",
+      notification_url: "https://cercamio-backend.onrender.com/api/pagos/webhook", // TU URL REAL
+      statement_descriptor: "CERCAMIO POS"
+    };
+
+    const result = await preference.create({ body });
+
+    // Devolvemos init_point (Link) y qr (Imagen genérica o string QR si MP lo devuelve, por ahora usamos el link)
+    res.json({ 
+      id: result.id, 
+      link_pago: result.init_point,
+      qr_code: result.init_point // En web móvil, el link abre la app directo
+    });
+
+  } catch (error) {
+    console.error("Error Flex:", error);
+    res.status(500).json({ error: 'Error al generar cobro' });
+  }
 });
 
 // RUTA: DESVINCULAR MERCADO PAGO
@@ -5782,6 +6027,236 @@ app.get('/api/mi-negocio/importar-excel/plantilla', (req, res) => {
   } catch (error) {
     console.error("Error generando plantilla:", error);
     res.status(500).send("Error al generar plantilla");
+  }
+});
+
+// ==========================================
+// MÓDULO CUPONES: GESTIÓN VENDEDOR (V15.0) 🎟️
+// ==========================================
+
+// RUTA 70: CREAR CUPÓN NUEVO
+app.post('/api/mi-negocio/cupones', async (req, res) => {
+  const authHeader = req.headers['authorization'];
+  if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
+  const token = authHeader.split(' ')[1];
+
+  const { codigo, descripcion, tipo_descuento, valor_descuento, stock_inicial, fecha_vencimiento } = req.body;
+
+  try {
+    const usuario = jwt.verify(token, process.env.JWT_SECRET);
+    
+    // 1. Obtener local
+    const localRes = await pool.query('SELECT local_id FROM locales WHERE usuario_id = $1', [usuario.id]);
+    if (localRes.rows.length === 0) return res.status(404).json({ error: 'No tienes local' });
+    const localId = localRes.rows[0].local_id;
+
+    // 2. Validaciones de Negocio
+    if (!codigo || !valor_descuento) return res.status(400).json({ error: 'Faltan datos obligatorios' });
+    
+    // Normalizar código (Mayúsculas sin espacios)
+    const codigoClean = codigo.trim().toUpperCase().replace(/\s/g, '');
+
+    // Seguridad financiera
+    if (tipo_descuento === 'PORCENTAJE' && valor_descuento > 100) {
+        return res.status(400).json({ error: 'El descuento no puede ser mayor al 100%' });
+    }
+
+    // 3. Insertar
+    const query = `
+      INSERT INTO cupones 
+      (local_id, codigo, descripcion, tipo_descuento, valor_descuento, stock_inicial, fecha_vencimiento)
+      VALUES ($1, $2, $3, $4, $5, $6, $7)
+    `;
+    
+    await pool.query(query, [
+        localId, 
+        codigoClean, 
+        descripcion, 
+        tipo_descuento || 'PORCENTAJE', 
+        valor_descuento, 
+        stock_inicial || 999999,
+        fecha_vencimiento || null
+    ]);
+
+    res.json({ mensaje: 'Cupón creado exitosamente' });
+
+  } catch (error) {
+    if (error.code === '23505') { // Error de unicidad SQL
+        return res.status(400).json({ error: 'Ya existe un cupón con este código en tu local.' });
+    }
+    console.error("Error creando cupón:", error);
+    res.status(500).json({ error: 'Error al crear cupón' });
+  }
+});
+
+// RUTA 71: LISTAR MIS CUPONES
+app.get('/api/mi-negocio/cupones', async (req, res) => {
+  const authHeader = req.headers['authorization'];
+  if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
+  const token = authHeader.split(' ')[1];
+
+  try {
+    const usuario = jwt.verify(token, process.env.JWT_SECRET);
+    
+    // Traemos cupones con formato de fecha bonito
+    const query = `
+      SELECT 
+        c.*,
+        TO_CHAR(c.fecha_vencimiento, 'DD/MM/YYYY') as vencimiento_fmt
+      FROM cupones c
+      JOIN locales l ON c.local_id = l.local_id
+      WHERE l.usuario_id = $1
+      ORDER BY c.activo DESC, c.fecha_creacion DESC
+    `;
+    
+    const result = await pool.query(query, [usuario.id]);
+    res.json(result.rows);
+
+  } catch (error) {
+    res.status(500).json({ error: 'Error al cargar cupones' });
+  }
+});
+
+// RUTA 72: PAUSAR/ACTIVAR CUPÓN
+app.put('/api/mi-negocio/cupones/:id/toggle', async (req, res) => {
+  const authHeader = req.headers['authorization'];
+  if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
+  const token = authHeader.split(' ')[1];
+  const { id } = req.params;
+
+  try {
+    const usuario = jwt.verify(token, process.env.JWT_SECRET);
+    
+    // Verificamos propiedad y actualizamos en un solo paso
+    const query = `
+      UPDATE cupones 
+      SET activo = NOT activo
+      FROM locales l
+      WHERE cupones.local_id = l.local_id
+      AND cupones.cupon_id = $1
+      AND l.usuario_id = $2
+      RETURNING cupones.activo
+    `;
+    
+    const result = await pool.query(query, [id, usuario.id]);
+
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Cupón no encontrado' });
+
+    res.json({ mensaje: 'Estado actualizado', activo: result.rows[0].activo });
+
+  } catch (error) {
+    res.status(500).json({ error: 'Error al actualizar' });
+  }
+});
+
+// ==========================================
+// RUTA 73: VALIDAR CUPÓN EN CARRITO 🛒
+// ==========================================
+app.post('/api/transaccion/validar-cupon', async (req, res) => {
+  const authHeader = req.headers['authorization'];
+  if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
+  
+  const { local_id, codigo } = req.body;
+
+  try {
+    const codigoNorm = codigo.trim().toUpperCase();
+
+    // 1. Buscar el cupón Maestro
+    const query = `
+      SELECT * FROM cupones 
+      WHERE local_id = $1 
+      AND codigo = $2
+      AND activo = TRUE
+    `;
+    const result = await pool.query(query, [local_id, codigoNorm]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Cupón no válido para este local' });
+    }
+
+    const cupon = result.rows[0];
+
+    // 2. Validaciones de Reglas
+    // A. Fecha
+    if (cupon.fecha_vencimiento && new Date() > new Date(cupon.fecha_vencimiento)) {
+        return res.status(400).json({ error: 'Este cupón ya venció' });
+    }
+    
+    // B. Stock Global
+    if (cupon.stock_usado >= cupon.stock_inicial) {
+        return res.status(400).json({ error: 'Este cupón se agotó' });
+    }
+
+    // 3. Respuesta Exitosa (Frontend calcula el total)
+    res.json({
+        valido: true,
+        cupon_id: cupon.cupon_id,
+        codigo: cupon.codigo,
+        tipo: cupon.tipo_descuento, // 'PORCENTAJE' o 'FIJO'
+        valor: parseFloat(cupon.valor_descuento),
+        mensaje: '¡Cupón aplicado!'
+    });
+
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Error al validar cupón' });
+  }
+});
+
+// ==========================================
+// 🎟️ RUTAS DE BILLETERA (CUPONES)
+// ==========================================
+app.get('/api/usuario/mis-cupones', verificarToken, async (req, res) => {
+  try {
+    const usuarioId = req.usuario.id;
+
+    const query = `
+      SELECT 
+        cw.wallet_id,
+        cw.estado,
+        c.cupon_id,
+        c.codigo,
+        c.descripcion,
+        c.tipo_descuento, -- 'PORCENTAJE' o 'FIJO'
+        c.valor_descuento,
+        c.fecha_vencimiento,
+        l.local_id,
+        l.nombre as nombre_local,
+        l.foto_perfil,
+        l.rubro
+      FROM cupones_wallet cw
+      JOIN cupones c ON cw.cupon_id = c.cupon_id
+      JOIN locales l ON c.local_id = l.local_id
+      WHERE cw.usuario_id = $1 
+        AND cw.estado = 'ACTIVO'
+        AND c.fecha_vencimiento > NOW()
+      ORDER BY c.fecha_vencimiento ASC
+    `;
+
+    const result = await pool.query(query, [usuarioId]);
+    
+    // Formateo para frontend
+    const cupones = result.rows.map(row => ({
+      wallet_id: row.wallet_id,
+      cupon_id: row.cupon_id,
+      codigo: row.codigo,
+      descripcion: row.descripcion,
+      tipo: row.tipo_descuento,
+      valor: row.valor_descuento,
+      vencimiento: row.fecha_vencimiento,
+      local: {
+        id: row.local_id,
+        nombre: row.nombre_local,
+        foto: row.foto_perfil,
+        rubro: row.rubro
+      }
+    }));
+
+    res.json(cupones);
+
+  } catch (err) {
+    console.error('Error al obtener mis cupones:', err);
+    res.status(500).json({ error: 'Error interno al cargar la billetera' });
   }
 });
 
