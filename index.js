@@ -202,8 +202,35 @@ try {
   console.error('❌ Error Firebase:', error.message);
 }
 
-// 8. MIDDLEWARES
-app.use(cors({ origin: '*', methods: ['GET', 'POST', 'PUT', 'DELETE'] }));
+// ==========================================
+// 8. MIDDLEWARES & SEGURIDAD WEB (CORS) 🛡️
+// ==========================================
+const whitelist = [
+  'https://cercamio.app',           // Landing Page Oficial
+  'https://panel.cercamio.app',     // Panel Vendedor
+  'https://admin.cercamio.app',     // Panel Admin
+  'https://api.cercamio.app',       // Auto-referencia
+  'http://localhost:5173',          // Tu entorno local (Vite)
+  'http://localhost:3000'           // Tu entorno local (Node)
+];
+
+app.use(cors({
+  origin: function (origin, callback) {
+    // Permitir requests sin origen (como Apps móviles Flutter, Postman o Server-to-Server)
+    if (!origin) return callback(null, true);
+    
+    if (whitelist.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      console.warn(`⛔ Bloqueado por CORS: ${origin}`);
+      callback(new Error('Bloqueado por CORS: Origen no permitido'));
+    }
+  },
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true // Permite cookies/tokens seguros
+}));
+
 app.use(express.json());
 
 // 9. BASE DE DATOS (NEON)
@@ -236,6 +263,24 @@ app.get('/', (req, res) => {
 });
 
 
+
+// ==========================================
+// 🔗 DEEP LINKING (VERIFICACIÓN ANDROID)
+// ==========================================
+app.get('/.well-known/assetlinks.json', (req, res) => {
+  res.json([
+    {
+      "relation": ["delegate_permission/common.handle_all_urls"],
+      "target": {
+        "namespace": "android_app",
+        "package_name": "com.cercamio.app", // ⚠️ CONFIRMA QUE ESTE SEA TU ID EN build.gradle
+        "sha256_cert_fingerprints": [
+           "66:EC:CF:28:65:75:F8:E6:FD:12:33:A7:6A:7A:44:4E:D9:2C:BB:FA:E2:04:D5:AE:8F:93:4F:4D:60:08:FF:F8" // ⚠️ PEGA AQUÍ TU SHA-256 DEL PASO 1
+        ]
+      }
+    }
+  ]);
+});
 
 // ==========================================
 // RUTAS DE NOTIFICACIONES (HISTORIAL) 🔔
@@ -2050,46 +2095,97 @@ app.get('/api/favoritos/mis-guardados', async (req, res) => {
   }
 });
 
-// RUTA 19: ANALYTICS (TABLERO FINANCIERO)
+// RUTA 19: ANALYTICS (TABLERO FINANCIERO PREMIUM) 💎
 app.get('/api/mi-negocio/analytics', async (req, res) => {
   const authHeader = req.headers['authorization'];
   if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
   const token = authHeader.split(' ')[1];
 
   try {
-    const usuario = jwt.verify(token, JWT_SECRET);
+    const usuario = jwt.verify(token, process.env.JWT_SECRET);
 
-    // 1. KPI PRINCIPALES (Totales generales)
-    // Usamos COALESCE para que devuelva 0 si es null
-    const kpiQuery = `
-      SELECT 
-        COALESCE(SUM(monto_total), 0) as ingresos_totales,
-        COUNT(*) as cantidad_ventas,
-        COALESCE(AVG(monto_total), 0) as ticket_promedio
-      FROM transacciones_p2p 
-      WHERE vendedor_id = $1 AND estado != 'CANCELADO'
-    `;
-    const kpiRes = await pool.query(kpiQuery, [usuario.id]);
+    const client = await pool.connect();
+    try {
+        // 1. OBTENER INFO DEL LOCAL Y PLAN
+        const localRes = await client.query(`
+            SELECT local_id, plan_tipo, plan_vencimiento 
+            FROM locales WHERE usuario_id = $1
+        `, [usuario.id]);
+        
+        if (localRes.rows.length === 0) return res.status(404).json({ error: 'Local no encontrado' });
+        
+        const local = localRes.rows[0];
+        // Verificamos si es Premium activo
+        const esPremium = local.plan_tipo === 'PREMIUM' && new Date(local.plan_vencimiento) > new Date();
 
-    // 2. PRODUCTOS MÁS VENDIDOS (Ranking)
-    const topQuery = `
-      SELECT 
-        C.nombre_oficial, 
-        SUM(T.cantidad) as total_unidades,
-        SUM(T.monto_total) as total_dinero
-      FROM transacciones_p2p T
-      JOIN catalogo_global C ON T.producto_global_id = C.global_id
-      WHERE T.vendedor_id = $1 AND T.estado != 'CANCELADO'
-      GROUP BY C.nombre_oficial
-      ORDER BY total_unidades DESC
-      LIMIT 5
-    `;
-    const topRes = await pool.query(topQuery, [usuario.id]);
+        // 2. KPI PRINCIPALES (Totales)
+        const kpiQuery = `
+          SELECT 
+            COALESCE(SUM(monto_total), 0) as ingresos_totales,
+            COUNT(*) as cantidad_ventas,
+            COALESCE(AVG(monto_total), 0) as ticket_promedio
+          FROM transacciones_p2p 
+          WHERE vendedor_id = $1 AND estado = 'APROBADO'
+        `;
+        const kpiRes = await client.query(kpiQuery, [usuario.id]);
 
-    res.json({
-      kpis: kpiRes.rows[0],
-      top_productos: topRes.rows
-    });
+        // 3. GRÁFICO SEMANAL (Últimos 7 días) 📊
+        // Devuelve: fecha (2023-10-25) y total vendido ese día
+        const chartQuery = `
+            SELECT 
+                to_char(fecha_operacion, 'YYYY-MM-DD') as fecha,
+                SUM(monto_total) as total
+            FROM transacciones_p2p
+            WHERE vendedor_id = $1 
+              AND estado = 'APROBADO'
+              AND fecha_operacion >= NOW() - INTERVAL '6 days'
+            GROUP BY 1
+            ORDER BY 1 ASC
+        `;
+        const chartRes = await client.query(chartQuery, [usuario.id]);
+
+        // 4. RANKING PRODUCTOS (Usamos nombre_snapshot para historia fiel)
+        const topQuery = `
+          SELECT 
+            nombre_snapshot as nombre_oficial, 
+            SUM(cantidad) as total_unidades,
+            SUM(monto_total) as total_dinero,
+            foto_snapshot as foto_url
+          FROM transacciones_p2p
+          WHERE vendedor_id = $1 AND estado = 'APROBADO'
+          GROUP BY nombre_snapshot, foto_snapshot
+          ORDER BY total_unidades DESC
+          LIMIT 5
+        `;
+        const topRes = await client.query(topQuery, [usuario.id]);
+
+        // 5. INSIGHTS PREMIUM (Simulados o Reales)
+        // Si no es premium, mandamos null o data parcial para que el front bloquee
+        let insights = null;
+        if (esPremium) {
+            // Ejemplo: Hora pico (Query real)
+            const horaPicoRes = await client.query(`
+                SELECT EXTRACT(HOUR FROM fecha_operacion) as hora, COUNT(*) as cant
+                FROM transacciones_p2p WHERE vendedor_id = $1 GROUP BY 1 ORDER BY 2 DESC LIMIT 1
+            `, [usuario.id]);
+            
+            insights = {
+                hora_pico: horaPicoRes.rows.length > 0 ? `${horaPicoRes.rows[0].hora}:00 hs` : "--",
+                proyeccion_mes: kpiRes.rows[0].ingresos_totales * 1.2 // Algoritmo simple de proyección
+            };
+        }
+
+        res.json({
+          es_premium: esPremium,
+          kpis: kpiRes.rows[0],
+          chart_data: chartRes.rows,
+          top_productos: topRes.rows,
+          insights: insights
+        });
+
+    } finally {
+        client.release();
+    }
 
   } catch (error) {
     console.error(error);
@@ -2207,6 +2303,7 @@ app.get('/api/mi-negocio/config', async (req, res) => {
     // Usamos 'l.' para asegurarnos de que pedimos datos de la tabla LOCALES
     const consulta = `
       SELECT 
+        l.local_id,
         l.nombre, 
         l.direccion_fisica as direccion, -- Alias para que Flutter lo entienda
         l.whatsapp, 
@@ -3366,7 +3463,7 @@ app.post('/api/pagos/crear-preferencia', async (req, res) => {
         pending: "cercamio://payment-result"
       },
       auto_return: "approved",
-      notification_url: "https://cercamio-backend.onrender.com/api/pagos/webhook",
+      notification_url: "https://api.cercamio.app/api/pagos/webhook",
       statement_descriptor: "CERCAMIO APP"
     };
 
@@ -3399,7 +3496,7 @@ app.get('/api/pagos/auth-url', async (req, res) => { // <--- Ahora es async
 
     // 2. Configuración MP (Revisa que tu APP_ID sea el correcto del panel)
     const appId = '7458384450787340'; 
-    const redirectUri = 'https://cercamio-backend.onrender.com/api/pagos/callback';
+    const redirectUri = 'https://api.cercamio.app/api/pagos/callback';
     
     // 3. EL TRUCO: Pasamos el ID del local en el parámetro 'state'
     // Así cuando vuelva, sabremos quién es.
@@ -3440,7 +3537,7 @@ app.get('/api/pagos/callback', async (req, res) => {
         grant_type: 'authorization_code',
         code: code,
         // Esta URL debe coincidir EXACTAMENTE con la configurada en MP
-        redirect_uri: 'https://cercamio-backend.onrender.com/api/pagos/callback'
+        redirect_uri: 'https://api.cercamio.app/api/pagos/callback'
       })
     });
 
@@ -3868,7 +3965,7 @@ app.post('/api/pagos/crear-preferencia-flex', verificarToken, async (req, res) =
         failure: "cercamio://payment-result",
       },
       auto_return: "approved",
-      notification_url: "https://cercamio-backend.onrender.com/api/pagos/webhook", // TU URL REAL
+      notification_url: "https://api.cercamio.app/api/pagos/webhook", // TU URL REAL
       statement_descriptor: "CERCAMIO POS"
     };
 
@@ -4911,7 +5008,7 @@ app.post('/api/suscripciones/crear-pago', async (req, res) => {
         pending: "cercamio://premium-pending"
       },
       auto_return: "approved",
-      notification_url: "https://cercamio-backend.onrender.com/api/pagos/webhook",
+      notification_url: "https://api.cercamio.app/api/pagos/webhook",
       statement_descriptor: "CERCAMIO PRO"
     };
 
