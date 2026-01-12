@@ -6268,6 +6268,43 @@ app.put('/api/mi-negocio/cupones/:id/toggle', async (req, res) => {
 });
 
 // ==========================================
+// RUTA 73: ELIMINAR CUPÓN (DELETE) 🗑️
+// ==========================================
+app.delete('/api/mi-negocio/cupones/:id', verificarToken, async (req, res) => {
+  const usuarioId = req.usuario.id;
+  const cuponId = req.params.id;
+
+  try {
+    // Solo borramos si pertenece al usuario (seguridad mediante JOIN implícito o subquery)
+    const query = `
+        DELETE FROM cupones 
+        WHERE cupon_id = $1 
+        AND local_id = (SELECT local_id FROM locales WHERE usuario_id = $2)
+    `;
+    
+    const result = await pool.query(query, [cuponId, usuarioId]);
+
+    if (result.rowCount === 0) {
+        // Puede ser que no exista o que tenga FK constraints (ya se usó)
+        // Si ya se usó, no se puede borrar por integridad SQL.
+        // En ese caso, mejor usamos la lógica de "Desactivar" (Ruta 72), 
+        // pero para el panel web intentaremos borrar primero.
+        return res.status(404).json({ error: 'No se pudo eliminar (quizás ya tiene uso o no es tuyo)' });
+    }
+
+    res.json({ mensaje: 'Cupón eliminado permanentemente' });
+
+  } catch (error) {
+    // Error 23503 = Violación de Foreign Key (El cupón ya se usó en una venta)
+    if (error.code === '23503') {
+       return res.status(400).json({ error: 'No se puede borrar un cupón que ya fue utilizado por clientes. Puedes pausarlo.' });
+    }
+    console.error("Error Delete Cupón:", error);
+    res.status(500).json({ error: 'Error al eliminar' });
+  }
+});
+
+// ==========================================
 // RUTA 73: VALIDAR CUPÓN EN CARRITO 🛒
 // ==========================================
 app.post('/api/transaccion/validar-cupon', async (req, res) => {
