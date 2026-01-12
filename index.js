@@ -151,6 +151,27 @@ const enviarNotificacion = async (usuarioIdDestino, titulo, mensaje, dataPayload
   }
 };
 
+// ==========================================
+// 🔐 MIDDLEWARE DE AUTENTICACIÓN (FALTABA ESTO)
+// ==========================================
+const verificarToken = (req, res, next) => {
+  // 1. Buscamos el header "Authorization: Bearer <token>"
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+
+  // 2. Si no hay token, error 401
+  if (!token) return res.status(401).json({ error: 'Acceso denegado: Token requerido' });
+
+  try {
+    // 3. Verificamos firma con el Secreto
+    const verificado = jwt.verify(token, process.env.JWT_SECRET);
+    req.usuario = verificado; // Guardamos datos del usuario en la request
+    next(); // Continuamos a la ruta
+  } catch (error) {
+    res.status(400).json({ error: 'Token inválido o expirado' });
+  }
+};
+
 // 6. CONFIGURAMOS LA APP EXPRESS
 const app = express();
 const port = process.env.PORT || 3000;
