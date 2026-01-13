@@ -447,8 +447,7 @@ app.get('/api/admin/finanzas', verificarToken, verificarAdmin, async (req, res) 
         WHERE estado != 'ANULADA'
       `);
 
-      // 4. ÚLTIMOS MOVIMIENTOS (Mix de Ventas y Suscripciones)
-      // Hacemos una UNION para mostrar todo junto cronológicamente
+      // 4. ÚLTIMOS MOVIMIENTOS (CORREGIDO: pago_id)
       const movimientosRes = await client.query(`
         (
           SELECT 
@@ -465,9 +464,10 @@ app.get('/api/admin/finanzas', verificarToken, verificarAdmin, async (req, res) 
         (
           SELECT 
             'PREMIUM' as tipo,
-            pagos_id::text as id,
+            -- 🔥 CORRECCIÓN AQUÍ: Probamos 'pago_id' (singular)
+            pago_id::text as id, 
             monto_pagado as monto,
-            monto_pagado as ganancia, -- En premium todo es ganancia (menos impuestos MP)
+            monto_pagado as ganancia,
             fecha_pago as fecha,
             'APROBADO' as estado
           FROM pagos_suscripciones
