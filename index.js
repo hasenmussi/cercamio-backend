@@ -172,6 +172,32 @@ const verificarToken = (req, res, next) => {
   }
 };
 
+// ==========================================
+// 🛡️ MIDDLEWARE: SOLO ADMINS
+// ==========================================
+const verificarAdmin = async (req, res, next) => {
+  // 1. Ya pasó por verificarToken, así que tenemos req.usuario.id
+  try {
+    const query = 'SELECT rol FROM usuarios WHERE usuario_id = $1';
+    const result = await pool.query(query, [req.usuario.id]);
+    
+    if (result.rows.length === 0) return res.status(401).json({ error: 'Usuario no existe' });
+    
+    const rol = result.rows[0].rol;
+    
+    // 2. Validamos el ROL
+    if (rol === 'SUPER_ADMIN' || rol === 'SOPORTE' || rol === 'MARKETING') {
+      req.usuario.rol = rol; // Guardamos el rol para usarlo luego
+      next(); // Pase, jefe.
+    } else {
+      return res.status(403).json({ error: 'Acceso denegado: Requieres permisos de Administrador' });
+    }
+  } catch (error) {
+    console.error("Error verificando admin:", error);
+    res.status(500).json({ error: 'Error de servidor' });
+  }
+};
+
 // 6. CONFIGURAMOS LA APP EXPRESS
 const app = express();
 const port = process.env.PORT || 3000;
@@ -917,7 +943,7 @@ app.post('/api/auth/registro', async (req, res) => {
 });
 
 // ==========================================
-// RUTA 4: LOGIN (OPTIMIZADA v10.4 - CON VERIFICACIÓN OBLIGATORIA 🔒)
+// RUTA 4: LOGIN (CON ROL ADMIN 👑)
 // ==========================================
 app.post('/api/auth/login', async (req, res) => {
   const { email, password } = req.body;
@@ -938,12 +964,11 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(400).json({ error: 'Contraseña incorrecta' });
     }
 
-    // 3. 🛑 CHECKPOINT DE VERIFICACIÓN (NUEVO) 🛑
+    // 3. CHECKPOINT DE VERIFICACIÓN
     if (!usuario.email_verified) {
-      // Si no verificó, lo bloqueamos y le avisamos al Frontend
       return res.status(403).json({ 
         error: 'Tu cuenta no está verificada.',
-        code: 'EMAIL_NOT_VERIFIED', // Código clave para Flutter
+        code: 'EMAIL_NOT_VERIFIED', 
         email: usuario.email 
       });
     }
@@ -955,14 +980,18 @@ app.post('/api/auth/login', async (req, res) => {
     const tienePerfilProfesional = localRes.rows.length > 0;
     const datosLocal = tienePerfilProfesional ? localRes.rows[0] : null;
 
-    // 5. Generar Token
+    // 5. Generar Token (🔥 AHORA INCLUYE EL ROL)
     const token = jwt.sign(
-      { id: usuario.usuario_id, tipo: usuario.tipo }, 
-      process.env.JWT_SECRET, // Asegúrate de usar process.env
+      { 
+        id: usuario.usuario_id, 
+        tipo: usuario.tipo,
+        rol: usuario.rol || 'USER' // Si es null, es USER
+      }, 
+      process.env.JWT_SECRET, 
       { expiresIn: '30d' }
     );
 
-    // 6. Responder
+    // 6. Responder (🔥 DEVOLVEMOS EL ROL AL FRONTEND)
     res.json({ 
       mensaje: 'Bienvenido',
       token: token,
@@ -971,7 +1000,8 @@ app.post('/api/auth/login', async (req, res) => {
         nombre: usuario.nombre_completo,
         email: usuario.email,
         tipo: usuario.tipo,
-        foto_url: usuario.foto_url 
+        foto_url: usuario.foto_url,
+        rol: usuario.rol || 'USER' // <--- DATO VITAL PARA EL PANEL
       },
       perfil_profesional: tienePerfilProfesional ? {
         local_id: datosLocal.local_id,
