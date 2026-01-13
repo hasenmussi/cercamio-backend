@@ -417,6 +417,93 @@ app.put('/api/admin/usuarios/:id/ban', verificarToken, verificarAdmin, async (re
 });
 
 // ==========================================
+// RUTA ADMIN: REPORTE FINANCIERO (CASHFLOW) 💰
+// ==========================================
+app.get('/api/admin/finanzas', verificarToken, verificarAdmin, async (req, res) => {
+  try {
+    const client = await pool.connect();
+    
+    try {
+      // 1. INGRESOS MARKETPLACE (Comisiones por venta)
+      // Solo sumamos de ventas completadas o aprobadas
+      const marketplaceRes = await client.query(`
+        SELECT 
+          COALESCE(SUM(monto_total), 0) as gmv_total, -- Dinero total movido
+          COALESCE(SUM(comision_plataforma), 0) as revenue_marketplace
+        FROM transacciones_p2p 
+        WHERE estado NOT IN ('CANCELADO', 'RECHAZADO')
+      `);
+
+      // 2. INGRESOS SAAS (Suscripciones Premium)
+      const saasRes = await client.query(`
+        SELECT COALESCE(SUM(monto_pagado), 0) as revenue_saas
+        FROM pagos_suscripciones
+      `);
+
+      // 3. EGRESOS SOCIOS (Reparto de ganancias)
+      const sociosRes = await client.query(`
+        SELECT COALESCE(SUM(monto_comision), 0) as costos_socios
+        FROM historial_comisiones
+        WHERE estado != 'ANULADA'
+      `);
+
+      // 4. ÚLTIMOS MOVIMIENTOS (Mix de Ventas y Suscripciones)
+      // Hacemos una UNION para mostrar todo junto cronológicamente
+      const movimientosRes = await client.query(`
+        (
+          SELECT 
+            'VENTA' as tipo,
+            transaccion_id::text as id,
+            monto_total as monto,
+            comision_plataforma as ganancia,
+            fecha_operacion as fecha,
+            estado
+          FROM transacciones_p2p
+          WHERE estado NOT IN ('CANCELADO', 'RECHAZADO')
+        )
+        UNION ALL
+        (
+          SELECT 
+            'PREMIUM' as tipo,
+            pagos_id::text as id,
+            monto_pagado as monto,
+            monto_pagado as ganancia, -- En premium todo es ganancia (menos impuestos MP)
+            fecha_pago as fecha,
+            'APROBADO' as estado
+          FROM pagos_suscripciones
+        )
+        ORDER BY fecha DESC
+        LIMIT 10
+      `);
+
+      const mkp = marketplaceRes.rows[0];
+      const saas = saasRes.rows[0].revenue_saas;
+      const socios = sociosRes.rows[0].costos_socios;
+
+      // Cálculo de Totales
+      const totalRevenue = parseFloat(mkp.revenue_marketplace) + parseFloat(saas);
+      const netProfit = totalRevenue - parseFloat(socios);
+
+      res.json({
+        gmv: mkp.gmv_total,           // Volumen bruto de ventas
+        revenue_mkp: mkp.revenue_marketplace,
+        revenue_saas: saas,
+        costos_socios: socios,
+        total_revenue: totalRevenue,  // Ingreso Bruto Plataforma
+        net_profit: netProfit,        // Tu Ganancia Neta
+        movimientos: movimientosRes.rows
+      });
+
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    console.error("Error Finanzas:", error);
+    res.status(500).json({ error: 'Error al calcular finanzas' });
+  }
+});
+
+// ==========================================
 // 🔗 DEEP LINKING (VERIFICACIÓN ANDROID)
 // ==========================================
 app.get('/.well-known/assetlinks.json', (req, res) => {
