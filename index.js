@@ -290,17 +290,17 @@ app.get('/', (req, res) => {
 
 
 // ==========================================
-// RUTA ADMIN: DASHBOARD GOD MODE 👑
+// RUTA ADMIN: DASHBOARD GOD MODE 👑 (CORREGIDO)
 // ==========================================
 app.get('/api/admin/dashboard', verificarToken, verificarAdmin, async (req, res) => {
   try {
     const client = await pool.connect();
     
     try {
-      // 1. KPIs GLOBALES (Instantáneos)
+      // 1. KPIs GLOBALES (Corregido: usuarios, locales)
       const kpisQuery = `
         SELECT 
-          (SELECT COUNT(*) FROM users) as total_usuarios,
+          (SELECT COUNT(*) FROM usuarios) as total_usuarios,
           (SELECT COUNT(*) FROM locales) as total_locales,
           (SELECT COALESCE(SUM(monto_total), 0) FROM transacciones_p2p WHERE estado = 'ENTREGADO') as gmv_total,
           (SELECT COUNT(*) FROM transacciones_p2p WHERE fecha_operacion >= CURRENT_DATE) as ventas_hoy
@@ -318,15 +318,14 @@ app.get('/api/admin/dashboard', verificarToken, verificarAdmin, async (req, res)
       `;
       const chart = (await client.query(chartQuery)).rows;
 
-      // 3. ÚLTIMOS USUARIOS (Los nuevos vecinos)
+      // 3. ÚLTIMOS USUARIOS (Corregido: tabla usuarios)
+      // Usamos usuario_id DESC porque no estoy seguro si tienes created_at
       const usersQuery = `
-        SELECT nombre_completo, email, foto_url, created_at 
-        FROM users 
-        ORDER BY created_at DESC LIMIT 5
+        SELECT nombre_completo, email, foto_url
+        FROM usuarios 
+        ORDER BY usuario_id DESC LIMIT 5
       `;
-      // Nota: Si tu tabla users no tiene created_at, usa user_id desc
-      // Asumiremos user_id desc para la demo si no tienes fecha
-      const lastUsers = (await client.query('SELECT nombre_completo, email, foto_url FROM usuarios ORDER BY usuario_id DESC LIMIT 5')).rows;
+      const lastUsers = (await client.query(usersQuery)).rows;
 
       res.json({ kpis, chart, lastUsers });
 
