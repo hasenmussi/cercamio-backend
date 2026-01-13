@@ -504,6 +504,57 @@ app.get('/api/admin/finanzas', verificarToken, verificarAdmin, async (req, res) 
 });
 
 // ==========================================
+// RUTA ADMIN: DATOS GEO-ESPACIALES (MAPA) 🗺️
+// ==========================================
+app.get('/api/admin/mapa', verificarToken, verificarAdmin, async (req, res) => {
+  try {
+    const client = await pool.connect();
+    try {
+      // 1. OBTENER LOCALES (Con Coordenadas)
+      // Usamos ST_X (Lon) y ST_Y (Lat) de PostGIS casting a geometry
+      const localesQuery = `
+        SELECT 
+          local_id, 
+          nombre, 
+          rubro, 
+          foto_perfil,
+          estado_manual, -- 'ABIERTO', 'CERRADO'
+          -- Extraemos lat/lng del objeto PostGIS
+          ST_Y(ubicacion::geometry) as lat,
+          ST_X(ubicacion::geometry) as lng
+        FROM locales
+        WHERE ubicacion IS NOT NULL
+      `;
+      const locales = (await client.query(localesQuery)).rows;
+
+      // 2. OBTENER ZONAS DE CALOR (Ventas recientes)
+      // Agrupamos ventas por ubicación del vendedor para ver dónde se factura más
+      const calorQuery = `
+        SELECT 
+          l.local_id,
+          ST_Y(l.ubicacion::geometry) as lat,
+          ST_X(l.ubicacion::geometry) as lng,
+          COUNT(*) as intensidad
+        FROM transacciones_p2p t
+        JOIN locales l ON t.vendedor_id = l.usuario_id
+        WHERE t.fecha_operacion > NOW() - INTERVAL '30 days'
+        GROUP BY l.local_id, l.ubicacion
+      `;
+      const calor = (await client.query(calorQuery)).rows;
+
+      res.json({ locales, calor });
+
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    console.error("Error Geo-Analytics:", error);
+    // Si falla PostGIS (ej: nulls), devolvemos array vacío para no romper el front
+    res.json({ locales: [], calor: [] });
+  }
+});
+
+// ==========================================
 // 🔗 DEEP LINKING (VERIFICACIÓN ANDROID)
 // ==========================================
 app.get('/.well-known/assetlinks.json', (req, res) => {
