@@ -339,10 +339,10 @@ app.get('/api/admin/dashboard', verificarToken, verificarAdmin, async (req, res)
 });
 
 // ==========================================
-// RUTA ADMIN: LISTAR USUARIOS (CON BUSCADOR) 👥
+// RUTA ADMIN: LISTAR USUARIOS (V3 - DETECCIÓN AUTOMÁTICA DE LOCAL) 🕵️‍♂️
 // ==========================================
 app.get('/api/admin/usuarios', verificarToken, verificarAdmin, async (req, res) => {
-  const { search } = req.query; // ?search=juan
+  const { search } = req.query;
 
   try {
     let query = `
@@ -352,21 +352,28 @@ app.get('/api/admin/usuarios', verificarToken, verificarAdmin, async (req, res) 
         u.email, 
         u.foto_url, 
         u.rol, 
-        u.tipo, -- 'PERSONAL' o 'PROFESIONAL'
+        u.tipo, -- Este campo puede mentir (decir Personal cuando ya tiene local)
         u.email_verified,
-        -- 🔥 LÓGICA INVERTIDA: Si banned es false, activo es true
         NOT COALESCE(u.banned, false) as activo, 
-        to_char(u.created_at, 'DD/MM/YYYY') as fecha_registro
+        to_char(u.created_at, 'DD/MM/YYYY') as fecha_registro,
+        
+        -- 🔥 LA FUENTE DE LA VERDAD:
+        -- Si esto no es NULL, es un Vendedor, punto.
+        l.nombre as nombre_local,
+        l.local_id
+        
       FROM usuarios u
+      LEFT JOIN locales l ON u.usuario_id = l.usuario_id
     `;
 
     const params = [];
     if (search) {
-      query += ` WHERE u.nombre_completo ILIKE $1 OR u.email ILIKE $1`;
+      // Buscamos por nombre de usuario, email O nombre del local
+      query += ` WHERE u.nombre_completo ILIKE $1 OR u.email ILIKE $1 OR l.nombre ILIKE $1`;
       params.push(`%${search}%`);
     }
 
-    query += ` ORDER BY u.usuario_id DESC LIMIT 50`; // Paginación simple v1
+    query += ` ORDER BY u.usuario_id DESC LIMIT 50`;
 
     const result = await pool.query(query, params);
     res.json(result.rows);
