@@ -385,31 +385,40 @@ app.get('/api/admin/usuarios', verificarToken, verificarAdmin, async (req, res) 
 });
 
 // ==========================================
-// RUTA ADMIN: BANEAR/DESBANEAR USUARIO (V2 - COLUMNA BANNED) 🚫
+// RUTA ADMIN: BANEAR + AUDITORÍA 🛡️📝
 // ==========================================
 app.put('/api/admin/usuarios/:id/ban', verificarToken, verificarAdmin, async (req, res) => {
   const { id } = req.params;
+  const adminId = req.usuario.id; // El que ejecuta la acción
   
   try {
-    if (parseInt(id) === req.usuario.id) {
-      return res.status(400).json({ error: 'No puedes banearte a ti mismo, Jefe.' });
+    if (parseInt(id) === adminId) return res.status(400).json({ error: 'No puedes banearte a ti mismo.' });
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        // 1. Ejecutar Baneo
+        const query = `UPDATE usuarios SET banned = NOT COALESCE(banned, false) WHERE usuario_id = $1 RETURNING banned, email`;
+        const result = await client.query(query, [id]);
+        const { banned, email } = result.rows[0];
+        const estado = banned ? 'BLOQUEADO' : 'ACTIVO';
+
+        // 2. Insertar en Auditoría 📝
+        await client.query(`
+            INSERT INTO logs_auditoria (admin_id, accion, detalle)
+            VALUES ($1, $2, $3)
+        `, [adminId, banned ? 'BAN_USER' : 'UNBAN_USER', `Usuario ${email} (ID: ${id}) pasó a estado: ${estado}`]);
+
+        await client.query('COMMIT');
+        res.json({ mensaje: `Usuario ${estado} correctamente` });
+
+    } catch (e) {
+        await client.query('ROLLBACK');
+        throw e;
+    } finally {
+        client.release();
     }
-
-    // Usamos COALESCE para tratar NULL como FALSE por seguridad
-    const query = `
-      UPDATE usuarios 
-      SET banned = NOT COALESCE(banned, false) 
-      WHERE usuario_id = $1 
-      RETURNING banned
-    `;
-    
-    const result = await pool.query(query, [id]);
-    
-    // Si banned es true, el estado es BLOQUEADO. Si es false, es ACTIVO.
-    const estado = result.rows[0].banned ? 'BLOQUEADO' : 'ACTIVO';
-    
-    res.json({ mensaje: `Usuario ${estado} correctamente` });
-
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: 'Error al cambiar estado' });
@@ -551,6 +560,32 @@ app.get('/api/admin/mapa', verificarToken, verificarAdmin, async (req, res) => {
     console.error("Error Geo-Analytics:", error);
     // Si falla PostGIS (ej: nulls), devolvemos array vacío para no romper el front
     res.json({ locales: [], calor: [] });
+  }
+});
+
+// ==========================================
+// RUTA ADMIN: VER LOGS DE SEGURIDAD 📜
+// ==========================================
+app.get('/api/admin/logs', verificarToken, verificarAdmin, async (req, res) => {
+  try {
+    const query = `
+      SELECT 
+        l.log_id,
+        l.accion,
+        l.detalle,
+        to_char(l.fecha, 'DD/MM/YYYY HH24:MI') as fecha_fmt,
+        u.nombre_completo as admin_nombre,
+        u.foto_url as admin_foto
+      FROM logs_auditoria l
+      JOIN usuarios u ON l.admin_id = u.usuario_id
+      ORDER BY l.fecha DESC
+      LIMIT 100
+    `;
+    const result = await pool.query(query);
+    res.json(result.rows);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Error leyendo logs' });
   }
 });
 
