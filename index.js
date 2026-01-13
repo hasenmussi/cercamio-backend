@@ -339,6 +339,77 @@ app.get('/api/admin/dashboard', verificarToken, verificarAdmin, async (req, res)
 });
 
 // ==========================================
+// RUTA ADMIN: LISTAR USUARIOS (CON BUSCADOR) 👥
+// ==========================================
+app.get('/api/admin/usuarios', verificarToken, verificarAdmin, async (req, res) => {
+  const { search } = req.query; // ?search=juan
+
+  try {
+    let query = `
+      SELECT 
+        u.usuario_id, 
+        u.nombre_completo, 
+        u.email, 
+        u.foto_url, 
+        u.rol, 
+        u.tipo, -- 'PERSONAL' o 'PROFESIONAL'
+        u.email_verified,
+        -- 🔥 LÓGICA INVERTIDA: Si banned es false, activo es true
+        NOT COALESCE(u.banned, false) as activo, 
+        to_char(u.created_at, 'DD/MM/YYYY') as fecha_registro
+      FROM usuarios u
+    `;
+
+    const params = [];
+    if (search) {
+      query += ` WHERE u.nombre_completo ILIKE $1 OR u.email ILIKE $1`;
+      params.push(`%${search}%`);
+    }
+
+    query += ` ORDER BY u.usuario_id DESC LIMIT 50`; // Paginación simple v1
+
+    const result = await pool.query(query, params);
+    res.json(result.rows);
+
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Error al listar usuarios' });
+  }
+});
+
+// ==========================================
+// RUTA ADMIN: BANEAR/DESBANEAR USUARIO (V2 - COLUMNA BANNED) 🚫
+// ==========================================
+app.put('/api/admin/usuarios/:id/ban', verificarToken, verificarAdmin, async (req, res) => {
+  const { id } = req.params;
+  
+  try {
+    if (parseInt(id) === req.usuario.id) {
+      return res.status(400).json({ error: 'No puedes banearte a ti mismo, Jefe.' });
+    }
+
+    // Usamos COALESCE para tratar NULL como FALSE por seguridad
+    const query = `
+      UPDATE usuarios 
+      SET banned = NOT COALESCE(banned, false) 
+      WHERE usuario_id = $1 
+      RETURNING banned
+    `;
+    
+    const result = await pool.query(query, [id]);
+    
+    // Si banned es true, el estado es BLOQUEADO. Si es false, es ACTIVO.
+    const estado = result.rows[0].banned ? 'BLOQUEADO' : 'ACTIVO';
+    
+    res.json({ mensaje: `Usuario ${estado} correctamente` });
+
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Error al cambiar estado' });
+  }
+});
+
+// ==========================================
 // 🔗 DEEP LINKING (VERIFICACIÓN ANDROID)
 // ==========================================
 app.get('/.well-known/assetlinks.json', (req, res) => {
@@ -1005,6 +1076,13 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(400).json({ error: 'Usuario no encontrado' });
     }
     const usuario = userRes.rows[0];
+
+    // 🛑 NUEVO BLOQUEO DE SEGURIDAD (BANNED) 🛑
+    if (usuario.banned) {
+       return res.status(403).json({ 
+         error: 'Tu cuenta ha sido suspendida por la administración por violar los términos de servicio.' 
+       });
+    }
 
     // 2. Validar Password
     const validPassword = await bcrypt.compare(password, usuario.password_hash);
