@@ -289,6 +289,55 @@ app.get('/', (req, res) => {
 });
 
 
+// ==========================================
+// RUTA ADMIN: DASHBOARD GOD MODE 👑
+// ==========================================
+app.get('/api/admin/dashboard', verificarToken, verificarAdmin, async (req, res) => {
+  try {
+    const client = await pool.connect();
+    
+    try {
+      // 1. KPIs GLOBALES (Instantáneos)
+      const kpisQuery = `
+        SELECT 
+          (SELECT COUNT(*) FROM users) as total_usuarios,
+          (SELECT COUNT(*) FROM locales) as total_locales,
+          (SELECT COALESCE(SUM(monto_total), 0) FROM transacciones_p2p WHERE estado = 'ENTREGADO') as gmv_total,
+          (SELECT COUNT(*) FROM transacciones_p2p WHERE fecha_operacion >= CURRENT_DATE) as ventas_hoy
+      `;
+      const kpis = (await client.query(kpisQuery)).rows[0];
+
+      // 2. CURVA DE CRECIMIENTO (Últimos 7 días)
+      const chartQuery = `
+        SELECT 
+          to_char(fecha_operacion, 'DD/MM') as fecha,
+          COALESCE(SUM(monto_total), 0) as total
+        FROM transacciones_p2p
+        WHERE fecha_operacion >= NOW() - INTERVAL '7 days'
+        GROUP BY 1 ORDER BY 1 ASC
+      `;
+      const chart = (await client.query(chartQuery)).rows;
+
+      // 3. ÚLTIMOS USUARIOS (Los nuevos vecinos)
+      const usersQuery = `
+        SELECT nombre_completo, email, foto_url, created_at 
+        FROM users 
+        ORDER BY created_at DESC LIMIT 5
+      `;
+      // Nota: Si tu tabla users no tiene created_at, usa user_id desc
+      // Asumiremos user_id desc para la demo si no tienes fecha
+      const lastUsers = (await client.query('SELECT nombre_completo, email, foto_url FROM usuarios ORDER BY usuario_id DESC LIMIT 5')).rows;
+
+      res.json({ kpis, chart, lastUsers });
+
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    console.error("Error Admin Dashboard:", error);
+    res.status(500).json({ error: 'Error de servidor' });
+  }
+});
 
 // ==========================================
 // 🔗 DEEP LINKING (VERIFICACIÓN ANDROID)
