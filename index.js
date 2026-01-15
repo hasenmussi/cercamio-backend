@@ -608,6 +608,182 @@ app.get('/.well-known/assetlinks.json', (req, res) => {
 });
 
 // ==========================================
+// RUTA 99: SMART DEEP LINK (DISEÑO PREMIUM v2) 🌉
+// ==========================================
+app.get('/local/:id', async (req, res) => {
+  const localId = req.params.id;
+  
+  // 1. DATA VISUAL
+  let titulo = "CercaMío";
+  let subtitulo = "El Sistema Operativo de tu Barrio";
+  // Icono de Mapa/Tienda genérico de alta calidad
+  let imagen = "https://cdn-icons-png.flaticon.com/512/854/854878.png"; 
+
+  try {
+    const localRes = await pool.query('SELECT nombre, foto_portada, rubro FROM locales WHERE local_id = $1', [localId]);
+    if (localRes.rows.length > 0) {
+      titulo = localRes.rows[0].nombre;
+      subtitulo = localRes.rows[0].rubro || "Comercio Local";
+      if (localRes.rows[0].foto_portada) imagen = localRes.rows[0].foto_portada;
+    }
+  } catch (e) { console.error("Error fetching local metadata", e); }
+
+  // 2. Intent Android
+  const intentUrl = `intent://api.cercamio.app/local/${localId}#Intent;scheme=https;package=com.cercamio.app;S.browser_fallback_url=https://play.google.com/store/apps/details?id=com.cercamio.app;end`;
+
+  // 3. HTML DE ALTO IMPACTO
+  res.send(`
+    <!DOCTYPE html>
+    <html lang="es">
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      
+      <!-- OG TAGS (WhatsApp Preview) -->
+      <meta property="og:title" content="${titulo} en CercaMío 📍" />
+      <meta property="og:description" content="Mirá sus productos, ofertas y turnos. ¡Descargá la App!" />
+      <meta property="og:image" content="${imagen}" />
+      <meta property="og:type" content="website" />
+      
+      <title>${titulo}</title>
+      <style>
+        /* RESET & BASE */
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { 
+          font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+          background: #f0f4f8;
+          background-image: radial-gradient(#cbd5e1 1px, transparent 1px);
+          background-size: 20px 20px;
+          height: 100vh;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          color: #1e293b;
+        }
+
+        /* TARJETA FLOTANTE */
+        .card {
+          background: rgba(255, 255, 255, 0.9);
+          backdrop-filter: blur(10px);
+          padding: 40px 30px;
+          border-radius: 30px;
+          box-shadow: 0 20px 40px -10px rgba(0,0,0,0.1), 0 0 0 1px rgba(255,255,255,0.5) inset;
+          text-align: center;
+          max-width: 90%;
+          width: 360px;
+          animation: slideUp 0.6s cubic-bezier(0.16, 1, 0.3, 1);
+        }
+
+        /* IMAGEN HERO */
+        .img-container {
+          width: 100px;
+          height: 100px;
+          margin: 0 auto 20px;
+          border-radius: 25px;
+          box-shadow: 0 10px 20px rgba(0,0,0,0.1);
+          overflow: hidden;
+          background: white;
+          position: relative;
+        }
+        .img-container img {
+          width: 100%;
+          height: 100%;
+          object-fit: cover;
+        }
+
+        /* TIPOGRAFÍA */
+        h1 { font-size: 24px; font-weight: 800; margin-bottom: 5px; color: #0f172a; letter-spacing: -0.5px; }
+        h2 { font-size: 14px; font-weight: 600; color: #64748b; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 25px; }
+        p { font-size: 15px; color: #475569; line-height: 1.5; margin-bottom: 30px; }
+
+        /* BOTÓN DE ACCIÓN */
+        .btn {
+          display: block;
+          width: 100%;
+          padding: 16px;
+          background: linear-gradient(135deg, #2563EB 0%, #1D4ED8 100%);
+          color: white;
+          text-decoration: none;
+          font-weight: 700;
+          border-radius: 16px;
+          font-size: 16px;
+          box-shadow: 0 10px 20px -5px rgba(37, 99, 235, 0.4);
+          transition: transform 0.2s, box-shadow 0.2s;
+          position: relative;
+          overflow: hidden;
+        }
+        .btn:active { transform: scale(0.96); }
+        
+        /* EFECTO PULSE EN BOTÓN */
+        .btn::after {
+          content: '';
+          position: absolute;
+          top: 0; left: 0; right: 0; bottom: 0;
+          background: rgba(255,255,255,0.2);
+          opacity: 0;
+          animation: pulse 2s infinite;
+        }
+
+        /* ANIMACIONES */
+        @keyframes slideUp {
+          from { opacity: 0; transform: translateY(20px); }
+          to { opacity: 1; transform: translateY(0); }
+        }
+        @keyframes pulse {
+          0% { transform: scale(0.95); opacity: 0; }
+          50% { opacity: 1; }
+          100% { transform: scale(1.05); opacity: 0; }
+        }
+        
+        .spinner {
+          margin-top: 20px;
+          font-size: 12px;
+          color: #94a3b8;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          gap: 5px;
+        }
+        .dot { width: 6px; height: 6px; background: #cbd5e1; border-radius: 50%; animation: bounce 1.4s infinite ease-in-out both; }
+        .dot:nth-child(1) { animation-delay: -0.32s; }
+        .dot:nth-child(2) { animation-delay: -0.16s; }
+        
+        @keyframes bounce { 0%, 80%, 100% { transform: scale(0); } 40% { transform: scale(1); } }
+
+      </style>
+    </head>
+    <body>
+      
+      <div class="card">
+        <div class="img-container">
+          <img src="${imagen}" alt="Logo Local">
+        </div>
+        
+        <h1>${titulo}</h1>
+        <h2>${subtitulo}</h2>
+        
+        <p>Te estamos redirigiendo a la app para ver el perfil completo, precios y disponibilidad.</p>
+        
+        <a id="btnOpen" href="${intentUrl}" class="btn">Abrir CercaMío</a>
+        
+        <div class="spinner">
+          <div class="dot"></div>
+          <div class="dot"></div>
+          <div class="dot"></div>
+        </div>
+      </div>
+
+      <script>
+        // Intento automático
+        setTimeout(function() { window.location.href = "${intentUrl}"; }, 800);
+      </script>
+    </body>
+    </html>
+  `);
+});
+
+
+// ==========================================
 // RUTAS DE NOTIFICACIONES (HISTORIAL) 🔔
 // ==========================================
 
