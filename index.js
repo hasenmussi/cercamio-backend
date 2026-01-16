@@ -590,19 +590,20 @@ app.get('/api/admin/logs', verificarToken, verificarAdmin, async (req, res) => {
 });
 
 // ==========================================
-// 🔗 DEEP LINKING (VERIFICACIÓN ANDROID - DUAL KEY) ✅
+// 🔗 DEEP LINKING & CREDENTIALS (VERIFICACIÓN FINAL GOOGLE) ✅
 // ==========================================
 app.get('/.well-known/assetlinks.json', (req, res) => {
   res.json([
     {
-      "relation": ["delegate_permission/common.handle_all_urls"],
+      "relation": [
+        "delegate_permission/common.handle_all_urls",
+        "delegate_permission/common.get_login_creds"
+      ],
       "target": {
         "namespace": "android_app",
         "package_name": "com.cercamio.app",
         "sha256_cert_fingerprints": [
-          // Llave 1 (Tu entorno local / Upload Key)
           "66:EC:CF:28:65:75:F8:E6:FD:12:33:A7:6A:7A:44:4E:D9:2C:BB:FA:E2:04:D5:AE:8F:93:4F:4D:60:08:FF:F8",
-          // Llave 2 (Google Play Signing - PROD)
           "33:28:06:98:CC:AB:D7:41:B9:F2:6A:E4:C4:DD:91:AA:7A:4A:14:5C:62:72:04:B5:3B:AF:A5:06:B0:7B:58:A0"
         ]
       }
