@@ -1099,7 +1099,7 @@ app.get('/api/buscar', async (req, res) => {
 });
 
 // ==========================================
-// RUTA 6: VER MIS PRODUCTOS (HÍBRIDO + OFERTAS + AGENDA) 🏆
+// RUTA 6: VER MIS PRODUCTOS (HÍBRIDO + OFERTAS + AGENDA + PLAN) 🏆
 // ==========================================
 app.get('/api/mi-negocio/productos', async (req, res) => {
   const authHeader = req.headers['authorization'];
@@ -1110,8 +1110,9 @@ app.get('/api/mi-negocio/productos', async (req, res) => {
     const usuario = jwt.verify(token, process.env.JWT_SECRET);
 
     // 1. Obtener datos del Local (Tu lógica de estado/misiones)
+    // AGREGADO: plan_vencimiento para el Banner Dinámico
     const localRes = await pool.query(
-      'SELECT local_id, misiones_puntos, estado_manual, plan_tipo FROM locales WHERE usuario_id = $1',
+      'SELECT local_id, misiones_puntos, estado_manual, plan_tipo, plan_vencimiento FROM locales WHERE usuario_id = $1',
       [usuario.id]
     );
 
@@ -1164,9 +1165,10 @@ app.get('/api/mi-negocio/productos', async (req, res) => {
         local_id: datosLocal.local_id,
         misiones_puntos: datosLocal.misiones_puntos || 0,
         estado_manual: datosLocal.estado_manual || 'AUTO',
-        plan_tipo: datosLocal.plan_tipo
+        plan_tipo: datosLocal.plan_tipo,
+        plan_vencimiento: datosLocal.plan_vencimiento // 🔥 ENVIAMOS AL FRONTEND
       },
-      items: productosRes.rows // Ahora los items traen la info de agenda
+      items: productosRes.rows 
     });
 
   } catch (error) {
@@ -2340,7 +2342,7 @@ app.post('/api/transaccion/calificar', upload.single('foto'), async (req, res) =
 });
 
 // ==========================================
-// RUTA 16: PERFIL PÚBLICO (CON FOTOS, PORTADA, FIDELIZACIÓN Y OFERTAS 🏷️)
+// RUTA 16: PERFIL PÚBLICO (CON FOTOS, PORTADA, FIDELIZACIÓN, OFERTAS Y HISTORIAS 🏷️)
 // ==========================================
 app.get('/api/perfil-publico/:id', async (req, res) => {
   const local_id = req.params.id;
@@ -2403,9 +2405,6 @@ app.get('/api/perfil-publico/:id', async (req, res) => {
       AND (I.requiere_agenda = TRUE OR I.stock > 0)
       
       -- 🔥 ORDENAMIENTO ESTRATÉGICO 🔥
-      -- 1. Ofertas Flash (Urgente)
-      -- 2. Ofertas Especiales
-      -- 3. Productos normales (lo más nuevo arriba)
       ORDER BY 
         CASE 
             WHEN I.categoria_interna = 'OFERTA_FLASH' THEN 1
@@ -2468,6 +2467,13 @@ app.get('/api/perfil-publico/:id', async (req, res) => {
       datosFidelidad = fidelidadRes.rows[0];
     }
 
+    // 6. 🔥 CHECK HISTORIAS ACTIVAS (NUEVO)
+    const historiasCheck = await pool.query(
+      'SELECT 1 FROM historias WHERE local_id = $1 AND fecha_expiracion > NOW() LIMIT 1',
+      [local_id]
+    );
+    const tieneHistorias = historiasCheck.rows.length > 0;
+
     // RESPUESTA FINAL
     res.json({
       info: localRes.rows[0],
@@ -2475,7 +2481,8 @@ app.get('/api/perfil-publico/:id', async (req, res) => {
       reseñas: reviewRes.rows,
       es_favorito: esFavorito,
       es_propio: esPropio,
-      fidelizacion: datosFidelidad 
+      fidelizacion: datosFidelidad,
+      tiene_historias: tieneHistorias // <--- DATO VITAL PARA EL FRONTEND
     });
 
   } catch (error) {
@@ -3526,8 +3533,85 @@ app.post('/api/historias/:id/reportar', async (req, res) => {
 });
 
 // ==========================================
-// MÓDULO AUDIENCIAS Y MARKETING (V14.0) 👁️
+// RUTA 80: MIS HISTORIAS ACTIVAS (GESTIÓN) 📸
 // ==========================================
+app.get('/api/mi-negocio/historias', verificarToken, async (req, res) => {
+  try {
+    const usuarioId = req.usuario.id;
+
+    // 1. Obtener local
+    const localRes = await pool.query('SELECT local_id FROM locales WHERE usuario_id = $1', [usuarioId]);
+    if (localRes.rows.length === 0) return res.status(404).json({ error: 'No tienes local' });
+    const localId = localRes.rows[0].local_id;
+
+    // 2. Traer historias VIVAS con conteo de vistas
+    // Usamos LEFT JOIN para contar las vistas
+    const query = `
+      SELECT 
+        h.historia_id,
+        h.media_url,
+        h.caption,
+        h.fecha_creacion,
+        COUNT(v.vista_id)::int as cantidad_vistas
+      FROM historias h
+      LEFT JOIN historias_vistas v ON h.historia_id = v.historia_id
+      WHERE h.local_id = $1 
+        AND h.fecha_expiracion > NOW() -- Solo las que se ven actualmente
+      GROUP BY h.historia_id
+      ORDER BY h.fecha_creacion DESC
+    `;
+
+    const result = await pool.query(query, [localId]);
+    res.json(result.rows);
+
+  } catch (error) {
+    console.error("Error mis historias:", error);
+    res.status(500).json({ error: 'Error al cargar historias' });
+  }
+});
+
+// ==========================================
+// RUTA 81: ELIMINAR HISTORIA 🗑️
+// ==========================================
+app.delete('/api/mi-negocio/historias/:id', verificarToken, async (req, res) => {
+  const historiaId = req.params.id;
+  const usuarioId = req.usuario.id;
+
+  try {
+    // 1. Validar propiedad (Seguridad estricta)
+    // Solo borramos si la historia pertenece a un local que pertenece al usuario
+    const checkQuery = `
+      SELECT h.historia_id 
+      FROM historias h
+      JOIN locales l ON h.local_id = l.local_id
+      WHERE h.historia_id = $1 AND l.usuario_id = $2
+    `;
+    const checkRes = await pool.query(checkQuery, [historiaId, usuarioId]);
+    
+    if (checkRes.rows.length === 0) {
+      return res.status(403).json({ error: 'No tienes permiso o la historia no existe' });
+    }
+
+    // 2. Ejecutar Borrado
+    // Opción Segura: Expirarla inmediatamente (Setear fecha al pasado)
+    // Esto hace que desaparezca de la App instantáneamente sin romper logs de vistas
+    await pool.query(`
+        UPDATE historias 
+        SET fecha_expiracion = NOW() - INTERVAL '1 minute' 
+        WHERE historia_id = $1
+    `, [historiaId]);
+
+    /* NOTA: Si prefieres borrarla físicamente para ahorrar espacio en Cloudinary, 
+       deberíamos borrar la imagen en Cloudinary también. 
+       Por ahora, expirar es lo más rápido y seguro para producción. */
+
+    res.json({ mensaje: 'Historia eliminada correctamente' });
+
+  } catch (error) {
+    console.error("Error eliminando historia:", error);
+    res.status(500).json({ error: 'Error al eliminar' });
+  }
+});
 
 // ==========================================
 // RUTA 60: REGISTRAR VISTA (ANTI-EGO + SILENCIOSA) 👁️
@@ -3567,7 +3651,7 @@ app.post('/api/historias/:id/visto', async (req, res) => {
 });
 
 // ==========================================
-// RUTA 61: OBTENER AUDIENCIA (ESTRICTA: SOLO HISTORIAS ACTIVAS) 📊
+// RUTA 61: OBTENER AUDIENCIA (GRANULAR: INVITADO VS MIMADO) 📊
 // ==========================================
 app.get('/api/mi-negocio/estadisticas/audiencia', async (req, res) => {
   const authHeader = req.headers['authorization'];
@@ -3583,24 +3667,36 @@ app.get('/api/mi-negocio/estadisticas/audiencia', async (req, res) => {
     
     const { local_id, plan_tipo } = localRes.rows[0];
 
-    // 2. Consulta Maestra de Audiencia
-    // 🔥 CAMBIO CLAVE: Filtramos por fecha_expiracion > NOW()
-    // Solo contamos vistas de historias que AÚN son visibles en la app.
+    // 2. Consulta Maestra de Audiencia (Desglosada)
     const query = `
       SELECT DISTINCT ON (U.usuario_id)
         U.usuario_id,
         U.nombre_completo,
         U.foto_url,
         MAX(HV.fecha_vista) as fecha_vista,
+        
         -- Check si ya es seguidor
         (SELECT COUNT(*) FROM favoritos F WHERE F.usuario_id = U.usuario_id AND F.local_id = $1) > 0 as es_seguidor,
-        -- Check si ya contactado hoy
-        (SELECT COUNT(*) FROM marketing_acciones MA WHERE MA.local_id = $1 AND MA.usuario_destino_id = U.usuario_id AND MA.fecha_accion > NOW() - INTERVAL '24 hours') > 0 as ya_contactado
+        
+        -- CHECK 1: ¿Ya lo invité a seguir hoy?
+        (SELECT COUNT(*) FROM marketing_acciones MA 
+         WHERE MA.local_id = $1 
+         AND MA.usuario_destino_id = U.usuario_id 
+         AND MA.tipo_accion = 'INVITAR' 
+         AND MA.fecha_accion > NOW() - INTERVAL '24 hours') > 0 as ya_invitado,
+
+        -- CHECK 2: ¿Ya le regalé un cupón hoy?
+        (SELECT COUNT(*) FROM marketing_acciones MA 
+         WHERE MA.local_id = $1 
+         AND MA.usuario_destino_id = U.usuario_id 
+         AND MA.tipo_accion = 'MIMO' 
+         AND MA.fecha_accion > NOW() - INTERVAL '24 hours') > 0 as ya_mimado
+
       FROM historias_vistas HV
       JOIN historias H ON HV.historia_id = H.historia_id
       JOIN usuarios U ON HV.usuario_id = U.usuario_id
       WHERE H.local_id = $1
-      AND H.fecha_expiracion > NOW() -- ⏳ SOLO HISTORIAS VIVAS (No vencidas)
+      AND H.fecha_expiracion > NOW() -- Solo historias vivas
       GROUP BY U.usuario_id, U.nombre_completo, U.foto_url
       ORDER BY U.usuario_id, fecha_vista DESC
     `;
