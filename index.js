@@ -3575,45 +3575,49 @@ app.get('/api/mi-negocio/historias', verificarToken, async (req, res) => {
 });
 
 // ==========================================
-// RUTA 81: ELIMINAR HISTORIA 🗑️
+// RUTA 81: ELIMINAR HISTORIA (HARD DELETE) 🗑️
 // ==========================================
 app.delete('/api/mi-negocio/historias/:id', verificarToken, async (req, res) => {
   const historiaId = req.params.id;
   const usuarioId = req.usuario.id;
 
+  const client = await pool.connect();
+
   try {
-    // 1. Validar propiedad (Seguridad estricta)
-    // Solo borramos si la historia pertenece a un local que pertenece al usuario
+    // 1. Validar propiedad
     const checkQuery = `
       SELECT h.historia_id 
       FROM historias h
       JOIN locales l ON h.local_id = l.local_id
       WHERE h.historia_id = $1 AND l.usuario_id = $2
     `;
-    const checkRes = await pool.query(checkQuery, [historiaId, usuarioId]);
+    const checkRes = await client.query(checkQuery, [historiaId, usuarioId]);
     
     if (checkRes.rows.length === 0) {
       return res.status(403).json({ error: 'No tienes permiso o la historia no existe' });
     }
 
-    // 2. Ejecutar Borrado
-    // Opción Segura: Expirarla inmediatamente (Setear fecha al pasado)
-    // Esto hace que desaparezca de la App instantáneamente sin romper logs de vistas
-    await pool.query(`
-        UPDATE historias 
-        SET fecha_expiracion = NOW() - INTERVAL '1 minute' 
-        WHERE historia_id = $1
-    `, [historiaId]);
+    await client.query('BEGIN'); // Iniciamos transacción por seguridad
 
-    /* NOTA: Si prefieres borrarla físicamente para ahorrar espacio en Cloudinary, 
-       deberíamos borrar la imagen en Cloudinary también. 
-       Por ahora, expirar es lo más rápido y seguro para producción. */
+    // 2. Borrar Vistas asociadas primero (Limpieza de FK)
+    await client.query('DELETE FROM historias_vistas WHERE historia_id = $1', [historiaId]);
+    
+    // 3. Borrar Denuncias asociadas (Si las hubiera)
+    await client.query('DELETE FROM denuncias_historias WHERE historia_id = $1', [historiaId]);
 
-    res.json({ mensaje: 'Historia eliminada correctamente' });
+    // 4. Borrar la Historia (Ahora sí, sin ataduras)
+    await client.query('DELETE FROM historias WHERE historia_id = $1', [historiaId]);
+
+    await client.query('COMMIT');
+
+    res.json({ mensaje: 'Historia eliminada permanentemente' });
 
   } catch (error) {
+    await client.query('ROLLBACK');
     console.error("Error eliminando historia:", error);
     res.status(500).json({ error: 'Error al eliminar' });
+  } finally {
+    client.release();
   }
 });
 
