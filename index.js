@@ -2422,9 +2422,9 @@ app.get('/api/perfil-publico/:id', async (req, res) => {
         COALESCE(foto_perfil, foto_url) as foto_url,
         foto_portada, 
         reputacion, 
-        direccion_fisica, whatsapp, redes_sociales, hora_apertura, hora_cierre, dias_atencion,
-        estado_manual, permite_delivery, permite_retiro,
-        pago_efectivo, pago_transferencia, pago_tarjeta
+        direccion_fisica, whatsapp, redes_sociales, hora_apertura, hora_cierre, dias_atencion, horarios_extra,
+        estado_manual, tipo_actividad, permite_delivery, permite_retiro,
+        pago_efectivo, pago_transferencia, pago_tarjeta, redes_sociales
       FROM locales 
       WHERE local_id = $1
     `;
