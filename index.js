@@ -1103,7 +1103,7 @@ app.get('/api/buscar', async (req, res) => {
 });
 
 // ==========================================
-// RUTA 6: VER MIS PRODUCTOS (HÍBRIDO + OFERTAS + AGENDA + PLAN) 🏆
+// RUTA 6: VER MIS PRODUCTOS (HÍBRIDO + OFERTAS + AGENDA + PLAN + BRANDING) 🏆
 // ==========================================
 app.get('/api/mi-negocio/productos', async (req, res) => {
   const authHeader = req.headers['authorization'];
@@ -1113,17 +1113,25 @@ app.get('/api/mi-negocio/productos', async (req, res) => {
   try {
     const usuario = jwt.verify(token, process.env.JWT_SECRET);
 
-    // 1. Obtener datos del Local (Tu lógica de estado/misiones)
-    // AGREGADO: plan_vencimiento para el Banner Dinámico
+    // 1. Obtener datos del Local (Estado + Plan + Branding)
+    // 🔥 ACTUALIZADO: Agregamos 'nombre' y 'foto_portada' para el botón compartir
     const localRes = await pool.query(
-      'SELECT local_id, misiones_puntos, estado_manual, plan_tipo, plan_vencimiento FROM locales WHERE usuario_id = $1',
+      `SELECT 
+         local_id, 
+         nombre,           -- Nuevo
+         foto_portada,     -- Nuevo
+         misiones_puntos, 
+         estado_manual, 
+         plan_tipo, 
+         plan_vencimiento 
+       FROM locales WHERE usuario_id = $1`,
       [usuario.id]
     );
 
     if (localRes.rows.length === 0) return res.status(404).json({ error: 'Local no encontrado' });
     const datosLocal = localRes.rows[0];
 
-    // 2. Obtener Productos (Ordenados por importancia)
+    // 2. Obtener Productos (Tu lógica intacta)
     const productosQuery = `
       SELECT 
         I.inventario_id,
@@ -1140,7 +1148,7 @@ app.get('/api/mi-negocio/productos', async (req, res) => {
         I.categoria_interna,
         I.precio_regular,
 
-        -- 🔥 DATOS DE AGENDA (AGREGADOS v13.1)
+        -- 🔥 DATOS DE AGENDA
         I.requiere_agenda,
         I.duracion_minutos
 
@@ -1149,10 +1157,7 @@ app.get('/api/mi-negocio/productos', async (req, res) => {
       LEFT JOIN catalogo_global C ON I.global_id = C.global_id
       WHERE L.usuario_id = $1
       
-      -- 🔥 ORDENAMIENTO INTELIGENTE:
-      -- 1. Ofertas Flash primero (Urgente)
-      -- 2. Ofertas Especiales segundo
-      -- 3. Productos normales al final (por fecha)
+      -- ORDENAMIENTO INTELIGENTE
       ORDER BY 
         CASE 
             WHEN I.categoria_interna = 'OFERTA_FLASH' THEN 1
@@ -1167,10 +1172,12 @@ app.get('/api/mi-negocio/productos', async (req, res) => {
     res.json({
       status: {
         local_id: datosLocal.local_id,
+        nombre: datosLocal.nombre,             // 🔥 SE ENVÍA AL FRONT
+        foto_portada: datosLocal.foto_portada, // 🔥 SE ENVÍA AL FRONT
         misiones_puntos: datosLocal.misiones_puntos || 0,
         estado_manual: datosLocal.estado_manual || 'AUTO',
         plan_tipo: datosLocal.plan_tipo,
-        plan_vencimiento: datosLocal.plan_vencimiento // 🔥 ENVIAMOS AL FRONTEND
+        plan_vencimiento: datosLocal.plan_vencimiento
       },
       items: productosRes.rows 
     });
@@ -2418,13 +2425,13 @@ app.get('/api/perfil-publico/:id', async (req, res) => {
     // 1. DATOS DEL LOCAL (ACTUALIZADO CON BRANDING)
     const queryLocal = `
       SELECT 
-        usuario_id, local_id, nombre, categoria, rubro, 
+        usuario_id, local_id, plan_tipo, nombre, categoria, rubro, 
         COALESCE(foto_perfil, foto_url) as foto_url,
         foto_portada, 
         reputacion, 
         direccion_fisica, whatsapp, redes_sociales, hora_apertura, hora_cierre, dias_atencion, horarios_extra,
         estado_manual, tipo_actividad, permite_delivery, permite_retiro,
-        pago_efectivo, pago_transferencia, pago_tarjeta, redes_sociales
+        pago_efectivo, pago_transferencia, pago_tarjeta, (mp_access_token IS NOT NULL) as acepta_mercado_pago, redes_sociales
       FROM locales 
       WHERE local_id = $1
     `;
