@@ -1182,7 +1182,7 @@ app.get('/api/mi-negocio/productos', async (req, res) => {
 });
 
 // ==========================================
-// RUTA 7: ACTUALIZAR NEGOCIO (HÍBRIDO: PRODUCTOS + SERVICIOS + AGENDA) 🧠
+// RUTA 7: ACTUALIZAR NEGOCIO (HÍBRIDO: PRODUCTOS + SERVICIOS + AGENDA v18.0) 🧠
 // ==========================================
 app.put('/api/mi-negocio/actualizar', async (req, res) => {
   const authHeader = req.headers['authorization'];
@@ -1200,7 +1200,7 @@ app.put('/api/mi-negocio/actualizar', async (req, res) => {
     nuevo_nombre, 
     nuevo_desc,
     codigo_barras,
-    categoria_interna, // 'GENERAL', 'OFERTA_FLASH', etc.
+    categoria_interna, 
     // 🔥 NUEVOS CAMPOS DE AGENDA (PASO 2)
     requiere_agenda, 
     duracion_minutos
@@ -1224,12 +1224,15 @@ app.put('/api/mi-negocio/actualizar', async (req, res) => {
     }
 
     // ---------------------------------------------------------
-    // CASO B: ACTUALIZAR PRODUCTO (PRECIOS + AGENDA)
+    // CASO B: ACTUALIZAR PRODUCTO (PRECIOS + AGENDA + CAPACIDAD)
     // ---------------------------------------------------------
     if (inventario_id) {
       
-      // 1. OBTENER ESTADO ACTUAL (Para la lógica de Ofertas)
-      const currentRes = await pool.query('SELECT precio, precio_regular, categoria_interna FROM inventario_local WHERE inventario_id = $1', [inventario_id]);
+      // 1. OBTENER ESTADO ACTUAL (Ahora traemos requiere_agenda también)
+      const currentRes = await pool.query(
+        'SELECT precio, precio_regular, categoria_interna, requiere_agenda FROM inventario_local WHERE inventario_id = $1', 
+        [inventario_id]
+      );
       
       if (currentRes.rows.length === 0) return res.status(404).json({ error: 'Producto no encontrado' });
       const actual = currentRes.rows[0];
@@ -1252,8 +1255,24 @@ app.put('/api/mi-negocio/actualizar', async (req, res) => {
           precioRegularFinal = null; 
       }
 
-      // 2. ACTUALIZAMOS INVENTARIO LOCAL (AHORA CON AGENDA)
-      // Usamos COALESCE para no romper nada si el frontend no manda los datos nuevos
+      // --- 🔥 LÓGICA DE STOCK VS CAPACIDAD (NUEVO) ---
+      // Determinamos si es servicio basándonos en lo que llega O lo que ya estaba
+      const esServicio = (requiere_agenda !== undefined) ? requiere_agenda : actual.requiere_agenda;
+      
+      let stockFinal;
+      let capacidadFinal;
+
+      if (esServicio) {
+          // Servicio: Stock infinito, 'nuevo_stock' define la capacidad (cupos)
+          stockFinal = 9999;
+          capacidadFinal = nuevo_stock || 1; 
+      } else {
+          // Producto: Stock es stock, capacidad es 1
+          stockFinal = nuevo_stock;
+          capacidadFinal = 1;
+      }
+
+      // 2. ACTUALIZAMOS INVENTARIO LOCAL (AHORA CON AGENDA Y CAPACIDAD)
       const updateInventario = `
         UPDATE inventario_local 
         SET 
@@ -1264,19 +1283,21 @@ app.put('/api/mi-negocio/actualizar', async (req, res) => {
           precio_regular = $5,
           -- 🔥 ACTUALIZACIÓN DE AGENDA
           requiere_agenda = COALESCE($7, requiere_agenda),
-          duracion_minutos = COALESCE($8, duracion_minutos)
+          duracion_minutos = COALESCE($8, duracion_minutos),
+          capacidad = $9  -- Nuevo campo
         WHERE inventario_id = $6
       `;
       
       await pool.query(updateInventario, [
         precioFinal,        // $1
-        nuevo_stock,        // $2
+        stockFinal,         // $2 (Calculado arriba)
         codigo_barras,      // $3
         catFinal,           // $4
         precioRegularFinal, // $5
         inventario_id,      // $6 (WHERE)
-        requiere_agenda,    // $7 (Nuevo)
-        duracion_minutos    // $8 (Nuevo)
+        requiere_agenda,    // $7
+        duracion_minutos,   // $8
+        capacidadFinal      // $9
       ]);
 
       // 3. ACTUALIZAMOS CATALOGO GLOBAL (Sin cambios)
@@ -1295,15 +1316,14 @@ app.put('/api/mi-negocio/actualizar', async (req, res) => {
 
         if (nuevo_foto) {
           await pool.query('UPDATE catalogo_global SET foto_url = $1 WHERE global_id = $2', [nuevo_foto, globalId]);
-          // Actualizamos local también por seguridad visual
           await pool.query('UPDATE inventario_local SET foto_url = $1 WHERE inventario_id = $2', [nuevo_foto, inventario_id]);
         }
       }
 
-      return res.json({ mensaje: 'Producto/Servicio actualizado correctamente' });
+      return res.json({ mensaje: 'Actualizado correctamente' });
     }
 
-    res.status(400).json({ error: 'Datos insuficientes para actualizar' });
+    res.status(400).json({ error: 'Datos insuficientes' });
 
   } catch (error) {
     console.error("Error en update híbrido:", error);
@@ -2202,7 +2222,9 @@ app.post('/api/upload', upload.single('imagen'), async (req, res) => {
   }
 });
 
-// RUTA 13: CREAR PRODUCTO (CORREGIDA v10.2 📸)
+// ==========================================
+// RUTA 13: CREAR ITEM (SOPORTE AGENDA + CAPACIDAD v18.0) 📸📅
+// ==========================================
 app.post('/api/mi-negocio/crear-item', async (req, res) => {
   const authHeader = req.headers['authorization'];
   if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
@@ -2210,7 +2232,10 @@ app.post('/api/mi-negocio/crear-item', async (req, res) => {
 
   const { 
     nombre, descripcion, precio, foto_url, tipo_item, stock_inicial,
-    codigo_barras 
+    codigo_barras,
+    // 🔥 NUEVOS PARAMETROS PARA AGENDA
+    requiere_agenda, 
+    duracion_minutos 
   } = req.body;
 
   const client = await pool.connect();
@@ -2226,7 +2251,7 @@ app.post('/api/mi-negocio/crear-item', async (req, res) => {
 
     let globalId = null;
 
-    // 2. LOGICA GLOBAL
+    // 2. LOGICA GLOBAL (Catálogo)
     if (codigo_barras) {
         const checkGlobal = await client.query('SELECT global_id FROM catalogo_global WHERE codigo_barras = $1', [codigo_barras]);
         if (checkGlobal.rows.length > 0) {
@@ -2245,20 +2270,47 @@ app.post('/api/mi-negocio/crear-item', async (req, res) => {
         globalId = resG.rows[0].global_id;
     }
 
-    // 3. INSERTAR EN INVENTARIO LOCAL (AHORA GUARDAMOS LA FOTO TAMBIÉN)
-    let stock = tipo_item === 'PRODUCTO_STOCK' ? stock_inicial : 9999;
+    // 3. INSERTAR EN INVENTARIO LOCAL (LÓGICA HÍBRIDA)
+    
+    // A. Definimos Stock y Capacidad según el tipo
+    let stockReal = 0;
+    let capacidadReal = 1; // Por defecto individual
+
+    if (tipo_item === 'PRODUCTO_STOCK') {
+        // Es un producto físico: Stock importa, capacidad no aplica
+        stockReal = stock_inicial || 0;
+        capacidadReal = 1; 
+    } else {
+        // Es un SERVICIO: Stock infinito, la capacidad la define el 'stock_inicial'
+        // (Reutilizamos el input de stock del frontend para la capacidad del turno)
+        stockReal = 9999;
+        capacidadReal = stock_inicial || 1; 
+    }
 
     const insertLocal = `
       INSERT INTO inventario_local 
-      (local_id, global_id, precio, stock, tipo_item, codigo_barras, foto_url) 
-      VALUES ($1, $2, $3, $4, $5, $6, $7) -- <--- Agregamos $7
+      (
+        local_id, global_id, precio, stock, tipo_item, codigo_barras, foto_url,
+        requiere_agenda, duracion_minutos, capacidad -- 🔥 COLUMNAS NUEVAS
+      ) 
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
     `;
     
-    // Pasamos foto_url al final
-    await client.query(insertLocal, [local_id, globalId, precio, stock, tipo_item, codigo_barras, foto_url]);
+    await client.query(insertLocal, [
+        local_id, 
+        globalId, 
+        precio, 
+        stockReal, 
+        tipo_item, 
+        codigo_barras, 
+        foto_url,
+        requiere_agenda || false,      // $8
+        duracion_minutos || null,      // $9
+        capacidadReal                  // $10
+    ]);
 
     await client.query('COMMIT');
-    res.json({ mensaje: 'Producto creado correctamente' });
+    res.json({ mensaje: 'Item creado correctamente' });
 
   } catch (error) {
     await client.query('ROLLBACK');
@@ -2370,7 +2422,7 @@ app.get('/api/perfil-publico/:id', async (req, res) => {
         COALESCE(foto_perfil, foto_url) as foto_url,
         foto_portada, 
         reputacion, 
-        direccion_fisica, whatsapp, hora_apertura, hora_cierre, dias_atencion,
+        direccion_fisica, whatsapp, redes_sociales, hora_apertura, hora_cierre, dias_atencion,
         estado_manual, permite_delivery, permite_retiro,
         pago_efectivo, pago_transferencia, pago_tarjeta
       FROM locales 
@@ -2717,7 +2769,7 @@ app.get('/api/mi-negocio/analytics', async (req, res) => {
 });
 
 // ==========================================
-// RUTA 20: ACTUALIZAR CONFIGURACIÓN COMPLETA (CORREGIDA ✅)
+// RUTA 20: ACTUALIZAR CONFIGURACIÓN COMPLETA (CON HORARIOS EXTRA V18.1) 🛠️
 // ==========================================
 app.put('/api/mi-negocio/actualizar-todo', async (req, res) => {
   const authHeader = req.headers['authorization'];
@@ -2730,7 +2782,9 @@ app.put('/api/mi-negocio/actualizar-todo', async (req, res) => {
     permite_delivery, permite_retiro,
     pago_efectivo, pago_transferencia, pago_tarjeta,
     en_vacaciones, notif_nuevas_ventas, notif_preguntas, 
-    foto_perfil, foto_portada // Campos nuevos
+    foto_perfil, foto_portada,
+    horarios_extra,
+    redes_sociales
   } = req.body;
 
   try {
@@ -2755,12 +2809,14 @@ app.put('/api/mi-negocio/actualizar-todo', async (req, res) => {
         notif_nuevas_ventas = $14,
         notif_preguntas = $15,
         
-        -- LÓGICA DE ESTADO (Aquí faltaba la coma) 👇
         estado_manual = CASE WHEN $13 = TRUE THEN 'CERRADO' ELSE estado_manual END, 
         
-        -- FOTOS (Con COALESCE para no borrar si viene null)
         foto_perfil = COALESCE($17, foto_perfil),
-        foto_portada = COALESCE($18, foto_portada)
+        foto_portada = COALESCE($18, foto_portada),
+        
+        -- 🔥 CAMPO NUEVO
+        horarios_extra = $19,
+        redes_sociales = $20
 
       WHERE usuario_id = $16
       RETURNING nombre, foto_perfil, foto_portada, estado_manual, rubro
@@ -2774,14 +2830,17 @@ app.put('/api/mi-negocio/actualizar-todo', async (req, res) => {
       pago_efectivo, pago_transferencia, pago_tarjeta,    // $10, $11, $12
       en_vacaciones, notif_nuevas_ventas, notif_preguntas,// $13, $14, $15
       
-      usuario.id,   // $16 (Va en el WHERE)
-      foto_perfil,  // $17
-      foto_portada  // $18
+      usuario.id,     // $16 (WHERE)
+      foto_perfil,    // $17
+      foto_portada,   // $18
+      horarios_extra || '{}', // $19 (Default vacío si no viene)
+      redes_sociales || '{}'  // $20
     ]);
 
-    res.json({ mensaje: 'Configuración guardada', 
-      perfil: result.rows[0] // <--- Esto permite al Frontend actualizarse sin recargar 
-      });
+    res.json({ 
+      mensaje: 'Configuración guardada', 
+      perfil: result.rows[0] 
+    });
 
   } catch (error) {
     console.error("Error actualizando todo:", error);
@@ -2834,6 +2893,8 @@ app.get('/api/mi-negocio/config', async (req, res) => {
         l.hora_apertura, 
         l.hora_cierre, 
         l.dias_atencion,
+        l.horarios_extra,
+        l.redes_sociales,
         l.permite_delivery,
         l.permite_retiro,
         l.pago_efectivo,
@@ -2995,15 +3056,22 @@ app.post('/api/users/update-fcm-token', async (req, res) => {
 });
 
 // ==========================================
-// RUTA 24: OBTENER LISTA DE CATEGORÍAS (Para el Frontend)
+// RUTA 24 (MEJORADA): OBTENER CATEGORÍAS (SEPARADAS POR TIPO) 📋
 // ==========================================
-app.get('/api/categorias', async (req, res) => {
+app.get('/api/config/categorias', async (req, res) => {
   try {
-    // Devolvemos ordenado por tipo y nombre
-    const result = await pool.query('SELECT * FROM categorias_config ORDER BY tipo, nombre');
-    res.json(result.rows);
+    const query = `SELECT nombre, tipo FROM categorias_config ORDER BY nombre ASC`;
+    const result = await pool.query(query);
+    
+    // Separamos en dos listas para facilitar al frontend
+    const productos = result.rows.filter(c => c.tipo === 'PRODUCTO').map(c => c.nombre);
+    const servicios = result.rows.filter(c => c.tipo === 'SERVICIO').map(c => c.nombre);
+
+    res.json({ productos, servicios });
+
   } catch (error) {
-    res.status(500).json({ error: 'Error cargando categorías' });
+    console.error("Error categorias:", error);
+    res.status(500).json({ error: 'Error al cargar categorías' });
   }
 });
 
@@ -6104,10 +6172,11 @@ app.post('/api/mi-negocio/agenda', async (req, res) => {
 });
 
 // ==========================================
-// RUTA 52: CALCULAR TURNOS (CON BLOQUEOS MANUALES) ⏳🛡️
+// RUTA 52: CALCULAR TURNOS (SOPORTE GRUPAL + CAPACIDAD + HORARIOS X DÍA) ⏳🛡️
 // ==========================================
 app.get('/api/turnos/disponibles', async (req, res) => {
-  const { local_id, fecha, duracion_minutos } = req.query; 
+  // 🔥 PARAMETRO NUEVO: inventario_id (Para saber la capacidad del servicio)
+  const { local_id, fecha, duracion_minutos, inventario_id } = req.query; 
 
   if (!local_id || !fecha) return res.status(400).json({ error: 'Faltan datos' });
 
@@ -6122,39 +6191,86 @@ app.get('/api/turnos/disponibles', async (req, res) => {
     let diaSemana = fechaObj.getDay(); 
     if (diaSemana === 0) diaSemana = 7; 
     
+    // Convertimos a String para buscar en el JSON
+    const diaKey = diaSemana.toString();
+
     if (!config.dias_activos.includes(diaSemana)) return res.json([]);
 
-    // 3. OBTENER OCUPACIÓN TOTAL (VENTAS + BLOQUEOS) 🔥
-    // Usamos UNION ALL para juntar ambas tablas en una sola lista de "intervalos ocupados"
-    const ocupacionRes = await pool.query(`
+    // 3. OBTENER CAPACIDAD DEL SERVICIO (NUEVO)
+    let capacidad = 1; // Por defecto individual
+    if (inventario_id) {
+       const invRes = await pool.query('SELECT capacidad FROM inventario_local WHERE inventario_id = $1', [inventario_id]);
+       if (invRes.rows.length > 0) {
+          capacidad = invRes.rows[0].capacidad || 1;
+       }
+    }
+
+    // 4. OBTENER OCUPACIÓN (VENTAS + BLOQUEOS)
+    // 🔥 CAMBIO CLAVE: Ya no nos importa solo "si hay algo", nos importa CUÁNTOS hay.
+    // Los bloqueos manuales siempre ocupan TODO el cupo (bloqueo total).
+    
+    // A. Ventas del mismo producto (Consumen cupo)
+    const ventasMismoServicio = await pool.query(`
         SELECT fecha_reserva_inicio as inicio, fecha_reserva_fin as fin 
         FROM transacciones_p2p 
-        WHERE vendedor_id = (SELECT usuario_id FROM locales WHERE local_id = $1)
+        WHERE producto_global_id = (SELECT global_id FROM inventario_local WHERE inventario_id = $1)
+        -- O si usas inventario_id directo en transacciones (depende tu esquema), ajustar aquí.
+        -- Asumiremos colisión por VENDEDOR para simplificar si es servicio único, 
+        -- PERO para clases grupales, debemos contar solo las de ESE servicio.
+        
+        -- ESTRATEGIA SEGURA V1: Contamos todas las reservas del vendedor en ese horario.
+        -- Si tienes 1 peluquero, no puede atender a 2 personas (aunque sean servicios distintos).
+        -- Si es una clase grupal, todas las reservas serán del mismo ID.
+        
+        -- CORRECCIÓN: Si es grupal, permitimos solapamiento hasta N.
+        -- Si es individual, N=1.
+        
+        AND vendedor_id = (SELECT usuario_id FROM locales WHERE local_id = $2)
         AND estado NOT IN ('CANCELADO', 'RECHAZADO')
-        AND fecha_reserva_inicio::date = $2::date
-        
-        UNION ALL
-        
+        AND fecha_reserva_inicio::date = $3::date
+    `, [inventario_id || 0, local_id, fecha]); // Usamos 0 si no hay ID para evitar crash
+
+    // B. Bloqueos Manuales (Estos matan el turno completo, restan capacidad infinita)
+    const bloqueosRes = await pool.query(`
         SELECT fecha_inicio as inicio, fecha_fin as fin
         FROM agenda_bloqueos
         WHERE local_id = $1
         AND fecha_inicio::date = $2::date
     `, [local_id, fecha]);
 
-    const intervalosOcupados = ocupacionRes.rows.map(r => ({
+    const reservas = ventasMismoServicio.rows.map(r => ({
         inicio: new Date(r.inicio).getTime(),
-        fin: new Date(r.fin).getTime()
+        fin: new Date(r.fin).getTime(),
+        peso: 1 // Cada reserva consume 1 cupo
     }));
 
-    // 4. GENERAR SLOTS (Igual que antes, pero comparando contra la lista unificada)
+    const bloqueos = bloqueosRes.rows.map(r => ({
+        inicio: new Date(r.inicio).getTime(),
+        fin: new Date(r.fin).getTime(),
+        peso: 9999 // Bloqueo consume todo
+    }));
+
+    const ocupaciones = [...reservas, ...bloqueos];
+
+    // 5. GENERAR SLOTS
     const turnosDisponibles = [];
     const timeToMins = (t) => { const [h, m] = t.split(':').map(Number); return h * 60 + m; };
 
-    let minutoActual = timeToMins(config.hora_inicio);
-    const minutoFinDia = timeToMins(config.hora_fin);
+    // 🔥 LÓGICA DE HORARIOS ESPECIALES (SOBRESCRITURA POR DÍA) 🔥
+    let horaInicioDia = config.hora_inicio;
+    let horaFinDia = config.hora_fin;
+
+    // Si existe configuración específica para este día (ej: Sábado distinto a Lunes)
+    // El JSON se guarda como { "6": { "inicio": "09:00", "fin": "13:00" } }
+    if (config.horarios_especiales && config.horarios_especiales[diaKey]) {
+         horaInicioDia = config.horarios_especiales[diaKey].inicio;
+         horaFinDia = config.horarios_especiales[diaKey].fin;
+    }
+
+    let minutoActual = timeToMins(horaInicioDia);
+    const minutoFinDia = timeToMins(horaFinDia);
     const duracionServicio = parseInt(duracion_minutos) || config.duracion_turno_minutos;
 
-    // Descansos fijos (Configuración general)
     let descansoInicio = config.hora_descanso_inicio ? timeToMins(config.hora_descanso_inicio) : -1;
     let descansoFin = config.hora_descanso_fin ? timeToMins(config.hora_descanso_fin) : -1;
 
@@ -6164,7 +6280,7 @@ app.get('/api/turnos/disponibles', async (req, res) => {
         slotInicio.setHours(Math.floor(minutoActual / 60), minutoActual % 60, 0, 0);
         const slotFin = new Date(slotInicio.getTime() + duracionServicio * 60000);
 
-        // A. Chequeo Configuración General (Almuerzo fijo)
+        // Chequeo Descanso
         let caeEnDescanso = false;
         if (descansoInicio !== -1) {
             if ((minutoActual >= descansoInicio && minutoActual < descansoFin) ||
@@ -6173,26 +6289,25 @@ app.get('/api/turnos/disponibles', async (req, res) => {
             }
         }
 
-        // B. Chequeo Ocupación Real (Ventas + Bloqueos Manuales)
-        let estaOcupado = false;
+        // Chequeo Capacidad 🔥
+        let cupoConsumido = 0;
         const slotStartMs = slotInicio.getTime();
         const slotEndMs = slotFin.getTime();
 
-        // Filtro de tiempo pasado (Si es hoy, no mostrar horas viejas)
         const ahoraMs = Date.now();
-        if (slotStartMs < ahoraMs) estaOcupado = true; // Ya pasó
+        if (slotStartMs < ahoraMs) cupoConsumido = 9999; // Tiempo pasado
 
-        if (!estaOcupado) {
-            for (const intervalo of intervalosOcupados) {
+        if (cupoConsumido === 0) {
+            for (const intervalo of ocupaciones) {
                 // Si se solapan
                 if (slotStartMs < intervalo.fin && slotEndMs > intervalo.inicio) {
-                    estaOcupado = true;
-                    break;
+                    cupoConsumido += intervalo.peso;
                 }
             }
         }
 
-        if (!caeEnDescanso && !estaOcupado) {
+        // SI HAY ESPACIO, AGREGAMOS
+        if (!caeEnDescanso && cupoConsumido < capacidad) {
             const horaStr = `${slotInicio.getHours().toString().padStart(2, '0')}:${slotInicio.getMinutes().toString().padStart(2, '0')}`;
             turnosDisponibles.push(horaStr);
         }
@@ -6485,7 +6600,9 @@ cron.schedule('*/15 * * * *', async () => {
 // MÓDULO AGENDA VISUAL (V13.5) 📅
 // ==========================================
 
-// RUTA A: OBTENER AGENDA DEL DÍA (VENTAS + BLOQUEOS)
+// ==========================================
+// RUTA A: OBTENER AGENDA DEL DÍA (VENTAS + BLOQUEOS + CONTACTO) 📅
+// ==========================================
 app.get('/api/agenda/dia', async (req, res) => {
   const authHeader = req.headers['authorization'];
   if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
@@ -6502,20 +6619,23 @@ app.get('/api/agenda/dia', async (req, res) => {
     if (localRes.rows.length === 0) return res.status(404).json({ error: 'Local no encontrado' });
     const localId = localRes.rows[0].local_id;
 
-    // 2. Traer VENTAS (Turnos reales)
+    // 2. Traer VENTAS (Turnos reales) con Datos del Cliente
+    // 🔥 CAMBIO: Usamos JOIN para traer nombre y teléfono en una sola consulta eficiente
     const ventasQuery = `
         SELECT 
-            transaccion_id as id,
-            fecha_reserva_inicio as inicio,
-            fecha_reserva_fin as fin,
-            nombre_snapshot as titulo,
-            'VENTA' as tipo, -- Para diferenciar en el frontend (Color Verde/Violeta)
-            comprador_id,
-            (SELECT nombre_completo FROM usuarios WHERE usuario_id = transacciones_p2p.comprador_id) as cliente
-        FROM transacciones_p2p 
-        WHERE vendedor_id = $1
-        AND estado NOT IN ('CANCELADO', 'RECHAZADO')
-        AND fecha_reserva_inicio::date = $2::date
+            t.transaccion_id as id,
+            t.fecha_reserva_inicio as inicio,
+            t.fecha_reserva_fin as fin,
+            t.nombre_snapshot as titulo,
+            'VENTA' as tipo, 
+            t.comprador_id,
+            u.nombre_completo as cliente,
+            u.telefono as telefono_cliente -- 📞 DATO CLAVE PARA WHATSAPP
+        FROM transacciones_p2p t
+        JOIN usuarios u ON t.comprador_id = u.usuario_id
+        WHERE t.vendedor_id = $1
+        AND t.estado NOT IN ('CANCELADO', 'RECHAZADO')
+        AND t.fecha_reserva_inicio::date = $2::date
     `;
     const ventasRes = await pool.query(ventasQuery, [usuario.id, fecha]);
 
@@ -6526,9 +6646,10 @@ app.get('/api/agenda/dia', async (req, res) => {
             fecha_inicio as inicio,
             fecha_fin as fin,
             motivo as titulo,
-            'BLOQUEO' as tipo, -- Para diferenciar (Color Gris)
+            'BLOQUEO' as tipo,
             NULL as comprador_id,
-            'N/A' as cliente
+            'N/A' as cliente,
+            NULL as telefono_cliente
         FROM agenda_bloqueos 
         WHERE local_id = $1
         AND fecha_inicio::date = $2::date
