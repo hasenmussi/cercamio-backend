@@ -903,6 +903,7 @@ app.get('/api/locales', async (req, res) => {
       SELECT 
         L.local_id, 
         L.nombre, 
+        L.whatsapp,
         L.categoria, 
         L.plan_tipo,
         L.plan_vencimiento,
@@ -921,7 +922,6 @@ app.get('/api/locales', async (req, res) => {
         L.pago_efectivo,
         L.pago_transferencia,
         L.pago_tarjeta,
-        L.whatsapp,
         (mp_access_token IS NOT NULL) as acepta_mercado_pago,
         
         (L.plan_tipo = 'PREMIUM' AND L.plan_vencimiento > NOW()) as es_premium,
@@ -2431,7 +2431,7 @@ app.get('/api/perfil-publico/:id', async (req, res) => {
         COALESCE(foto_perfil, foto_url) as foto_url,
         foto_portada, 
         reputacion, 
-        direccion_fisica, whatsapp, redes_sociales, hora_apertura, hora_cierre, dias_atencion, horarios_extra,
+        direccion_fisica, whatsapp, ST_Y(ubicacion::geometry) as lat, ST_X(ubicacion::geometry) as long, redes_sociales, hora_apertura, hora_cierre, dias_atencion, horarios_extra,
         estado_manual, tipo_actividad, permite_delivery, permite_retiro,
         pago_efectivo, pago_transferencia, pago_tarjeta, (mp_access_token IS NOT NULL) as acepta_mercado_pago, redes_sociales
       FROM locales 
