@@ -921,6 +921,7 @@ app.get('/api/locales', async (req, res) => {
         L.pago_efectivo,
         L.pago_transferencia,
         L.pago_tarjeta,
+        L.whatsapp,
         (mp_access_token IS NOT NULL) as acepta_mercado_pago,
         
         (L.plan_tipo = 'PREMIUM' AND L.plan_vencimiento > NOW()) as es_premium,
