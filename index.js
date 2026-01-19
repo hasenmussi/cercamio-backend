@@ -1453,7 +1453,7 @@ app.post('/api/auth/registro', async (req, res) => {
 });
 
 // ==========================================
-// RUTA 4: LOGIN (CON ROL ADMIN 👑)
+// RUTA 4: LOGIN (CON ROL ADMIN + LOCAL + SOCIO 🤝)
 // ==========================================
 app.post('/api/auth/login', async (req, res) => {
   const { email, password } = req.body;
@@ -1468,7 +1468,7 @@ app.post('/api/auth/login', async (req, res) => {
     }
     const usuario = userRes.rows[0];
 
-    // 🛑 NUEVO BLOQUEO DE SEGURIDAD (BANNED) 🛑
+    // 🛑 BLOQUEO DE SEGURIDAD (BANNED) 🛑
     if (usuario.banned) {
        return res.status(403).json({ 
          error: 'Tu cuenta ha sido suspendida por la administración por violar los términos de servicio.' 
@@ -1490,25 +1490,33 @@ app.post('/api/auth/login', async (req, res) => {
       });
     }
 
-    // 4. Buscar Perfil Profesional
-    const localQuery = 'SELECT * FROM locales WHERE usuario_id = $1';
-    const localRes = await pool.query(localQuery, [usuario.usuario_id]);
+    // 4. BUSCAR PERFILES (LOCAL Y SOCIO EN PARALELO) 🚀
+    // Ejecutamos ambas consultas a la vez para no perder tiempo
+    const localPromise = pool.query('SELECT * FROM locales WHERE usuario_id = $1', [usuario.usuario_id]);
+    const socioPromise = pool.query('SELECT * FROM socios WHERE usuario_id = $1', [usuario.usuario_id]);
+
+    const [localRes, socioRes] = await Promise.all([localPromise, socioPromise]);
     
+    // Procesar Local
     const tienePerfilProfesional = localRes.rows.length > 0;
     const datosLocal = tienePerfilProfesional ? localRes.rows[0] : null;
 
-    // 5. Generar Token (🔥 AHORA INCLUYE EL ROL)
+    // Procesar Socio
+    const esSocio = socioRes.rows.length > 0;
+    const datosSocio = esSocio ? socioRes.rows[0] : null;
+
+    // 5. Generar Token (INCLUYE ROL)
     const token = jwt.sign(
       { 
         id: usuario.usuario_id, 
         tipo: usuario.tipo,
-        rol: usuario.rol || 'USER' // Si es null, es USER
+        rol: usuario.rol || 'USER'
       }, 
       process.env.JWT_SECRET, 
       { expiresIn: '30d' }
     );
 
-    // 6. Responder (🔥 DEVOLVEMOS EL ROL AL FRONTEND)
+    // 6. Responder (DEVUELVE TODO EL CONTEXTO)
     res.json({ 
       mensaje: 'Bienvenido',
       token: token,
@@ -1518,13 +1526,20 @@ app.post('/api/auth/login', async (req, res) => {
         email: usuario.email,
         tipo: usuario.tipo,
         foto_url: usuario.foto_url,
-        rol: usuario.rol || 'USER' // <--- DATO VITAL PARA EL PANEL
+        rol: usuario.rol || 'USER'
       },
+      // Datos de Vendedor
       perfil_profesional: tienePerfilProfesional ? {
         local_id: datosLocal.local_id,
         nombre_fantasia: datosLocal.nombre,
         tipo_actividad: datosLocal.tipo_actividad,
         foto_url: datosLocal.foto_url
+      } : null,
+      // Datos de Socio (Nuevo) 🔥
+      perfil_socio: esSocio ? {
+        socio_id: datosSocio.socio_id,
+        codigo: datosSocio.codigo_referido,
+        estado: datosSocio.estado
       } : null
     });
 
