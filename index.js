@@ -5619,6 +5619,40 @@ app.post('/api/socios/retirar', async (req, res) => {
   }
 });
 
+// ==========================================
+// RUTA 50: ACTUALIZAR PERFIL SOCIO (CBU) 🏦
+// ==========================================
+app.put('/api/socios/perfil', verificarToken, async (req, res) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader.split(' ')[1];
+  
+  const { cbu_alias } = req.body;
+
+  try {
+    const usuario = jwt.verify(token, process.env.JWT_SECRET);
+    
+    if (!cbu_alias) return res.status(400).json({ error: 'El CBU/Alias es obligatorio' });
+
+    // Actualizamos
+    const query = `
+      UPDATE socios 
+      SET cbu_alias = $1 
+      WHERE usuario_id = $2
+      RETURNING cbu_alias
+    `;
+    
+    const result = await pool.query(query, [cbu_alias, usuario.id]);
+
+    if (result.rows.length === 0) return res.status(404).json({ error: 'No eres socio' });
+
+    res.json({ mensaje: 'Datos bancarios actualizados', data: result.rows[0] });
+
+  } catch (error) {
+    console.error("Error update socio:", error);
+    res.status(500).json({ error: 'Error al actualizar perfil' });
+  }
+});
+
 // =========================================================
 // 💎 GESTIÓN DE SUSCRIPCIONES (PREMIUM)
 // =========================================================
