@@ -1344,70 +1344,89 @@ app.put('/api/mi-negocio/actualizar', async (req, res) => {
 // MÓDULO DE AUTENTICACIÓN (SEGURIDAD)
 // ==========================================
 
-// RUTA 3: REGISTRO AVANZADO (CON CÓDIGO DE SOCIO Y LEVEL UP AUTOMÁTICO)
+// ==========================================
+// RUTA 3: REGISTRO AVANZADO (FIX: CREACIÓN SIMULTÁNEA TIENDA + SOCIO) ✅
+// ==========================================
 app.post('/api/auth/registro', async (req, res) => {
   const { nombre, email, password, tipo, nombre_tienda, categoria, whatsapp, direccion, tipo_actividad, rubro, lat, long, codigo_socio } = req.body;
 
+  // 1. Validaciones Básicas
   if (!email || !password || !nombre || !tipo) {
     return res.status(400).json({ error: 'Faltan datos obligatorios' });
   }
 
-  if ((tipo === 'Minorista' || tipo === 'Mayorista') && !nombre_tienda) {
+  // 🔥 CORRECCIÓN: Aceptamos 'PROFESIONAL' como tipo válido
+  if ((tipo === 'PROFESIONAL' || tipo === 'Minorista' || tipo === 'Mayorista') && !nombre_tienda) {
     return res.status(400).json({ error: 'Los vendedores deben indicar el Nombre de la Tienda' });
   }
 
   const client = await pool.connect();
 
   try {
-    await client.query('BEGIN'); 
+    await client.query('BEGIN'); // Inicio Transacción
 
+    // 2. Crear Usuario
     const salt = await bcrypt.genSalt(10);
     const passwordEncriptada = await bcrypt.hash(password, salt);
 
+    // Normalizamos el tipo a 'PROFESIONAL' si viene algo raro, para consistencia
+    const tipoFinal = (tipo === 'Minorista' || tipo === 'Mayorista') ? 'PROFESIONAL' : tipo;
+
     const userQuery = `
-      INSERT INTO usuarios (nombre_completo, email, password_hash, tipo, nivel_confianza)
-      VALUES ($1, $2, $3, $4, 0)
+      INSERT INTO usuarios (nombre_completo, email, password_hash, tipo, nivel_confianza, email_verified)
+      VALUES ($1, $2, $3, $4, 0, false) -- Nace no verificado
       RETURNING usuario_id, nombre_completo, email, tipo
     `;
-    const userRes = await client.query(userQuery, [nombre, email, passwordEncriptada, tipo]);
+    const userRes = await client.query(userQuery, [nombre, email, passwordEncriptada, tipoFinal]);
     const nuevoUsuario = userRes.rows[0];
 
-    // Variable para guardar el ID del socio si se usó código
-    let socioIdEncontrado = null; 
-
-    if (tipo === 'Minorista' || tipo === 'Mayorista') {
+    // 3. LOGICA DE VENDEDOR (CREAR TIENDA)
+    // 🔥 CORRECCIÓN: Ahora entra si es 'PROFESIONAL'
+    if (tipo === 'PROFESIONAL' || tipo === 'Minorista' || tipo === 'Mayorista') {
       
-      if (codigo_socio) {
-        const socioRes = await client.query('SELECT socio_id, usuario_id FROM socios WHERE codigo_referido = $1', [codigo_socio]);
+      // A. Procesar Código de Socio (Si existe)
+      let socioIdEncontrado = null; 
+      
+      if (codigo_socio && codigo_socio.trim().length > 0) {
+        const codigoLimpio = codigo_socio.trim().toUpperCase();
+        
+        const socioRes = await client.query('SELECT socio_id, usuario_id FROM socios WHERE codigo_referido = $1', [codigoLimpio]);
         
         if (socioRes.rows.length > 0) {
           const datosSocio = socioRes.rows[0];
           
+          // Evitar auto-referido (Socio se refiere a sí mismo para su propia tienda)
           if (datosSocio.usuario_id === nuevoUsuario.usuario_id) {
-             console.warn("Intento de auto-referencia en registro.");
+             console.warn("Intento de auto-referencia en registro ignorado.");
           } else {
              socioIdEncontrado = datosSocio.socio_id; 
+             console.log(`✅ Tienda referida por Socio ID: ${socioIdEncontrado}`);
           }
         } else {
-          throw new Error(`El código de socio "${codigo_socio}" no existe. Verifica si lo escribiste bien.`);
+          // Si el código está mal escrito, ¿Fallamos o seguimos?
+          // Opción estricta: Fallamos para que el usuario corrija.
+          throw new Error(`El código de socio "${codigo_socio}" no existe. Verifícalo.`);
         }
       }
 
-      const latitudFinal = lat || -45.86;
-      const longitudFinal = long || -67.48;
+      // B. Coordenadas (Con fallback a Comodoro centro si falla el GPS)
+      const latitudFinal = parseFloat(lat) || -45.86413;
+      const longitudFinal = parseFloat(long) || -67.49656;
 
-      let fotoDefecto = 'https://cdn-icons-png.flaticon.com/512/3081/3081559.png'; 
+      // C. Foto por defecto según rubro
+      let fotoDefecto = 'https://cdn-icons-png.flaticon.com/512/3081/3081559.png'; // Tienda
       if (tipo_actividad === 'SERVICIO') {
-          fotoDefecto = 'https://cdn-icons-png.flaticon.com/512/1063/1063376.png'; 
+          fotoDefecto = 'https://cdn-icons-png.flaticon.com/512/1063/1063376.png'; // Herramientas
       }
 
+      // D. Insertar Local
       const localQuery = `
         INSERT INTO locales 
-        (usuario_id, nombre, categoria, ubicacion, whatsapp, permite_retiro, permite_delivery, direccion_fisica, tipo_actividad, rubro, foto_url, referido_por_socio_id)
-        VALUES ($1, $2, $3, ST_SetSRID(ST_MakePoint($4, $5), 4326), $6, $7, $8, $9, $10, $11, $12, $13)
+        (usuario_id, nombre, categoria, ubicacion, whatsapp, permite_retiro, permite_delivery, direccion_fisica, tipo_actividad, rubro, foto_url, referido_por_socio_id, fecha_registro)
+        VALUES ($1, $2, $3, ST_SetSRID(ST_MakePoint($4, $5), 4326)::geography, $6, $7, $8, $9, $10, $11, $12, $13, NOW())
       `;
     
-      const permiteDelivery = tipo_actividad === 'PRODUCTO'; 
+      const permiteDelivery = tipo_actividad !== 'SERVICIO'; // Por defecto true si es producto
     
       await client.query(localQuery, [
         nuevoUsuario.usuario_id, 
@@ -1416,37 +1435,36 @@ app.post('/api/auth/registro', async (req, res) => {
         longitudFinal, 
         latitudFinal,
         whatsapp,
-        true, 
+        true, // permite_retiro default
         permiteDelivery,
         direccion || 'Sin dirección',
         tipo_actividad || 'PRODUCTO',
         rubro || 'General',
         fotoDefecto,
-        socioIdEncontrado 
+        socioIdEncontrado // Aquí se vincula la comisión
       ]);
     }
 
     await client.query('COMMIT'); 
 
-    // --- NUEVO: SI HUBO SOCIO, RECALCULAMOS SU NIVEL AUTOMÁTICAMENTE ---
-    if (socioIdEncontrado) {
-       // Ejecutamos en segundo plano (sin await para no demorar la respuesta)
-       actualizarNivelSocio(socioIdEncontrado);
+    // 4. ACTUALIZAR NIVEL SOCIO (Post-Commit)
+    if (socioIdEncontrado && typeof actualizarNivelSocio === 'function') {
+       actualizarNivelSocio(socioIdEncontrado).catch(e => console.error("Error background nivel:", e));
     }
-    // -------------------------------------------------------------------
 
-    res.json({ mensaje: 'Registro exitoso', usuario: nuevoUsuario });
+    res.json({ mensaje: 'Registro exitoso. Revisa tu email.', usuario: nuevoUsuario });
 
   } catch (error) {
     await client.query('ROLLBACK');
-    console.error(error);
+    console.error("Error Registro:", error);
+    
     if (error.message.includes("código de socio")) {
         return res.status(400).json({ error: error.message });
     }
     if (error.code === '23505') {
-      return res.status(400).json({ error: 'El email ya está registrado' });
+      return res.status(400).json({ error: 'El email ya está registrado.' });
     }
-    res.status(500).json({ error: 'Error en el servidor al registrar' });
+    res.status(500).json({ error: 'Error en el servidor al registrar.' });
   } finally {
     client.release();
   }
