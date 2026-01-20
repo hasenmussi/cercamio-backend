@@ -8,6 +8,8 @@ const crypto = require('crypto');
 const nodemailer = require('nodemailer');
 const axios = require('axios');
 const xlsx = require('xlsx');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 
 // 2. CONFIGURACIÓN DE IMÁGENES (CLOUDINARY + MULTER)
 const cloudinary = require('cloudinary').v2;
@@ -43,10 +45,16 @@ const storagePrivado = new CloudinaryStorage({
 const upload = multer({ storage: storagePublico }); 
 const uploadPrivado = multer({ storage: storagePrivado }); 
 
-// C) Storage en MEMORIA (Para Excel temporal) 🧠
-// No guardamos en disco ni en nube, solo en RAM para procesar rápido
+// C) Storage en MEMORIA (BLINDADO 🛡️)
+// No guardamos en disco, solo en RAM.
 const storageMemoria = multer.memoryStorage();
-const uploadMemoria = multer({ storage: storageMemoria });
+
+const uploadMemoria = multer({ 
+  storage: storageMemoria,
+  // 🔥 LÍMITE DE SEGURIDAD: 5MB
+  // Si el archivo pesa más, Multer lo rechaza automáticamente antes de procesarlo.
+  limits: { fileSize: 5 * 1024 * 1024 } 
+});
 
 // 3. MERCADO PAGO (Solo importamos clases, instanciamos en las rutas)
 const { MercadoPagoConfig, Preference, Payment } = require('mercadopago');
@@ -216,6 +224,19 @@ const port = process.env.PORT || 3000;
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const JWT_SECRET = process.env.JWT_SECRET; // Lee del .env
+
+// 1. Protección de Cabeceras HTTP (Oculta info del servidor)
+app.use(helmet());
+
+// 2. Limitador de Velocidad (Anti-Ataque Masivo)
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutos
+  max: 500, // Subimos a 500 para no bloquear a usuarios legítimos intensivos
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Demasiadas solicitudes, intenta más tarde.' }
+});
+app.use(limiter);
 
 // 7. FIREBASE ADMIN
 const admin = require('firebase-admin');
@@ -4200,7 +4221,7 @@ app.post('/api/pagos/crear-preferencia', async (req, res) => {
         pending: "cercamio://payment-result"
       },
       auto_return: "approved",
-      notification_url: "https://api.cercamio.app/api/pagos/webhook",
+      notification_url: "https://api.cercamio.app/api/pagos/webhook?secret=${process.env.MP_WEBHOOK_SECRET}",
       statement_descriptor: "CERCAMIO APP"
     };
 
@@ -4350,11 +4371,20 @@ app.get('/api/pagos/callback', async (req, res) => {
 // ==========================================
 app.post('/api/pagos/webhook', async (req, res) => {
   const { type, data } = req.body;
+  const { secret } = req.query; // 🔥 LEEMOS EL SECRETO
+
+  // 1. CAPA DE SEGURIDAD 1 (El Portero)
+  // Si configuraste la variable en Render, activamos este bloqueo.
+  if (process.env.MP_WEBHOOK_SECRET && secret !== process.env.MP_WEBHOOK_SECRET) {
+      console.warn(`⛔ Webhook rechazado (Secret incorrecto). IP: ${req.ip}`);
+      return res.status(403).send("Forbidden");
+  }
 
   if (type === 'payment') {
     try {
       const paymentId = data.id;
       
+      // 2. CAPA DE SEGURIDAD 2 (Validación Real - TU CÓDIGO ACTUAL)
       const client = new MercadoPagoConfig({ accessToken: process.env.MP_ACCESS_TOKEN_PROD });
       const paymentClient = new Payment(client); 
       const paymentData = await paymentClient.get({ id: paymentId });
@@ -4702,7 +4732,7 @@ app.post('/api/pagos/crear-preferencia-flex', verificarToken, async (req, res) =
         const qrBody = {
           external_reference: externalRef,
           title: concepto || "Compra CercaMío",
-          notification_url: "https://api.cercamio.app/api/pagos/webhook", // TU URL
+          notification_url: "https://api.cercamio.app/api/pagos/webhook?secret=${process.env.MP_WEBHOOK_SECRET}", // TU URL
           total_amount: Number(monto),
           items: [
             {
@@ -4757,7 +4787,7 @@ app.post('/api/pagos/crear-preferencia-flex', verificarToken, async (req, res) =
         failure: "cercamio://payment-result",
       },
       auto_return: "approved",
-      notification_url: "https://api.cercamio.app/api/pagos/webhook",
+      notification_url: "https://api.cercamio.app/api/pagos/webhook?secret=${process.env.MP_WEBHOOK_SECRET}",
       statement_descriptor: "CERCAMIO POS"
     };
 
@@ -6868,32 +6898,52 @@ app.delete('/api/agenda/bloquear/:id', async (req, res) => {
 });
 
 // ==========================================
-// RUTA 54: ANALIZAR EXCEL (PREVISUALIZACIÓN) 📊
+// RUTA 54: ANALIZAR EXCEL (BLINDADA 🛡️ + MAPEO INTELIGENTE 🧠)
 // ==========================================
-app.post('/api/mi-negocio/importar-excel/analizar', uploadMemoria.single('archivo'), async (req, res) => {
-  const authHeader = req.headers['authorization'];
-  if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
-
+app.post('/api/mi-negocio/importar-excel/analizar', verificarToken, uploadMemoria.single('archivo'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No se subió ningún archivo' });
 
-    // 1. LEER EL ARCHIVO DESDE LA MEMORIA RAM
-    const workbook = xlsx.read(req.file.buffer, { type: 'buffer' });
-    const sheetName = workbook.SheetNames[0]; // Leemos la primera hoja
-    const sheet = workbook.Sheets[sheetName];
+    // 1. CAPA DE SEGURIDAD: VALIDACIÓN DE TIPO
+    const mimePermitidos = [
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', // .xlsx
+      'application/vnd.ms-excel', // .xls
+      'application/octet-stream' // A veces Windows envía esto por defecto
+    ];
     
-    // Convertimos a JSON crudo (Array de objetos)
-    const rawData = xlsx.utils.sheet_to_json(sheet);
+    if (!mimePermitidos.includes(req.file.mimetype)) {
+       // Check extra por extensión si el mimetype falla (por seguridad)
+       if (!req.file.originalname.match(/\.(xlsx|xls)$/)) {
+          return res.status(400).json({ error: 'Formato inválido. Solo se aceptan archivos Excel (.xlsx, .xls)' });
+       }
+    }
+
+    // 2. LECTURA SEGURA (SANDBOX)
+    let rawData = [];
+    try {
+        const workbook = xlsx.read(req.file.buffer, { 
+            type: 'buffer',
+            cellFormula: false, // 🚫 SEGURIDAD: Ignorar fórmulas (evita inyecciones)
+            cellHTML: false,    // 🚫 SEGURIDAD: Ignorar HTML
+            cellText: true      // Solo texto plano
+        });
+        
+        const sheetName = workbook.SheetNames[0]; 
+        const sheet = workbook.Sheets[sheetName];
+        rawData = xlsx.utils.sheet_to_json(sheet);
+
+    } catch (parseError) {
+        console.warn(`⚠️ Archivo Excel corrupto o malicioso subido por usuario ${req.usuario.id}`);
+        return res.status(400).json({ error: 'El archivo está dañado o tiene un formato no soportado.' });
+    }
 
     if (rawData.length === 0) return res.status(400).json({ error: 'El archivo está vacío' });
 
-    // 2. MAPEO INTELIGENTE (NORMALIZADOR) 🧠
-    // Convertimos las columnas del usuario a nuestras columnas
+    // 3. MAPEO INTELIGENTE (TU LÓGICA DE NEGOCIO 🧠)
     const productosProcesados = [];
     let errores = 0;
 
     for (let row of rawData) {
-        // Normalizamos claves a minúsculas para buscar patrones
         let item = { nombre: '', precio: 0, stock: 0, codigo: '' };
         let esValido = true;
 
@@ -6907,6 +6957,7 @@ app.post('/api/mi-negocio/importar-excel/analizar', uploadMemoria.single('archiv
             }
             // Detección de Precio
             else if (k.includes('precio') || k.includes('valor') || k.includes('costo') || k.includes('$')) {
+                // Limpiamos símbolos raros, dejamos solo números y puntos
                 item.precio = parseFloat(String(val).replace(/[^0-9.]/g, '')) || 0;
             }
             // Detección de Stock
@@ -6919,7 +6970,7 @@ app.post('/api/mi-negocio/importar-excel/analizar', uploadMemoria.single('archiv
             }
         });
 
-        // Validaciones mínimas
+        // Validaciones mínimas para considerar el producto útil
         if (!item.nombre || item.precio <= 0) {
             esValido = false;
             errores++;
@@ -6930,18 +6981,18 @@ app.post('/api/mi-negocio/importar-excel/analizar', uploadMemoria.single('archiv
         }
     }
 
-    // 3. RESPONDER CON EL RESUMEN
+    // 4. RESPUESTA
     res.json({
         total_encontrados: rawData.length,
         validos: productosProcesados.length,
         errores: errores,
-        muestra: productosProcesados.slice(0, 5), // Mandamos los primeros 5 para que el usuario confirme
-        datos_completos: productosProcesados // Mandamos todo para que el frontend lo tenga listo para confirmar
+        muestra: productosProcesados.slice(0, 5), // Preview
+        datos_completos: productosProcesados // Data lista para confirmar
     });
 
   } catch (error) {
-    console.error("Error leyendo Excel:", error);
-    res.status(500).json({ error: 'El archivo no es válido o está dañado.' });
+    console.error("Error Global Importación:", error);
+    res.status(500).json({ error: 'Error interno al procesar el archivo.' });
   }
 });
 
