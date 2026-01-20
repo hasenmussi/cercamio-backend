@@ -1347,7 +1347,7 @@ app.put('/api/mi-negocio/actualizar', async (req, res) => {
 // ==========================================
 
 // ==========================================
-// RUTA 3: REGISTRO AVANZADO (FIX: CREACIÓN SIMULTÁNEA TIENDA + SOCIO) ✅
+// RUTA 3: REGISTRO AVANZADO (FIX: VARIABLE SCOPE) ✅
 // ==========================================
 app.post('/api/auth/registro', async (req, res) => {
   const { nombre, email, password, tipo, nombre_tienda, categoria, whatsapp, direccion, tipo_actividad, rubro, lat, long, codigo_socio } = req.body;
@@ -1357,7 +1357,6 @@ app.post('/api/auth/registro', async (req, res) => {
     return res.status(400).json({ error: 'Faltan datos obligatorios' });
   }
 
-  // 🔥 CORRECCIÓN: Aceptamos 'PROFESIONAL' como tipo válido
   if ((tipo === 'PROFESIONAL' || tipo === 'Minorista' || tipo === 'Mayorista') && !nombre_tienda) {
     return res.status(400).json({ error: 'Los vendedores deben indicar el Nombre de la Tienda' });
   }
@@ -1371,24 +1370,23 @@ app.post('/api/auth/registro', async (req, res) => {
     const salt = await bcrypt.genSalt(10);
     const passwordEncriptada = await bcrypt.hash(password, salt);
 
-    // Normalizamos el tipo a 'PROFESIONAL' si viene algo raro, para consistencia
     const tipoFinal = (tipo === 'Minorista' || tipo === 'Mayorista') ? 'PROFESIONAL' : tipo;
 
     const userQuery = `
       INSERT INTO usuarios (nombre_completo, email, password_hash, tipo, nivel_confianza, email_verified)
-      VALUES ($1, $2, $3, $4, 0, false) -- Nace no verificado
+      VALUES ($1, $2, $3, $4, 0, false)
       RETURNING usuario_id, nombre_completo, email, tipo
     `;
     const userRes = await client.query(userQuery, [nombre, email, passwordEncriptada, tipoFinal]);
     const nuevoUsuario = userRes.rows[0];
 
+    // 🔥 FIX CRÍTICO: DECLARAMOS LA VARIABLE AQUÍ (FUERA DEL IF)
+    let socioIdEncontrado = null; 
+
     // 3. LOGICA DE VENDEDOR (CREAR TIENDA)
-    // 🔥 CORRECCIÓN: Ahora entra si es 'PROFESIONAL'
     if (tipo === 'PROFESIONAL' || tipo === 'Minorista' || tipo === 'Mayorista') {
       
       // A. Procesar Código de Socio (Si existe)
-      let socioIdEncontrado = null; 
-      
       if (codigo_socio && codigo_socio.trim().length > 0) {
         const codigoLimpio = codigo_socio.trim().toUpperCase();
         
@@ -1397,28 +1395,26 @@ app.post('/api/auth/registro', async (req, res) => {
         if (socioRes.rows.length > 0) {
           const datosSocio = socioRes.rows[0];
           
-          // Evitar auto-referido (Socio se refiere a sí mismo para su propia tienda)
           if (datosSocio.usuario_id === nuevoUsuario.usuario_id) {
              console.warn("Intento de auto-referencia en registro ignorado.");
           } else {
+             // Asignamos valor a la variable externa
              socioIdEncontrado = datosSocio.socio_id; 
              console.log(`✅ Tienda referida por Socio ID: ${socioIdEncontrado}`);
           }
         } else {
-          // Si el código está mal escrito, ¿Fallamos o seguimos?
-          // Opción estricta: Fallamos para que el usuario corrija.
-          throw new Error(`El código de socio "${codigo_socio}" no existe. Verifícalo.`);
+          throw new Error(`El código de socio "${codigo_socio}" no existe.`);
         }
       }
 
-      // B. Coordenadas (Con fallback a Comodoro centro si falla el GPS)
+      // B. Coordenadas
       const latitudFinal = parseFloat(lat) || -45.86413;
       const longitudFinal = parseFloat(long) || -67.49656;
 
-      // C. Foto por defecto según rubro
-      let fotoDefecto = 'https://cdn-icons-png.flaticon.com/512/3081/3081559.png'; // Tienda
+      // C. Foto por defecto
+      let fotoDefecto = 'https://cdn-icons-png.flaticon.com/512/3081/3081559.png'; 
       if (tipo_actividad === 'SERVICIO') {
-          fotoDefecto = 'https://cdn-icons-png.flaticon.com/512/1063/1063376.png'; // Herramientas
+          fotoDefecto = 'https://cdn-icons-png.flaticon.com/512/1063/1063376.png'; 
       }
 
       // D. Insertar Local
@@ -1428,7 +1424,7 @@ app.post('/api/auth/registro', async (req, res) => {
         VALUES ($1, $2, $3, ST_SetSRID(ST_MakePoint($4, $5), 4326)::geography, $6, $7, $8, $9, $10, $11, $12, $13, NOW())
       `;
     
-      const permiteDelivery = tipo_actividad !== 'SERVICIO'; // Por defecto true si es producto
+      const permiteDelivery = tipo_actividad !== 'SERVICIO'; 
     
       await client.query(localQuery, [
         nuevoUsuario.usuario_id, 
@@ -1437,19 +1433,20 @@ app.post('/api/auth/registro', async (req, res) => {
         longitudFinal, 
         latitudFinal,
         whatsapp,
-        true, // permite_retiro default
+        true, 
         permiteDelivery,
         direccion || 'Sin dirección',
         tipo_actividad || 'PRODUCTO',
         rubro || 'General',
         fotoDefecto,
-        socioIdEncontrado // Aquí se vincula la comisión
+        socioIdEncontrado // Aquí usamos la variable (funciona)
       ]);
     }
 
     await client.query('COMMIT'); 
 
     // 4. ACTUALIZAR NIVEL SOCIO (Post-Commit)
+    // 🔥 AHORA SÍ LA VARIABLE EXISTE EN ESTE SCOPE
     if (socioIdEncontrado && typeof actualizarNivelSocio === 'function') {
        actualizarNivelSocio(socioIdEncontrado).catch(e => console.error("Error background nivel:", e));
     }
