@@ -1144,6 +1144,7 @@ app.get('/api/mi-negocio/productos', async (req, res) => {
         
         I.precio,
         I.stock,
+        I.capacidad,
         I.tipo_item,
         
         -- Datos de Oferta
@@ -1153,6 +1154,7 @@ app.get('/api/mi-negocio/productos', async (req, res) => {
         -- 🔥 DATOS DE AGENDA
         I.requiere_agenda,
         I.duracion_minutos
+        
 
       FROM inventario_local I
       JOIN locales L ON I.local_id = L.local_id
