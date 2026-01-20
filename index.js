@@ -92,6 +92,18 @@ const capitalizarNombre = (texto) => {
   if (!texto) return "";
   return texto.toLowerCase().split(' ').map(p => p.charAt(0).toUpperCase() + p.slice(1)).join(' ');
 };
+// --- HELPER: CENSURA DE TELÉFONOS 🚫📞 ---
+const censurarDatos = (texto) => {
+  if (!texto) return "";
+  
+  // Explicación Regex:
+  // \b: Inicio de palabra/número
+  // (?:\d[\s.-]*){8,}: Busca grupos de dígitos que pueden tener espacios, puntos o guiones en el medio.
+  // {8,}: Tienen que ser al menos 8 números (evita censurar precios como "1500" o años "2024", pero atrapa "297 123 4567")
+  const regexTelefono = /\b(?:\d[\s.-]*){8,}\b/g;
+  
+  return texto.replace(regexTelefono, ' [OCULTO] ');
+};
 
 // ==========================================
 // FUNCIÓN AUXILIAR: NOTIFICACIONES HÍBRIDAS (DB + FCM) 🔔
@@ -4638,7 +4650,7 @@ app.post('/api/pagos/webhook', async (req, res) => {
 });
 
 // ==========================================
-// RUTA 5.B: PREFERENCIA FLEX (COBRO RÁPIDO POS) ⚡
+// RUTA 5.B: PREFERENCIA FLEX INTEROPERABLE (QR NATIVO + LINK) ⚡💳
 // ==========================================
 app.post('/api/pagos/crear-preferencia-flex', verificarToken, async (req, res) => {
   const { monto, concepto, local_id } = req.body;
@@ -4646,8 +4658,12 @@ app.post('/api/pagos/crear-preferencia-flex', verificarToken, async (req, res) =
   if (!local_id || !monto || monto <= 0) return res.status(400).json({ error: 'Datos inválidos' });
 
   try {
-    // 1. OBTENER CREDENCIALES DEL VENDEDOR
-    const queryLocal = 'SELECT mp_access_token, nombre, usuario_id FROM locales WHERE local_id = $1';
+    // 1. OBTENER CREDENCIALES Y SOCIO
+    // 🔥 ACTUALIZADO: Traemos mp_user_id y el socio
+    const queryLocal = `
+        SELECT mp_access_token, mp_user_id, nombre, usuario_id, referido_por_socio_id 
+        FROM locales WHERE local_id = $1
+    `;
     const localRes = await pool.query(queryLocal, [local_id]);
 
     if (localRes.rows.length === 0) return res.status(404).json({ error: 'Local no encontrado' });
@@ -4656,19 +4672,69 @@ app.post('/api/pagos/crear-preferencia-flex', verificarToken, async (req, res) =
     if (!sellerData.mp_access_token) return res.status(400).json({ error: 'Debes vincular Mercado Pago primero.' });
 
     const vendedorId = sellerData.usuario_id;
-    const externalRef = `FLEX-${Date.now()}-${req.usuario.id}`; // Prefijo FLEX clave para el webhook
+    const socioId = sellerData.referido_por_socio_id; // ID del socio si existe
+    const externalRef = `FLEX-${Date.now()}-${req.usuario.id}`; 
 
-    // 2. CALCULAR COMISIÓN (1%)
+    // 2. CALCULAR COMISIÓN PLATAFORMA (1%)
+    // Nota: De este 1% total saldrá la parte del socio en el Webhook (Revenue Share)
     const comisionCercaMio = Math.round((monto * 0.01) * 100) / 100;
 
-    // 3. CREAR PREFERENCIA
+    // 3. GENERACIÓN DE QR INTEROPERABLE (NUEVO BLOQUE) 📲
+    let qrStringInteroperable = null;
+    
+    try {
+        // A. Definir ID de Caja Virtual fija para este local
+        const EXTERNAL_POS_ID = `POS-FLEX-${local_id}`; 
+        
+        // B. Asegurar que la Caja existe en MP (Idempotente)
+        try {
+           await axios.post(`https://api.mercadopago.com/pos?access_token=${sellerData.mp_access_token}`, {
+              name: "CercaMio Flex",
+              fixed_amount: true,
+              external_id: EXTERNAL_POS_ID,
+              store_id: null 
+           });
+        } catch (e) { /* Ignoramos si ya existe (Error 400) */ }
+
+        // C. Crear la Orden QR (Esto genera el código que lee Modo/Bancos)
+        const urlOrder = `https://api.mercadopago.com/instore/orders/qr/seller/collectors/${sellerData.mp_user_id}/pos/${EXTERNAL_POS_ID}/qrs?access_token=${sellerData.mp_access_token}`;
+        
+        const qrBody = {
+          external_reference: externalRef,
+          title: concepto || "Compra CercaMío",
+          notification_url: "https://api.cercamio.app/api/pagos/webhook", // TU URL
+          total_amount: Number(monto),
+          items: [
+            {
+              sku_number: "FLEX",
+              category: "marketplace",
+              title: concepto || "Compra",
+              unit_price: Number(monto),
+              quantity: 1,
+              unit_measure: "unit",
+              total_amount: Number(monto)
+            }
+          ],
+          // En Instore, la comisión se configura a nivel aplicación en MP, 
+          // pero como usamos el token del vendedor, dependemos del split del webhook o configuración de app.
+        };
+
+        const qrRes = await axios.put(urlOrder, qrBody);
+        qrStringInteroperable = qrRes.data.qr_data; // EL CÓDIGO MÁGICO
+
+    } catch (qrError) {
+        console.error("⚠️ Falló generación QR Nativo, usando fallback web:", qrError.message);
+        // Si falla el QR nativo, no rompemos todo, seguimos con el Link como respaldo
+    }
+
+    // 4. CREAR PREFERENCIA WEB (LINK)
     const sellerClient = new MercadoPagoConfig({ accessToken: sellerData.mp_access_token });
     const preference = new Preference(sellerClient);
 
-    const body = {
+    const prefBody = {
       items: [
         {
-          id: 'FLEX', // ID Genérico
+          id: 'FLEX', 
           title: concepto || "Compra en Local",
           description: "Pago presencial rápido",
           quantity: 1,
@@ -4676,31 +4742,33 @@ app.post('/api/pagos/crear-preferencia-flex', verificarToken, async (req, res) =
           currency_id: 'ARS',
         }
       ],
-      marketplace_fee: comisionCercaMio,
+      marketplace_fee: comisionCercaMio, // Aquí cobramos el 1% explícito en Checkout Web
       external_reference: externalRef,
       metadata: {
-        tipo: 'FLEX', // Bandera para el Webhook
-        comprador_id: req.usuario.id, // Puede ser el mismo vendedor si usa su cel para cobrar a un NN
+        tipo: 'FLEX', 
+        comprador_id: req.usuario.id, 
         vendedor_id: vendedorId,
         local_id: local_id,
-        monto_original: monto
+        monto_original: monto,
+        socio_id: socioId // 🔥 Pasamos el socio para que el Webhook lo vea rápido
       },
       back_urls: {
         success: "cercamio://payment-result",
         failure: "cercamio://payment-result",
       },
       auto_return: "approved",
-      notification_url: "https://api.cercamio.app/api/pagos/webhook", // TU URL REAL
+      notification_url: "https://api.cercamio.app/api/pagos/webhook",
       statement_descriptor: "CERCAMIO POS"
     };
 
-    const result = await preference.create({ body });
+    const result = await preference.create({ body: prefBody });
 
-    // Devolvemos init_point (Link) y qr (Imagen genérica o string QR si MP lo devuelve, por ahora usamos el link)
+    // 5. RESPUESTA FINAL HÍBRIDA
     res.json({ 
       id: result.id, 
       link_pago: result.init_point,
-      qr_code: result.init_point // En web móvil, el link abre la app directo
+      // Si logramos el QR Interoperable, mandamos ese. Si no, mandamos el link web como QR (Fallback).
+      qr_code: qrStringInteroperable || result.init_point 
     });
 
   } catch (error) {
@@ -4823,11 +4891,11 @@ app.post('/api/mi-negocio/responder-pregunta', async (req, res) => {
 });
 
 // ==========================================
-// RUTA 40: OBTENER PREGUNTAS DE UN LOCAL
+// RUTA 40: OBTENER PREGUNTAS (CENSURA SOLO AL USUARIO 🛡️)
 // ==========================================
 app.get('/api/preguntas/local/:id', async (req, res) => {
   const local_id = req.params.id;
-  const { limit } = req.query; // Puede ser 3 o undefined (todas)
+  const { limit } = req.query; 
 
   try {
     let consulta = `
@@ -4844,13 +4912,23 @@ app.get('/api/preguntas/local/:id', async (req, res) => {
       ORDER BY P.fecha_pregunta DESC
     `;
 
-    // Si piden límite (ej: las 3 últimas para el perfil)
     if (limit) {
       consulta += ` LIMIT ${parseInt(limit)}`;
     }
 
     const respuesta = await pool.query(consulta, [local_id]);
-    res.json(respuesta.rows);
+    
+    // 🔥 LOGICA CORREGIDA:
+    const preguntasSanitizadas = respuesta.rows.map(row => ({
+        ...row,
+        // 1. Censuramos al USUARIO (Para su seguridad)
+        pregunta: censurarDatos(row.pregunta),
+        
+        // 2. El VENDEDOR es libre (Su info ya es pública)
+        respuesta: row.respuesta 
+    }));
+
+    res.json(preguntasSanitizadas);
 
   } catch (error) {
     console.error(error);
