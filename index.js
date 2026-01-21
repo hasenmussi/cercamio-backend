@@ -10,240 +10,40 @@ const axios = require('axios');
 const xlsx = require('xlsx');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
-
-// 2. CONFIGURACIÓN DE IMÁGENES (CLOUDINARY + MULTER)
-const cloudinary = require('cloudinary').v2;
-const { CloudinaryStorage } = require('multer-storage-cloudinary');
-const multer = require('multer');
-
-cloudinary.config({ 
-  cloud_name: process.env.CLOUDINARY_CLOUD_NAME, 
-  api_key: process.env.CLOUDINARY_API_KEY, 
-  api_secret: process.env.CLOUDINARY_API_SECRET 
-});
-
-// A) Storage PÚBLICO (Reseñas, Productos)
-const storagePublico = new CloudinaryStorage({
-  cloudinary: cloudinary,
-  params: {
-    folder: 'cercamio_public', 
-    allowed_formats: ['jpg', 'png', 'jpeg', 'webp'],
-  },
-});
-
-// B) Storage PRIVADO (DNI / Documentación) 🔒
-const storagePrivado = new CloudinaryStorage({
-  cloudinary: cloudinary,
-  params: {
-    folder: 'cercamio_documentacion_privada',
-    type: 'private', // Bloquea acceso público
-    access_mode: 'authenticated',
-    allowed_formats: ['jpg', 'png', 'jpeg', 'pdf'],
-  },
-});
-
-const upload = multer({ storage: storagePublico }); 
-const uploadPrivado = multer({ storage: storagePrivado }); 
-
-// C) Storage en MEMORIA (BLINDADO 🛡️)
-// No guardamos en disco, solo en RAM.
-const storageMemoria = multer.memoryStorage();
-
-const uploadMemoria = multer({ 
-  storage: storageMemoria,
-  // 🔥 LÍMITE DE SEGURIDAD: 5MB
-  // Si el archivo pesa más, Multer lo rechaza automáticamente antes de procesarlo.
-  limits: { fileSize: 5 * 1024 * 1024 } 
-});
-
-// 3. MERCADO PAGO (Solo importamos clases, instanciamos en las rutas)
-const { MercadoPagoConfig, Preference, Payment } = require('mercadopago');
-
-// 4. CONFIGURACIÓN DE EMAIL (ENVIALOSIMPLE TRANSACCIONAL) 📧
-const transporter = nodemailer.createTransport({
-  host: 'smtp.envialosimple.email', // Tal cual la foto
-  port: 587, 
-  secure: false, // 587 usa STARTTLS, por eso secure va en false
-  auth: {
-    user: process.env.EMAIL_USER, // Leerá el usuario largo 'xb69...' de Render
-    pass: process.env.EMAIL_PASS  // Leerá la password larga 'k89P...' de Render
-  },
-  tls: {
-    // La foto dice "Requiere TLS 1.3 o superior", forzamos eso por seguridad
-    minVersion: 'TLSv1.3',
-    rejectUnauthorized: false 
-  }
-});
-
-// Función auxiliar
-const enviarEmail = async (destinatario, asunto, texto, html) => {
-  console.log(`📨 Enviando email a: ${destinatario}`);
-  try {
-    await transporter.sendMail({
-      from: '"Equipo CercaMío" <soporte@cercamio.app>', // 👁️ AQUÍ SÍ VA TU EMAIL REAL COMO REMITENTE
-      to: destinatario,
-      subject: asunto,
-      text: texto,
-      html: html
-    });
-    console.log('✅ Email enviado.');
-    return true;
-  } catch (error) {
-    console.error("⚠️ Falló envío de email:", error.message);
-    return false;
-  }
-};
-
-// 5. FUNCIONES AUXILIARES SIMPLES
-const generarCodigo = () => Math.floor(100000 + Math.random() * 900000).toString();
-const capitalizarNombre = (texto) => {
-  if (!texto) return "";
-  return texto.toLowerCase().split(' ').map(p => p.charAt(0).toUpperCase() + p.slice(1)).join(' ');
-};
-// --- HELPER: CENSURA DE TELÉFONOS 🚫📞 ---
-const censurarDatos = (texto) => {
-  if (!texto) return "";
-  
-  // Explicación Regex:
-  // \b: Inicio de palabra/número
-  // (?:\d[\s.-]*){8,}: Busca grupos de dígitos que pueden tener espacios, puntos o guiones en el medio.
-  // {8,}: Tienen que ser al menos 8 números (evita censurar precios como "1500" o años "2024", pero atrapa "297 123 4567")
-  const regexTelefono = /\b(?:\d[\s.-]*){8,}\b/g;
-  
-  return texto.replace(regexTelefono, ' [OCULTO] ');
-};
-
-// ==========================================
-// FUNCIÓN AUXILIAR: NOTIFICACIONES HÍBRIDAS (DB + FCM) 🔔
-// ==========================================
-const enviarNotificacion = async (usuarioIdDestino, titulo, mensaje, dataPayload = {}) => {
-  try {
-    // 1. GUARDAR EN BASE DE DATOS (HISTORIAL PERMANENTE) 💾
-    // Hacemos esto primero para que quede registro aunque falle el envío Push
-    const payloadJson = dataPayload || {};
-    const tipo = payloadJson.tipo || 'SISTEMA'; // Si no viene tipo, es aviso de sistema
-
-    // Insertamos en la tabla 'notificaciones'
-    await pool.query(
-      `INSERT INTO notificaciones (usuario_id, titulo, mensaje, tipo, data_payload) 
-       VALUES ($1, $2, $3, $4, $5)`,
-      [usuarioIdDestino, titulo, mensaje, tipo, payloadJson]
-    );
-
-    // 2. BUSCAR TOKEN DEL USUARIO (Tu lógica original)
-    const query = 'SELECT fcm_token FROM usuarios WHERE usuario_id = $1';
-    const res = await pool.query(query, [usuarioIdDestino]);
-
-    // Si no existe el usuario o no tiene token, terminamos aquí (pero ya guardamos en DB)
-    if (res.rows.length === 0 || !res.rows[0].fcm_token) {
-      return; 
-    }
-
-    const fcmToken = res.rows[0].fcm_token;
-
-    // 3. PREPARAR MENSAJE PARA FIREBASE
-    // Firebase requiere que los valores de 'data' sean Strings obligatoriamente
-    const payloadString = {};
-    for (let key in payloadJson) {
-        payloadString[key] = String(payloadJson[key]);
-    }
-
-    const message = {
-      notification: { title: titulo, body: mensaje },
-      token: fcmToken,
-      data: payloadString // Datos convertidos para FCM
-    };
-
-    // 4. ENVIAR PUSH
-    await admin.messaging().send(message);
-    // console.log(`📲 Notificación enviada a usuario ${usuarioIdDestino}`);
-
-  } catch (error) {
-    console.error('⚠️ Error sistema notificaciones:', error.message);
-
-    // --- AUTO-LIMPIEZA DE TOKENS MUERTOS (Tu lógica original conservada) ---
-    if (error.code === 'messaging/registration-token-not-registered' || 
-        error.code === 'messaging/invalid-argument') {
-       
-       await pool.query('UPDATE usuarios SET fcm_token = NULL WHERE usuario_id = $1', [usuarioIdDestino]);
-       console.log(`🗑️ Token inválido eliminado para usuario ${usuarioIdDestino}`);
-    }
-  }
-};
-
-// ==========================================
-// 🔐 MIDDLEWARE DE AUTENTICACIÓN (FALTABA ESTO)
-// ==========================================
-const verificarToken = (req, res, next) => {
-  // 1. Buscamos el header "Authorization: Bearer <token>"
-  const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1];
-
-  // 2. Si no hay token, error 401
-  if (!token) return res.status(401).json({ error: 'Acceso denegado: Token requerido' });
-
-  try {
-    // 3. Verificamos firma con el Secreto
-    const verificado = jwt.verify(token, process.env.JWT_SECRET);
-    req.usuario = verificado; // Guardamos datos del usuario en la request
-    next(); // Continuamos a la ruta
-  } catch (error) {
-    res.status(400).json({ error: 'Token inválido o expirado' });
-  }
-};
-
-// ==========================================
-// 🛡️ MIDDLEWARE: SOLO ADMINS
-// ==========================================
-const verificarAdmin = async (req, res, next) => {
-  // 1. Ya pasó por verificarToken, así que tenemos req.usuario.id
-  try {
-    const query = 'SELECT rol FROM usuarios WHERE usuario_id = $1';
-    const result = await pool.query(query, [req.usuario.id]);
-    
-    if (result.rows.length === 0) return res.status(401).json({ error: 'Usuario no existe' });
-    
-    const rol = result.rows[0].rol;
-    
-    // 2. Validamos el ROL
-    if (rol === 'SUPER_ADMIN' || rol === 'SOPORTE' || rol === 'MARKETING') {
-      req.usuario.rol = rol; // Guardamos el rol para usarlo luego
-      next(); // Pase, jefe.
-    } else {
-      return res.status(403).json({ error: 'Acceso denegado: Requieres permisos de Administrador' });
-    }
-  } catch (error) {
-    console.error("Error verificando admin:", error);
-    res.status(500).json({ error: 'Error de servidor' });
-  }
-};
-
-// 6. CONFIGURAMOS LA APP EXPRESS
-const app = express();
-const port = process.env.PORT || 3000;
+const admin = require('firebase-admin'); // 🔥 MOVIDO ARRIBA
+const fs = require('fs'); // 🔥 MOVIDO ARRIBA
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const JWT_SECRET = process.env.JWT_SECRET; // Lee del .env
 
-// 1. Protección de Cabeceras HTTP (Oculta info del servidor)
-app.use(helmet());
+// 2. INICIALIZAMOS APP & BASE DE DATOS (ANTES DE USARLAS)
+const app = express();
+const port = process.env.PORT || 3000;
+const JWT_SECRET = process.env.JWT_SECRET;
 
-// 2. Limitador de Velocidad (Anti-Ataque Masivo)
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutos
-  max: 500, // Subimos a 500 para no bloquear a usuarios legítimos intensivos
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: 'Demasiadas solicitudes, intenta más tarde.' }
+// FIX CRÍTICO PARA RENDER: Confiar en el Proxy
+// Esto permite que el Rate Limit lea la IP real del celular y no la del servidor de Render
+app.set('trust proxy', 1);
+
+// 3. BASE DE DATOS (NEON) - INICIALIZADA TEMPRANO
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { require: true, rejectUnauthorized: false },
+  max: 20, 
+  idleTimeoutMillis: 30000, 
+  connectionTimeoutMillis: 10000, 
 });
-app.use(limiter);
 
-// 7. FIREBASE ADMIN
-const admin = require('firebase-admin');
-const fs = require('fs'); 
+pool.on('error', (err, client) => {
+  console.error('❌ Error inesperado en cliente de base de datos:', err);
+});
+
+pool.connect()
+  .then(() => console.log('✅ Conectado a Neon DB'))
+  .catch(err => console.error('❌ Error DB:', err.message));
+
+// 4. FIREBASE ADMIN (INICIALIZADO TEMPRANO)
 const rutaLocal = './serviceAccountKey.json';
 const rutaRender = '/etc/secrets/serviceAccountKey.json';
-
 let serviceAccount;
 try {
   if (fs.existsSync(rutaRender)) {
@@ -261,23 +61,191 @@ try {
   console.error('❌ Error Firebase:', error.message);
 }
 
-// ==========================================
-// 8. MIDDLEWARES & SEGURIDAD WEB (CORS) 🛡️
-// ==========================================
+// 5. SEGURIDAD (HELMET + RATE LIMIT) 🛡️
+app.use(helmet());
+
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutos
+  max: 500, // Límite razonable
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Demasiadas solicitudes, intenta más tarde.' }
+});
+app.use(limiter);
+
+// 6. CONFIGURACIÓN DE IMÁGENES (CLOUDINARY + MULTER)
+const cloudinary = require('cloudinary').v2;
+const { CloudinaryStorage } = require('multer-storage-cloudinary');
+const multer = require('multer');
+
+cloudinary.config({ 
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME, 
+  api_key: process.env.CLOUDINARY_API_KEY, 
+  api_secret: process.env.CLOUDINARY_API_SECRET 
+});
+
+// A) Storage PÚBLICO
+const storagePublico = new CloudinaryStorage({
+  cloudinary: cloudinary,
+  params: {
+    folder: 'cercamio_public', 
+    allowed_formats: ['jpg', 'png', 'jpeg', 'webp'],
+  },
+});
+
+// B) Storage PRIVADO
+const storagePrivado = new CloudinaryStorage({
+  cloudinary: cloudinary,
+  params: {
+    folder: 'cercamio_documentacion_privada',
+    type: 'private',
+    access_mode: 'authenticated',
+    allowed_formats: ['jpg', 'png', 'jpeg', 'pdf'],
+  },
+});
+
+const upload = multer({ storage: storagePublico }); 
+const uploadPrivado = multer({ storage: storagePrivado }); 
+
+// C) Storage en MEMORIA (BLINDADO 🛡️)
+const storageMemoria = multer.memoryStorage();
+const uploadMemoria = multer({ 
+  storage: storageMemoria,
+  limits: { fileSize: 5 * 1024 * 1024 } // 5MB
+});
+
+// 7. MERCADO PAGO
+const { MercadoPagoConfig, Preference, Payment } = require('mercadopago');
+
+// 8. CONFIGURACIÓN DE EMAIL
+const transporter = nodemailer.createTransport({
+  host: 'smtp.envialosimple.email', 
+  port: 587, 
+  secure: false, 
+  auth: {
+    user: process.env.EMAIL_USER, 
+    pass: process.env.EMAIL_PASS 
+  },
+  tls: { minVersion: 'TLSv1.3', rejectUnauthorized: false }
+});
+
+// Helpers
+const enviarEmail = async (destinatario, asunto, texto, html) => {
+  console.log(`📨 Enviando email a: ${destinatario}`);
+  try {
+    await transporter.sendMail({
+      from: '"Equipo CercaMío" <soporte@cercamio.app>',
+      to: destinatario,
+      subject: asunto,
+      text: texto,
+      html: html
+    });
+    console.log('✅ Email enviado.');
+    return true;
+  } catch (error) {
+    console.error("⚠️ Falló envío de email:", error.message);
+    return false;
+  }
+};
+
+const generarCodigo = () => Math.floor(100000 + Math.random() * 900000).toString();
+const capitalizarNombre = (texto) => {
+  if (!texto) return "";
+  return texto.toLowerCase().split(' ').map(p => p.charAt(0).toUpperCase() + p.slice(1)).join(' ');
+};
+const censurarDatos = (texto) => {
+  if (!texto) return "";
+  const regexTelefono = /\b(?:\d[\s.-]*){8,}\b/g;
+  return texto.replace(regexTelefono, ' [OCULTO] ');
+};
+
+// 9. NOTIFICACIONES (HÍBRIDAS) 🔔
+const enviarNotificacion = async (usuarioIdDestino, titulo, mensaje, dataPayload = {}) => {
+  try {
+    const payloadJson = dataPayload || {};
+    const tipo = payloadJson.tipo || 'SISTEMA';
+
+    await pool.query(
+      `INSERT INTO notificaciones (usuario_id, titulo, mensaje, tipo, data_payload) 
+       VALUES ($1, $2, $3, $4, $5)`,
+      [usuarioIdDestino, titulo, mensaje, tipo, payloadJson]
+    );
+
+    const query = 'SELECT fcm_token FROM usuarios WHERE usuario_id = $1';
+    const res = await pool.query(query, [usuarioIdDestino]);
+
+    if (res.rows.length === 0 || !res.rows[0].fcm_token) return;
+
+    const fcmToken = res.rows[0].fcm_token;
+    
+    // Firebase necesita strings
+    const payloadString = {};
+    for (let key in payloadJson) {
+        payloadString[key] = String(payloadJson[key]);
+    }
+
+    const message = {
+      notification: { title: titulo, body: mensaje },
+      token: fcmToken,
+      data: payloadString
+    };
+
+    await admin.messaging().send(message);
+
+  } catch (error) {
+    console.error('⚠️ Error sistema notificaciones:', error.message);
+    if (error.code === 'messaging/registration-token-not-registered' || 
+        error.code === 'messaging/invalid-argument') {
+       await pool.query('UPDATE usuarios SET fcm_token = NULL WHERE usuario_id = $1', [usuarioIdDestino]);
+    }
+  }
+};
+
+// 10. MIDDLEWARES AUTH
+const verificarToken = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'Acceso denegado: Token requerido' });
+  try {
+    const verificado = jwt.verify(token, process.env.JWT_SECRET);
+    req.usuario = verificado;
+    next();
+  } catch (error) {
+    res.status(400).json({ error: 'Token inválido o expirado' });
+  }
+};
+
+const verificarAdmin = async (req, res, next) => {
+  try {
+    const query = 'SELECT rol FROM usuarios WHERE usuario_id = $1';
+    const result = await pool.query(query, [req.usuario.id]);
+    if (result.rows.length === 0) return res.status(401).json({ error: 'Usuario no existe' });
+    const rol = result.rows[0].rol;
+    if (rol === 'SUPER_ADMIN' || rol === 'SOPORTE' || rol === 'MARKETING') {
+      req.usuario.rol = rol;
+      next();
+    } else {
+      return res.status(403).json({ error: 'Acceso denegado: Requieres permisos de Administrador' });
+    }
+  } catch (error) {
+    console.error("Error verificando admin:", error);
+    res.status(500).json({ error: 'Error de servidor' });
+  }
+};
+
+// 11. CORS & PARSEO
 const whitelist = [
-  'https://cercamio.app',           // Landing Page Oficial
-  'https://panel.cercamio.app',     // Panel Vendedor
-  'https://admin.cercamio.app',     // Panel Admin
-  'https://api.cercamio.app',       // Auto-referencia
-  'http://localhost:5173',          // Tu entorno local (Vite)
-  'http://localhost:3000'           // Tu entorno local (Node)
+  'https://cercamio.app',           
+  'https://panel.cercamio.app',     
+  'https://admin.cercamio.app',     
+  'https://api.cercamio.app',       
+  'http://localhost:5173',          
+  'http://localhost:3000'           
 ];
 
 app.use(cors({
   origin: function (origin, callback) {
-    // Permitir requests sin origen (como Apps móviles Flutter, Postman o Server-to-Server)
     if (!origin) return callback(null, true);
-    
     if (whitelist.indexOf(origin) !== -1) {
       callback(null, true);
     } else {
@@ -287,39 +255,14 @@ app.use(cors({
   },
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
-  credentials: true // Permite cookies/tokens seguros
+  credentials: true 
 }));
 
 app.use(express.json());
 
-// 9. BASE DE DATOS (NEON)
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL, // Lee del .env
-  ssl: { require: true, rejectUnauthorized: false },
-  
-  // --- OPTIMIZACIÓN DE CONEXIONES ---
-  max: 20, // Máximo de conexiones simultáneas (Ideal para plan Launch)
-  idleTimeoutMillis: 30000, // Cerrar conexión si lleva 30s sin usarse (Ahorra recursos)
-  connectionTimeoutMillis: 10000, // Esperar hasta 10s a que la DB despierte (Antes tiraba error a los 2s)
-});
-
-// Manejador de errores del Pool (Para que no tumbe el servidor si se cae la DB)
-pool.on('error', (err, client) => {
-  console.error('❌ Error inesperado en cliente de base de datos:', err);
-  // No salimos del proceso, dejamos que intente reconectar en la próxima
-});
-
-// Test de conexión
-pool.connect()
-  .then(() => console.log('✅ Conectado a Neon DB'))
-  .catch(err => console.error('❌ Error DB:', err.message));
-
+// RUTA TEST
 app.get('/ping', (req, res) => res.send('pong'));
-
-// Ruta de prueba básica
-app.get('/', (req, res) => {
-  res.send('¡Hola! El servidor de CercaMío está funcionando 🚀');
-});
+app.get('/', (req, res) => res.send('¡Hola! El servidor de CercaMío está funcionando 🚀'));
 
 
 // ==========================================
