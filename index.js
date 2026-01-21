@@ -24,10 +24,18 @@ const JWT_SECRET = process.env.JWT_SECRET;
 // Esto permite que el Rate Limit lea la IP real del celular y no la del servidor de Render
 app.set('trust proxy', 1);
 
-// 3. BASE DE DATOS (NEON) - INICIALIZADA TEMPRANO
+// 3. BASE DE DATOS (NEON) - BLINDAJE SSL TOTAL 🐘🔒
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: true, 
+  // 🔥 FIX: Limpiamos '?sslmode=...' de la URL para que no cause warnings
+  // Usamos solo la parte base de la URL y configuramos SSL manualmente abajo
+  connectionString: process.env.DATABASE_URL ? process.env.DATABASE_URL.split('?')[0] : null,
+  
+  // Configuración SSL Estricta (Verify Full)
+  // Esto elimina el warning y asegura que el certificado de Neon sea válido
+  ssl: {
+    rejectUnauthorized: true, 
+  },
+  
   max: 20, 
   idleTimeoutMillis: 30000, 
   connectionTimeoutMillis: 10000, 
@@ -38,7 +46,7 @@ pool.on('error', (err, client) => {
 });
 
 pool.connect()
-  .then(() => console.log('✅ Conectado a Neon DB'))
+  .then(() => console.log('✅ Conectado a Neon DB (SSL Seguro)'))
   .catch(err => console.error('❌ Error DB:', err.message));
 
 // 4. FIREBASE ADMIN (INICIALIZADO TEMPRANO)
