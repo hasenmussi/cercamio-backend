@@ -27,7 +27,7 @@ app.set('trust proxy', 1);
 // 3. BASE DE DATOS (NEON) - INICIALIZADA TEMPRANO
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { require: true, rejectUnauthorized: false },
+  ssl: true, 
   max: 20, 
   idleTimeoutMillis: 30000, 
   connectionTimeoutMillis: 10000, 
