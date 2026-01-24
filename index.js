@@ -71,6 +71,7 @@ try {
 
 // 5. SEGURIDAD (HELMET + RATE LIMIT) 🛡️
 app.use(helmet());
+app.use(compression());
 
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutos
@@ -7305,6 +7306,23 @@ app.get('/api/usuario/mis-cupones', verificarToken, async (req, res) => {
     console.error('Error al obtener mis cupones:', err);
     res.status(500).json({ error: 'Error interno al cargar la billetera' });
   }
+});
+
+// ==========================================
+// 🛡️ SISTEMA DE PREVENCIÓN DE CRASH (GLOBAL)
+// ==========================================
+
+// Atrapa errores de Promesas no manejadas (ej: DB desconectada en medio de una query)
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('⚠️ ALERTA: Promesa rechazada no manejada:', reason);
+  // No matamos el proceso, solo avisamos.
+});
+
+// Atrapa excepciones síncronas que romperían la app
+process.on('uncaughtException', (error) => {
+  console.error('🔥 CRÍTICO: Excepción no capturada:', error);
+  // En producción crítica, algunos recomiendan reiniciar, 
+  // pero para este error de conexión DB, mejor aguantar.
 });
 
 // ENCENDEMOS EL SERVIDOR
