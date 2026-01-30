@@ -157,6 +157,42 @@ const enviarEmail = async (destinatario, asunto, texto, html) => {
   }
 };
 
+// ==========================================
+// HELPER: FILTRO DE SEGURIDAD (TRUST & SAFETY) 🛡️
+// ==========================================
+const verificarContenidoSeguro = async (titulo, descripcion) => {
+  // 1. Normalizamos texto (minusculas, sin tildes para buscar fácil)
+  const textoCompleto = `${titulo} ${descripcion || ''}`
+    .toLowerCase()
+    .normalize("NFD").replace(/[\u0300-\u036f]/g, ""); // Quita tildes
+
+  // 2. Buscamos reglas activas en la DB
+  // (Idealmente esto se cachea en Redis, pero para MVP SQL directo está bien)
+  const reglas = await pool.query('SELECT palabra_clave, categoria_id FROM reglas_contenido WHERE activo = TRUE');
+
+  for (const regla of reglas.rows) {
+    const palabra = regla.palabra_clave.toLowerCase();
+    
+    // Chequeo simple de inclusión (Contains)
+    // Nota: Para "armas", evita falsos positivos como "alarmas". 
+    // Usamos regex con límites de palabra \b si es necesario, pero start simple.
+    if (textoCompleto.includes(palabra)) {
+      
+      // Buscamos el nombre de la categoría para el mensaje de error
+      const catRes = await pool.query('SELECT titulo FROM categorias_prohibidas WHERE categoria_id = $1', [regla.categoria_id]);
+      const categoriaNombre = catRes.rows[0]?.titulo || "Contenido Prohibido";
+
+      return {
+        es_seguro: false,
+        motivo: `Detectamos contenido no permitido: "${palabra}".`,
+        categoria: categoriaNombre
+      };
+    }
+  }
+
+  return { es_seguro: true };
+};
+
 const generarCodigo = () => Math.floor(100000 + Math.random() * 900000).toString();
 const capitalizarNombre = (texto) => {
   if (!texto) return "";
@@ -1223,6 +1259,18 @@ app.put('/api/mi-negocio/actualizar', async (req, res) => {
     // CASO B: ACTUALIZAR PRODUCTO (PRECIOS + AGENDA + CAPACIDAD)
     // ---------------------------------------------------------
     if (inventario_id) {
+
+      // CHECKPOINT DE SEGURIDAD (Solo si cambia nombre o desc)
+      if (nuevo_nombre || nuevo_desc) {
+         const checkSeguridad = await verificarContenidoSeguro(nuevo_nombre, nuevo_desc);
+         if (!checkSeguridad.es_seguro) {
+            return res.status(400).json({ 
+              error: 'Edición rechazada por normas de seguridad.',
+              detalle: checkSeguridad.motivo,
+              categoria_violada: checkSeguridad.categoria
+            });
+         }
+      }
       
       // 1. OBTENER ESTADO ACTUAL (Ahora traemos requiere_agenda también)
       const currentRes = await pool.query(
@@ -1515,7 +1563,7 @@ app.post('/api/auth/login', async (req, res) => {
         rol: usuario.rol || 'USER'
       }, 
       process.env.JWT_SECRET, 
-      { expiresIn: '30d' }
+      { expiresIn: '365d' }
     );
 
     // 6. Responder (DEVUELVE TODO EL CONTEXTO)
@@ -1655,12 +1703,29 @@ app.post('/api/transaccion/comprar', async (req, res) => {
 
     await client.query('BEGIN');
 
-    // 2. Buscamos al vendedor
-    const localRes = await client.query('SELECT usuario_id, nombre FROM locales WHERE local_id = $1', [local_id]);
+    // 2. Buscamos al vendedor Y SU PERFIL FISCAL (BLINDAJE 🛡️)
+    const localRes = await client.query(`
+      SELECT 
+        L.usuario_id, L.nombre,
+        L.emite_factura,
+        (
+          SELECT json_build_object(
+            'razon_social', P.razon_social,
+            'cuit', P.cuit,
+            'condicion_afip', P.condicion_afip
+          )
+          FROM locales_perfil_fiscal P
+          WHERE P.local_id = L.local_id AND L.emite_factura = TRUE
+        ) as perfil_fiscal
+      FROM locales L
+      WHERE L.local_id = $1
+    `, [local_id]);
+
     if (localRes.rows.length === 0) throw new Error('Local no encontrado');
     
     const vendedor_id = localRes.rows[0].usuario_id;
     const nombreLocal = localRes.rows[0].nombre;
+    const snapshotFiscal = localRes.rows[0].perfil_fiscal; // Puede ser null
 
     if (comprador_id === vendedor_id) throw new Error('No puedes comprarte a ti mismo.');
 
@@ -1764,10 +1829,11 @@ app.post('/api/transaccion/comprar', async (req, res) => {
                 estado, tipo_entrega, compra_uuid, nombre_snapshot, foto_snapshot, 
                 comision_plataforma, codigo_retiro,
                 fecha_reserva_inicio, fecha_reserva_fin,
-                cupon_id, monto_descuento -- <--- 2 NUEVAS COLUMNAS
+                cupon_id, monto_descuento, 
+                snapshot_datos_fiscales
             )
-            -- 🔥 CORRECCIÓN AQUÍ: Agregamos $15 y $16
-            VALUES ($1, $2, $3, $4, $5, 'PENDIENTE_PAGO', $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+            
+            VALUES ($1, $2, $3, $4, $5, 'PENDIENTE_PAGO', $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
         `;
         
         await client.query(insertTx, [
@@ -1785,7 +1851,8 @@ app.post('/api/transaccion/comprar', async (req, res) => {
             fechaInicio, // $12
             fechaFin,    // $13
             cupon_id || null, // $15 (Si es undefined, pasa null)
-            0 // $16 (Monto descuento: Ponemos 0 en el item individual, ya que el descuento es al total)
+            0, // $16 (Monto descuento: Ponemos 0 en el item individual, ya que el descuento es al total)
+            snapshotFiscal || null // $17
         ]);
     }
 
@@ -2228,6 +2295,50 @@ app.put('/api/mi-negocio/ventas/estado', async (req, res) => {
   }
 });
 
+// ==========================================
+// RUTA: MARCAR FACTURA COMO ENVIADA (VENDEDOR) ✅
+// ==========================================
+app.put('/api/mi-negocio/ventas/factura-enviada', async (req, res) => {
+  const authHeader = req.headers['authorization'];
+  if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
+  const token = authHeader.split(' ')[1];
+  
+  const { compra_uuid } = req.body;
+
+  try {
+    const usuario = jwt.verify(token, process.env.JWT_SECRET);
+    
+    // 1. Actualizar estado (Validando que el vendedor sea el dueño)
+    const query = `
+      UPDATE transacciones_p2p
+      SET estado_facturacion = 'ENVIADA'
+      WHERE compra_uuid = $1 AND vendedor_id = $2
+      RETURNING comprador_id, compra_uuid
+    `;
+    
+    const result = await pool.query(query, [compra_uuid, usuario.id]);
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'Orden no encontrada o no tienes permiso' });
+    }
+
+    // 2. Notificar al Comprador 🔔
+    const venta = result.rows[0];
+    await enviarNotificacion(
+      venta.comprador_id,
+      "Factura Disponible 🧾",
+      `El vendedor ha emitido tu factura para la orden #${venta.compra_uuid.substring(0,4)}. Revisá tu correo o mensajes.`,
+      { tipo: 'COMPRA', uuid: venta.compra_uuid }
+    );
+
+    res.json({ mensaje: 'Estado actualizado correctamente' });
+
+  } catch (error) {
+    console.error("Error confirmando factura:", error);
+    res.status(500).json({ error: 'Error interno' });
+  }
+});
+
 // RUTA 12: SUBIR IMAGEN A LA NUBE
 // 'imagen' es el nombre del campo que enviará el celular
 app.post('/api/upload', upload.single('imagen'), async (req, res) => {
@@ -2263,6 +2374,20 @@ app.post('/api/mi-negocio/crear-item', async (req, res) => {
     requiere_agenda, 
     duracion_minutos 
   } = req.body;
+
+  // CHECKPOINT DE SEGURIDAD (TRUST & SAFETY)
+  // Antes de abrir la base de datos, verificamos el contenido.
+  const checkSeguridad = await verificarContenidoSeguro(nombre, descripcion);
+  
+  if (!checkSeguridad.es_seguro) {
+    // RECHAZO INMEDIATO (Error 400)
+    // Devolvemos el motivo para que el frontend lo muestre en rojo.
+    return res.status(400).json({ 
+      error: 'Publicación rechazada por normas de seguridad.',
+      detalle: checkSeguridad.motivo,
+      categoria_violada: checkSeguridad.categoria
+    });
+  }
 
   const client = await pool.connect();
 
@@ -2441,17 +2566,34 @@ app.get('/api/perfil-publico/:id', async (req, res) => {
   }
 
   try {
-    // 1. DATOS DEL LOCAL (ACTUALIZADO CON BRANDING)
+    // 1. DATOS DEL LOCAL (ACTUALIZADO CON BLINDAJE FISCAL 🛡️)
     const queryLocal = `
       SELECT 
         usuario_id, local_id, plan_tipo, nombre, categoria, rubro, 
         COALESCE(foto_perfil, foto_url) as foto_url,
         foto_portada, 
         reputacion, 
-        direccion_fisica, whatsapp, ST_Y(ubicacion::geometry) as lat, ST_X(ubicacion::geometry) as long, redes_sociales, hora_apertura, hora_cierre, dias_atencion, horarios_extra,
+        direccion_fisica, whatsapp, ST_Y(ubicacion::geometry) as lat, ST_X(ubicacion::geometry) as long,
+        hora_apertura, hora_cierre, dias_atencion, horarios_extra,
         estado_manual, tipo_actividad, permite_delivery, permite_retiro,
-        pago_efectivo, pago_transferencia, pago_tarjeta, (mp_access_token IS NOT NULL) as acepta_mercado_pago, redes_sociales
-      FROM locales 
+        pago_efectivo, pago_transferencia, pago_tarjeta, (mp_access_token IS NOT NULL) as acepta_mercado_pago, 
+        redes_sociales,
+        
+        -- DATOS FISCALES NUEVOS
+        emite_factura,
+        
+        -- Subconsulta inteligente: Solo trae datos si emite_factura es TRUE
+        (
+          SELECT json_build_object(
+            'razon_social', razon_social,
+            'cuit', cuit,
+            'condicion_afip', condicion_afip
+          )
+          FROM locales_perfil_fiscal P
+          WHERE P.local_id = L.local_id AND L.emite_factura = TRUE
+        ) as perfil_fiscal
+
+      FROM locales L
       WHERE local_id = $1
     `;
     
@@ -2570,6 +2712,70 @@ app.get('/api/perfil-publico/:id', async (req, res) => {
   } catch (error) {
     console.error("Error en perfil público:", error);
     res.status(500).json({ error: 'Error al cargar perfil' });
+  }
+});
+
+// ==========================================
+// RUTA: SOLICITAR FACTURA (COMPRADOR) 🧾
+// ==========================================
+app.post('/api/transaccion/solicitar-factura', async (req, res) => {
+  const authHeader = req.headers['authorization'];
+  if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
+  const token = authHeader.split(' ')[1];
+  
+  const { transaccion_id, compra_uuid } = req.body;
+
+  try {
+    const usuario = jwt.verify(token, process.env.JWT_SECRET);
+    
+    // 1. Identificar la orden
+    // Puede venir por ID (simple) o UUID (agrupada)
+    let whereClause = '';
+    let values = [];
+
+    if (compra_uuid) {
+      whereClause = "compra_uuid = $1";
+      values = [compra_uuid];
+    } else {
+      whereClause = "transaccion_id = $1";
+      values = [transaccion_id];
+    }
+
+    // 2. Validar que la orden sea de este usuario (Seguridad)
+    // Y actualizar el estado a 'SOLICITADA'
+    const updateQuery = `
+      UPDATE transacciones_p2p
+      SET estado_facturacion = 'SOLICITADA'
+      WHERE ${whereClause} AND comprador_id = $2
+      RETURNING vendedor_id, compra_uuid
+    `;
+    
+    // Agregamos el ID del usuario al final de los valores para el WHERE
+    values.push(usuario.id);
+
+    const result = await pool.query(updateQuery, values);
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'Orden no encontrada o no te pertenece' });
+    }
+
+    // 3. Notificar al Vendedor (Push Notification) 🔔
+    const venta = result.rows[0];
+    const vendedorId = venta.vendedor_id;
+    const uuidOrden = venta.compra_uuid;
+
+    await enviarNotificacion(
+      vendedorId,
+      "Solicitud de Factura 📄",
+      `Un cliente solicitó la factura de la orden #${uuidOrden ? uuidOrden.substring(0,4) : '...'}.`,
+      { tipo: 'VENTA', id: String(uuidOrden) }
+    );
+
+    res.json({ mensaje: 'Solicitud registrada correctamente' });
+
+  } catch (error) {
+    console.error("Error solicitando factura:", error);
+    res.status(500).json({ error: 'Error interno al procesar solicitud' });
   }
 });
 
@@ -2795,7 +3001,7 @@ app.get('/api/mi-negocio/analytics', async (req, res) => {
 });
 
 // ==========================================
-// RUTA 20: ACTUALIZAR CONFIGURACIÓN COMPLETA (CON HORARIOS EXTRA V18.1) 🛠️
+// RUTA 20: ACTUALIZAR CONFIGURACIÓN COMPLETA (BLINDAJE FISCAL V20.0) 🛡️
 // ==========================================
 app.put('/api/mi-negocio/actualizar-todo', async (req, res) => {
   const authHeader = req.headers['authorization'];
@@ -2810,13 +3016,24 @@ app.put('/api/mi-negocio/actualizar-todo', async (req, res) => {
     en_vacaciones, notif_nuevas_ventas, notif_preguntas, 
     foto_perfil, foto_portada,
     horarios_extra,
-    redes_sociales
+    redes_sociales,
+    
+    // 🔥 NUEVOS CAMPOS FISCALES
+    emite_factura, 
+    perfil_fiscal // Objeto { razon_social, cuit, condicion_afip }
   } = req.body;
+
+  // Usamos un cliente dedicado para manejar Transacción (Atomicidad)
+  const client = await pool.connect();
 
   try {
     const usuario = jwt.verify(token, process.env.JWT_SECRET);
+    
+    // 1. INICIAR TRANSACCIÓN
+    await client.query('BEGIN');
 
-    const updateQuery = `
+    // 2. ACTUALIZAR TABLA 'LOCALES'
+    const updateLocalesQuery = `
       UPDATE locales 
       SET 
         nombre = $1,
@@ -2840,37 +3057,85 @@ app.put('/api/mi-negocio/actualizar-todo', async (req, res) => {
         foto_perfil = COALESCE($17, foto_perfil),
         foto_portada = COALESCE($18, foto_portada),
         
-        -- 🔥 CAMPO NUEVO
         horarios_extra = $19,
-        redes_sociales = $20
+        redes_sociales = $20,
+
+        -- 🔥 SWITCH FISCAL
+        emite_factura = $21
 
       WHERE usuario_id = $16
-      RETURNING nombre, foto_perfil, foto_portada, estado_manual, rubro
+      RETURNING local_id, nombre, foto_perfil, foto_portada, estado_manual, rubro, emite_factura
     `;
     
-    // El orden del array debe coincidir EXACTAMENTE con los números $
-    const result = await pool.query(updateQuery, [
-      nombre, direccion, whatsapp,                        // $1, $2, $3
-      hora_apertura, hora_cierre, dias_atencion,          // $4, $5, $6
-      rubro, permite_delivery, permite_retiro,            // $7, $8, $9
-      pago_efectivo, pago_transferencia, pago_tarjeta,    // $10, $11, $12
-      en_vacaciones, notif_nuevas_ventas, notif_preguntas,// $13, $14, $15
+    const resultLocales = await client.query(updateLocalesQuery, [
+      nombre, direccion, whatsapp,                        // $1-$3
+      hora_apertura, hora_cierre, dias_atencion,          // $4-$6
+      rubro, permite_delivery, permite_retiro,            // $7-$9
+      pago_efectivo, pago_transferencia, pago_tarjeta,    // $10-$12
+      en_vacaciones, notif_nuevas_ventas, notif_preguntas,// $13-$15
       
       usuario.id,     // $16 (WHERE)
       foto_perfil,    // $17
       foto_portada,   // $18
-      horarios_extra || '{}', // $19 (Default vacío si no viene)
-      redes_sociales || '{}'  // $20
+      horarios_extra || '{}', // $19
+      redes_sociales || '{}',  // $20
+      
+      emite_factura || false // $21 (Default False para informales)
     ]);
 
+    if (resultLocales.rows.length === 0) {
+      throw new Error('Local no encontrado');
+    }
+
+    const localId = resultLocales.rows[0].local_id;
+
+    // 3. ACTUALIZAR TABLA 'LOCALES_PERFIL_FISCAL' (Solo si activó el switch)
+    if (emite_factura === true && perfil_fiscal) {
+      
+      // A. Verificamos si ya tiene perfil creado
+      const checkQuery = 'SELECT perfil_id FROM locales_perfil_fiscal WHERE local_id = $1';
+      const checkRes = await client.query(checkQuery, [localId]);
+
+      if (checkRes.rows.length > 0) {
+        // UPDATE (Ya existía)
+        await client.query(`
+          UPDATE locales_perfil_fiscal 
+          SET razon_social = $1, cuit = $2, condicion_afip = $3, fecha_actualizacion = NOW()
+          WHERE local_id = $4
+        `, [
+          perfil_fiscal.razon_social, 
+          perfil_fiscal.cuit, 
+          perfil_fiscal.condicion_afip, 
+          localId
+        ]);
+      } else {
+        // INSERT (Nuevo registro fiscal)
+        await client.query(`
+          INSERT INTO locales_perfil_fiscal (local_id, razon_social, cuit, condicion_afip)
+          VALUES ($1, $2, $3, $4)
+        `, [
+          localId, 
+          perfil_fiscal.razon_social, 
+          perfil_fiscal.cuit, 
+          perfil_fiscal.condicion_afip
+        ]);
+      }
+    }
+
+    // 4. CONFIRMAR TRANSACCIÓN
+    await client.query('COMMIT');
+
     res.json({ 
-      mensaje: 'Configuración guardada', 
-      perfil: result.rows[0] 
+      mensaje: 'Configuración guardada correctamente', 
+      perfil: resultLocales.rows[0] 
     });
 
   } catch (error) {
+    await client.query('ROLLBACK'); // Si falla algo, deshacemos todo
     console.error("Error actualizando todo:", error);
     res.status(500).json({ error: 'Error al guardar configuración' });
+  } finally {
+    client.release(); // Liberamos el cliente
   }
 });
 
@@ -4415,9 +4680,20 @@ app.post('/api/pagos/webhook', async (req, res) => {
             try {
               await clientDb.query('BEGIN');
 
-              // 1. BUSCAR DATOS DEL SOCIO
+              // 1. BUSCAR DATOS DEL SOCIO Y PERFIL FISCAL (BLINDAJE 🛡️)
               const socioRes = await clientDb.query(`
-                  SELECT L.local_id, L.referido_por_socio_id, S.porcentaje_ganancia
+                  SELECT 
+                    L.local_id, L.referido_por_socio_id, S.porcentaje_ganancia,
+                    L.emite_factura,
+                    (
+                      SELECT json_build_object(
+                        'razon_social', P.razon_social,
+                        'cuit', P.cuit,
+                        'condicion_afip', P.condicion_afip
+                      )
+                      FROM locales_perfil_fiscal P
+                      WHERE P.local_id = L.local_id AND L.emite_factura = TRUE
+                    ) as perfil_fiscal
                   FROM locales L
                   LEFT JOIN socios S ON L.referido_por_socio_id = S.socio_id
                   WHERE L.usuario_id = $1
@@ -4427,6 +4703,7 @@ app.post('/api/pagos/webhook', async (req, res) => {
               const socioId = localInfo?.referido_por_socio_id;
               const porcentajeSocio = socioId ? parseFloat(localInfo.porcentaje_ganancia || 5.00) : 0;
               const localId = localInfo?.local_id;
+              const snapshotFiscal = localInfo?.perfil_fiscal; // Guardamos esto
 
               let comisionTotalOrden = 0;
               let ultimoTransaccionId = null;
@@ -4481,9 +4758,10 @@ app.post('/api/pagos/webhook', async (req, res) => {
                       estado, tipo_entrega, mp_payment_id, fecha_operacion,
                       compra_uuid, nombre_snapshot, foto_snapshot, codigo_retiro,
                       comision_plataforma, fecha_reserva_inicio, fecha_reserva_fin,
-                      cupon_id, monto_descuento -- <--- NUEVOS
+                      cupon_id, monto_descuento,
+                      snapshot_datos_fiscales
                     )
-                    VALUES ($1, $2, $3, $4, $5, 'APROBADO', $6, $7, NOW(), $8, $9, $10, $11, $12, $13, $14, $15, $16)
+                    VALUES ($1, $2, $3, $4, $5, 'APROBADO', $6, $7, NOW(), $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
                     RETURNING transaccion_id
                  `;
                  
@@ -4492,7 +4770,8 @@ app.post('/api/pagos/webhook', async (req, res) => {
                     tipoEntrega, paymentId.toString(), compraUuid, datosReales.nombre, datosReales.foto_url,
                     codigoRetiro, comisionItem,
                     fechaInicio, fechaFin,
-                    cuponId, 0 // Guardamos ID de cupón en todas las filas, pero monto 0 individual (descuento global)
+                    cuponId, 0, // Guardamos ID de cupón en todas las filas, pero monto 0 individual (descuento global)
+                    snapshotFiscal || null // ($17)
                  ]);
                  
                  ultimoTransaccionId = txRes.rows[0].transaccion_id;
@@ -7305,6 +7584,49 @@ app.get('/api/usuario/mis-cupones', verificarToken, async (req, res) => {
   } catch (err) {
     console.error('Error al obtener mis cupones:', err);
     res.status(500).json({ error: 'Error interno al cargar la billetera' });
+  }
+});
+
+// ==========================================
+// RUTA: REPORTAR CONTENIDO (TRUST & SAFETY) 👮
+// ==========================================
+app.post('/api/seguridad/reportar', async (req, res) => {
+  const authHeader = req.headers['authorization'];
+  if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
+  const token = authHeader.split(' ')[1];
+
+  const { 
+    tipo_objeto, // 'PRODUCTO', 'SERVICIO', 'USUARIO'
+    objeto_id,   // ID del item
+    motivo,      // String del motivo seleccionado
+    descripcion  // Texto opcional
+  } = req.body;
+
+  try {
+    const usuario = jwt.verify(token, process.env.JWT_SECRET);
+
+    // 1. Intentar vincular el motivo con una categoría interna
+    // (Buscamos coincidencia parcial en el título)
+    const catRes = await pool.query(
+      "SELECT categoria_id FROM categorias_prohibidas WHERE titulo ILIKE $1 LIMIT 1", 
+      [`%${motivo}%`] 
+    );
+    
+    // Si no encuentra coincidencia exacta, se guarda como NULL (Sin categoría específica)
+    const categoriaId = catRes.rows.length > 0 ? catRes.rows[0].categoria_id : null;
+
+    // 2. Guardar Reporte en la DB
+    await pool.query(`
+      INSERT INTO reportes (denunciante_id, tipo_objeto, objeto_id, categoria_id, descripcion_extra, estado)
+      VALUES ($1, $2, $3, $4, $5, 'PENDIENTE')
+    `, [usuario.id, tipo_objeto, objeto_id, categoriaId, descripcion]);
+
+    // 3. Respuesta al usuario
+    res.json({ mensaje: 'Reporte enviado. Gracias por cuidar la comunidad.' });
+
+  } catch (error) {
+    console.error("Error al reportar:", error);
+    res.status(500).json({ error: 'Error interno al procesar reporte' });
   }
 });
 
