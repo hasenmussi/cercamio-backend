@@ -14,6 +14,7 @@ const admin = require('firebase-admin'); // 🔥 MOVIDO ARRIBA
 const fs = require('fs'); // 🔥 MOVIDO ARRIBA
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const compression = require('compression');
 
 // 2. INICIALIZAMOS APP & BASE DE DATOS (ANTES DE USARLAS)
 const app = express();
